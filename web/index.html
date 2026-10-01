@@ -1,0 +1,1616 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aigit — 源代码管理</title>
+<style>
+/* ── 设计令牌：照 VSCode Dark+ ───────────────────────────────────────── */
+:root{
+  --bg-editor:#1e1e1e;
+  --bg-side:#252526;
+  --bg-input:#3c3c3c;
+  --bg-hover:#2a2d2e;
+  --bg-active:#37373d;
+  --border:#454545;
+  --fg:#cccccc;
+  --fg-dim:#6a6a6a;
+  --btn:#0e639c;
+  --btn-hover:#1177bb;
+  --add:#487e02;
+  --del:#a31515;
+  --st-M:#e2c08d;
+  --st-A:#73c991;
+  --st-D:#f14c4c;
+  --st-U:#d16969;
+  --st-Q:#cccccc;
+  --row-h:22px;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;background:var(--bg-editor);color:var(--fg);
+  font:13px/1.5 "Segoe UI","Microsoft YaHei",-apple-system,sans-serif;
+  display:flex;flex-direction:column;overflow:hidden;
+}
+button,input,select,textarea{font-family:inherit;font-size:13px;color:var(--fg)}
+code{
+  font-family:"Cascadia Mono",Consolas,"Courier New",monospace;
+  background:#2d2d30;padding:1px 4px;border-radius:2px;font-size:11px;
+}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#424242;border-radius:5px}
+::-webkit-scrollbar-thumb:hover{background:#555}
+::-webkit-scrollbar-track{background:transparent}
+
+/* ── 顶栏 ────────────────────────────────────────────────────────────── */
+#topbar{
+  display:flex;align-items:center;gap:10px;flex:0 0 auto;
+  height:38px;padding:0 12px;background:var(--bg-side);
+  border-bottom:1px solid var(--border);
+}
+#logo{font-weight:700;font-size:13px;color:#fff;letter-spacing:.5px}
+#repoPath{
+  flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;color:var(--fg-dim);font-size:12px;
+}
+#branchSel{
+  background:var(--bg-input);border:1px solid transparent;border-radius:2px;
+  padding:3px 8px;min-width:150px;max-width:260px;cursor:pointer;
+}
+#branchSel:focus{outline:none;border-color:var(--btn)}
+
+/* ── 测试工具条 ──────────────────────────────────────────────────────── */
+#testbar{
+  display:flex;align-items:center;gap:8px;flex:0 0 auto;flex-wrap:wrap;
+  padding:8px 12px;background:#2d2d30;border-bottom:1px solid var(--border);
+}
+#testbar .tb-label{
+  color:var(--fg-dim);font-size:11px;letter-spacing:.5px;
+  text-transform:uppercase;margin-right:2px;
+}
+
+/* ── 按钮 ────────────────────────────────────────────────────────────── */
+.btn{
+  background:var(--btn);color:#fff;border:none;border-radius:2px;
+  padding:4px 11px;cursor:pointer;white-space:nowrap;
+  display:inline-flex;align-items:center;gap:5px;
+}
+.btn:hover:not(:disabled){background:var(--btn-hover)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.ghost{background:transparent;border:1px solid var(--border);color:var(--fg)}
+.btn.ghost:hover:not(:disabled){background:var(--bg-active);border-color:#666}
+.btn.danger{background:#a1260d}
+.btn.danger:hover:not(:disabled){background:#c43911}
+.btn.icon{padding:4px 8px}
+.btn.tiny{padding:2px 8px;font-size:11px}
+
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{
+  width:11px;height:11px;border:2px solid rgba(255,255,255,.3);
+  border-top-color:#fff;border-radius:50%;display:none;
+  animation:spin .7s linear infinite;flex:0 0 auto;
+}
+body.busy .btn .spinner{display:inline-block}
+
+/* ── 主体 ────────────────────────────────────────────────────────────── */
+#body{flex:1;display:flex;min-height:0}
+
+/* 侧栏 */
+#side{
+  width:300px;flex:0 0 300px;background:var(--bg-side);
+  border-right:1px solid var(--border);display:flex;flex-direction:column;min-height:0;
+}
+#sideHead{
+  padding:8px 12px;flex:0 0 auto;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+}
+#sideTitle{font-weight:600;font-size:12px;letter-spacing:.3px}
+#sideCount{color:var(--fg-dim);font-size:11px}
+#sideTools{display:flex;gap:4px;padding:6px 8px;border-bottom:1px solid var(--border);flex:0 0 auto}
+#vscroll{flex:1;overflow-y:auto;overflow-x:hidden;position:relative;min-height:0}
+#vspacer{position:relative;width:100%}
+#vrows{position:absolute;top:0;left:0;right:0}
+
+.row{
+  height:var(--row-h);display:flex;align-items:center;gap:6px;
+  padding:0 10px 0 12px;cursor:pointer;white-space:nowrap;overflow:hidden;
+  font-size:13px;user-select:none;
+}
+.row:hover{background:var(--bg-hover)}
+.row.active{background:var(--bg-active);box-shadow:inset 2px 0 0 #007acc}
+.row.sec{
+  font-size:11px;letter-spacing:.6px;color:var(--fg-dim);
+  cursor:default;font-weight:600;padding-top:2px;
+}
+.row.sec:hover{background:transparent}
+.badge{
+  background:#4d4d4d;color:#fff;border-radius:9px;padding:0 6px;
+  font-size:10px;line-height:16px;font-weight:600;
+}
+.badge.hot{background:#0e639c}
+.st{flex:0 0 14px;font-weight:700;text-align:center;font-size:12px}
+.st-M{color:var(--st-M)} .st-A{color:var(--st-A)} .st-D{color:var(--st-D)}
+.st-U{color:var(--st-U)} .st-Q{color:var(--st-Q)} .st-R{color:#75beff}
+.path{flex:1;overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left}
+.row .act{
+  flex:0 0 auto;font-size:10px;color:var(--fg-dim);padding:0 4px;border-radius:2px;
+  opacity:0;cursor:pointer;
+}
+.row:hover .act{opacity:1}
+.row .act:hover{background:#4d4d4d;color:#fff}
+.row .act.warn:hover{background:var(--del);color:#fff}
+
+/* 主区 */
+#main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg-editor)}
+#tabs{display:flex;flex:0 0 auto;background:var(--bg-side);border-bottom:1px solid var(--border);padding:0 6px}
+.tab{
+  padding:7px 14px;cursor:pointer;color:var(--fg-dim);font-size:12px;
+  border-bottom:2px solid transparent;user-select:none;
+}
+.tab:hover{color:var(--fg)}
+.tab.active{color:#fff;border-bottom-color:#007acc}
+.pane{flex:1;display:none;min-height:0;flex-direction:column}
+.pane.active{display:flex}
+
+/* 改动详情 */
+#fileHead{flex:0 0 auto;padding:8px 14px;border-bottom:1px solid var(--border);background:#252526}
+#fileName{font-weight:600;font-size:13px;margin-bottom:6px;word-break:break-all}
+#stageToggle{display:inline-flex;border:1px solid var(--border);border-radius:2px;overflow:hidden}
+#stageToggle button{
+  background:transparent;border:none;padding:2px 10px;cursor:pointer;font-size:11px;
+  color:var(--fg-dim);
+}
+#stageToggle button:hover:not(.on){background:#3a3d41}
+#stageToggle button.on{background:#0e639c;color:#fff}
+#summary{margin-top:6px;font-size:12px;color:var(--fg-dim);line-height:1.7}
+
+#diffWrap{flex:1;overflow:auto;min-height:0;background:var(--bg-editor)}
+.dline{
+  display:grid;grid-template-columns:46px 46px 1fr;
+  font-family:"Cascadia Mono",Consolas,"Courier New",monospace;
+  font-size:12px;line-height:19px;
+  /* 便宜的虚拟化：离屏行跳过布局与绘制 */
+  content-visibility:auto;contain-intrinsic-size:0 19px;
+}
+.dline .gut{
+  color:#6e7681;text-align:right;padding-right:8px;background:#1b1b1b;
+  border-right:1px solid #2b2b2b;user-select:none;font-size:11px;
+  white-space:pre;overflow:hidden;
+}
+.dline .txt{padding:0 10px;white-space:pre-wrap;overflow-wrap:anywhere}
+.dline.add{background:rgba(72,126,2,.32)}
+.dline.add .gut{background:rgba(72,126,2,.20)}
+.dline.del{background:rgba(163,21,21,.32)}
+.dline.del .gut{background:rgba(163,21,21,.20)}
+.dline.add .txt{color:#c6dbb0}
+.dline.del .txt{color:#e0c0c0}
+.dline.hunk{background:#0e3a5c;color:#8fc9ff;font-weight:600}
+.dline.hunk .gut{background:#0a2a45;color:#6aa9e0}
+.dline.meta{background:#2a2a2a;color:var(--fg-dim);font-style:italic}
+.dline.nonew{color:#8a8a8a;font-style:italic;background:#242424}
+
+/* 提示条 */
+.note{
+  margin:10px 14px;padding:9px 12px;border-left:3px solid var(--btn);
+  background:#1b2b38;color:#cfe8ff;font-size:12px;border-radius:0 2px 2px 0;
+  white-space:pre-wrap;line-height:1.7;word-break:break-word;
+}
+.note b{color:#fff;font-weight:600}
+.note.warn{border-left-color:#cca700;background:#332b12;color:#ffe9a8}
+.note.warn b{color:#fff3c4}
+.note.err{border-left-color:#f14c4c;background:#3a1a1a;color:#ffb3b3}
+.note.err b{color:#ffd0d0}
+.note.ok{border-left-color:#73c991;background:#12301d;color:#b8f0cd}
+.note.ok b{color:#d7ffe6}
+.note .x{
+  float:right;cursor:pointer;color:inherit;opacity:.6;margin-left:10px;font-weight:700;
+}
+.note .x:hover{opacity:1}
+
+/* 提交框 */
+#commitBox{
+  flex:0 0 auto;border-top:1px solid var(--border);background:var(--bg-side);padding:8px 12px;
+}
+#msg{
+  width:100%;min-height:56px;max-height:180px;resize:vertical;
+  background:var(--bg-input);border:1px solid var(--border);border-radius:2px;
+  padding:6px 8px;line-height:1.5;outline:none;
+}
+#msg:focus{border-color:var(--btn)}
+#commitHint{margin-top:5px;font-size:11px;color:var(--fg-dim);line-height:1.6}
+#commitHint strong{color:#e2c08d;font-weight:600}
+#commitRow{display:flex;gap:8px;align-items:center;margin-top:7px}
+#split{position:relative;display:inline-flex}
+#splitMenu{
+  position:absolute;bottom:100%;right:0;margin-bottom:4px;min-width:230px;
+  background:#252526;border:1px solid var(--border);border-radius:2px;
+  box-shadow:0 2px 12px rgba(0,0,0,.6);z-index:60;display:none;padding:2px 0;
+}
+#splitMenu.show{display:block}
+#splitMenu div{padding:6px 12px;cursor:pointer;font-size:12px}
+#splitMenu div:hover{background:#0e639c;color:#fff}
+#splitMenu div small{display:block;color:var(--fg-dim);font-size:10px;margin-top:2px}
+#splitMenu div:hover small{color:#cfe8ff}
+
+/* 合并 / 历史 */
+#mergeWrap,#logWrap{flex:1;overflow:auto;padding:14px;min-height:0}
+.h2{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--fg-dim);margin:0 0 8px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th,td{text-align:left;padding:5px 8px;border-bottom:1px solid #333;vertical-align:middle}
+th{color:var(--fg-dim);font-weight:600;font-size:11px;text-transform:uppercase}
+td.sha{font-family:Consolas,monospace;color:#75beff;white-space:nowrap}
+td.msg{word-break:break-word}
+tr.cur td{background:#2a2a2a}
+tr.fresh td:first-child{box-shadow:inset 2px 0 0 #73c991}
+.tagnew{
+  background:#12301d;color:#b8f0cd;border:1px solid #2c5c3a;
+  border-radius:2px;padding:0 5px;font-size:10px;margin-left:6px;
+}
+pre.out{
+  background:#1a1a1a;border:1px solid var(--border);border-radius:2px;padding:9px;
+  font-family:Consolas,monospace;font-size:11px;white-space:pre-wrap;word-break:break-word;
+  max-height:260px;overflow:auto;color:#d4d4d4;margin:8px 0 0;
+}
+pre.out.ok{color:#b8f0cd;border-color:#2c5c3a}
+pre.out.bad{color:#ffb3b3;border-color:#5c2c2c}
+.empty{padding:36px 20px;text-align:center;color:var(--fg-dim);font-size:12px;line-height:1.9}
+
+/* 场景表 */
+#scenWrap{max-height:340px;overflow:auto}
+#scenWrap table{font-size:12px}
+#scenWrap th{position:sticky;top:0;background:var(--bg-editor);z-index:1}
+td.br{font-family:Consolas,monospace;color:#75beff;font-size:11px;word-break:break-all;white-space:normal}
+.verdict{font-weight:700;white-space:nowrap}
+.verdict.yes{color:#73c991}
+.verdict.no{color:#f14c4c}
+.kindtag{
+  background:#2d2d30;border:1px solid #454545;border-radius:2px;
+  padding:0 5px;font-size:10px;color:var(--fg-dim);white-space:nowrap;
+}
+tr.bad td{background:rgba(163,21,21,.15)}
+
+/* 模态 */
+#mask{
+  position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;
+  display:none;align-items:center;justify-content:center;padding:20px;
+}
+#mask.show{display:flex}
+#modal{
+  background:#252526;border:1px solid #454545;border-radius:3px;
+  max-width:560px;width:100%;box-shadow:0 8px 40px rgba(0,0,0,.7);
+}
+#modalHead{padding:13px 16px 0;font-size:14px;font-weight:600;color:#fff}
+#modalBody{padding:10px 16px 14px;font-size:12px;line-height:1.8;color:#d4d4d4;white-space:pre-wrap}
+#modalBody .danger{color:#ff9b9b;font-weight:600}
+#modalBody ul{margin:6px 0;padding-left:20px;max-height:160px;overflow:auto;white-space:normal}
+#modalBody li{word-break:break-all}
+#modalFoot{padding:10px 16px;background:#1f1f1f;display:flex;justify-content:flex-end;gap:8px}
+#modal input{
+  width:100%;background:var(--bg-input);border:1px solid var(--border);
+  border-radius:2px;padding:6px 8px;outline:none;margin-top:4px;
+}
+#modal input:focus{border-color:var(--btn)}
+#modalFoot .spinner{display:none}
+body.busy #modalFoot #modalOk .spinner{display:inline-block}
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <span id="logo">aigit</span>
+  <span id="repoPath" title="">正在连接后端…</span>
+  <select id="branchSel" title="切换分支"></select>
+  <button class="btn ghost icon" id="btnRefresh" title="重新读取状态与分支列表">
+    <span class="spinner"></span>⟳ 刷新
+  </button>
+</div>
+
+<div id="testbar">
+  <span class="tb-label">测试数据</span>
+  <button class="btn ghost" data-gen="mergeable" title="造两个分支改同一文件的不同区域">
+    <span class="spinner"></span>生成 · 可合并变更
+  </button>
+  <button class="btn ghost" data-gen="unrelated" title="造两个分支改完全不同的文件">
+    <span class="spinner"></span>生成 · 无关变更
+  </button>
+  <button class="btn ghost" data-gen="adddel" title="一个分支加文件、另一个删文件">
+    <span class="spinner"></span>生成 · 增删变更
+  </button>
+  <button class="btn ghost" data-gen="conflict" title="两个分支改同一行，合并应冲突（对照组）">
+    <span class="spinner"></span>生成 · 冲突变更
+  </button>
+  <button class="btn ghost" data-gen="all" title="上面四类场景一次全造">
+    <span class="spinner"></span>一键全生成
+  </button>
+  <button class="btn danger" id="btnReset" title="reset --hard + clean -fd，丢弃全部改动">
+    <span class="spinner"></span>丢弃全部改动
+  </button>
+  <button class="btn ghost" id="btnNewBranch" title="新建分支并切换过去">
+    <span class="spinner"></span>新建分支
+  </button>
+</div>
+
+<div id="body">
+  <div id="side">
+    <div id="sideHead">
+      <span id="sideTitle">源代码管理</span>
+      <span id="sideCount">—</span>
+    </div>
+    <div id="sideTools">
+      <button class="btn ghost tiny" id="btnStageAll" title="把所有已跟踪改动加入索引">
+        全部暂存
+      </button>
+      <button class="btn ghost tiny" id="btnUnstageAll" title="把所有改动移出索引">
+        全部取消暂存
+      </button>
+    </div>
+    <div id="vscroll"><div id="vspacer"><div id="vrows"></div></div></div>
+  </div>
+
+  <div id="main">
+    <div id="tabs">
+      <div class="tab active" data-tab="diff">改动详情</div>
+      <div class="tab" data-tab="merge">合并</div>
+      <div class="tab" data-tab="log">提交历史</div>
+    </div>
+
+    <div class="pane active" id="pane-diff">
+      <div id="fileHead">
+        <div id="fileName">未选择文件</div>
+        <div id="stageToggle" style="display:none">
+          <button data-staged="1" class="on">已暂存</button>
+          <button data-staged="0">未暂存</button>
+        </div>
+        <div id="summary">在左侧点一个文件查看差异。</div>
+      </div>
+      <div id="diffWrap"><div id="diffBox"></div></div>
+
+      <div id="commitBox">
+        <textarea id="msg" placeholder="提交信息（不能为空）" spellcheck="false"></textarea>
+        <div id="commitHint">
+          注意：后端 <code>/api/commit</code> 会先跑 <code>git add -A</code>，
+          所以<strong>「提交」会把未暂存的改动一起提交</strong>，不是只提交已暂存部分。
+        </div>
+        <div id="commitRow">
+          <div id="split">
+            <button class="btn" id="btnCommit" title="提交（Ctrl+Enter）">
+              <span class="spinner"></span>提交
+            </button>
+            <button class="btn" id="btnSplit" title="更多提交选项" style="padding-left:5px">▾</button>
+            <div id="splitMenu">
+              <div data-cmd="commit">提交（全部改动）<small>等价于 git add -A &amp;&amp; git commit</small></div>
+              <div data-cmd="commit-log">提交并查看历史<small>提交完成后直接跳到「提交历史」标签</small></div>
+            </div>
+          </div>
+          <button class="btn ghost" id="btnLogRefresh">
+            <span class="spinner"></span>刷新历史
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="pane" id="pane-merge">
+      <div id="mergeWrap">
+        <h3 class="h2">本次生成的场景（点分支右侧「合并进来」逐个验证）</h3>
+        <div id="scenNote"></div>
+        <div id="scenWrap">
+          <div class="empty">还没有生成过场景。<br>用顶部的「测试数据」按钮造一批。</div>
+        </div>
+        <h3 class="h2" style="margin-top:22px">把分支合并进当前分支</h3>
+        <div id="mergeNote"></div>
+        <table>
+          <thead><tr>
+            <th>分支</th><th style="width:60px">当前</th><th style="width:170px">操作</th>
+          </tr></thead>
+          <tbody id="mergeRows"></tbody>
+        </table>
+        <div style="margin-top:16px;display:flex;gap:8px">
+          <button class="btn danger" id="btnMergeAbort" title="中止进行中的合并，回到合并前状态">
+            <span class="spinner"></span>终止合并（merge --abort）
+          </button>
+        </div>
+        <h3 class="h2" style="margin-top:22px">最近一次合并输出</h3>
+        <pre class="out" id="mergeOut">（还没有执行过合并）</pre>
+      </div>
+    </div>
+
+    <div class="pane" id="pane-log">
+      <div id="logWrap">
+        <h3 class="h2">最近 30 条提交</h3>
+        <div id="logNote"></div>
+        <table>
+          <thead><tr>
+            <th style="width:90px">提交</th><th style="width:140px">作者</th>
+            <th style="width:110px">日期</th><th>说明</th>
+          </tr></thead>
+          <tbody id="logRows"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="mask">
+  <div id="modal">
+    <div id="modalHead"></div>
+    <div id="modalBody"></div>
+    <div id="modalFoot"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ══════════════════════════════════════════════════════════════════════
+   状态
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* 行的唯一键。用 charCode(0) 分隔路径与 staged 标志 ——
+   直接写 \u0000 会被写文件工具展开成真正的 NUL 字节，故运行时构造。 */
+var SEP = String.fromCharCode(0);
+
+var S = {
+  health: null,
+  status: null,
+  branches: [],
+  log: [],
+  scenarios: [],   // 最近一次 /api/gen 造出的场景 [{file, branches, expect}]
+  openKey: null,
+  openStaged: 0,
+  rows: [],
+  tab: "diff",
+  mergeResult: null
+};
+
+/* ══════════════════════════════════════════════════════════════════════
+   小工具
+   ══════════════════════════════════════════════════════════════════════ */
+
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+function $(id) { return document.getElementById(id); }
+function rowKey(path, staged) { return path + SEP + (staged ? 1 : 0); }
+function statusText(s) {
+  return {
+    M: "已修改", A: "新增", D: "删除", R: "重命名",
+    C: "复制", U: "冲突", "?": "未跟踪", T: "类型变更"
+  }[s] || ("状态 " + s);
+}
+function stClass(s) { return "st st-" + String(s || "?").replace(/[^A-Za-z?]/g, ""); }
+
+/* 忙碌计数：嵌套调用也不会提前解除置灰 */
+var busyCount = 0;
+function setBusy(on) {
+  busyCount += on ? 1 : -1;
+  if (busyCount < 0) busyCount = 0;
+  var b = busyCount > 0;
+  document.body.classList.toggle("busy", b);
+  var els = document.querySelectorAll(
+    "#testbar button, #commitBox .btn, #btnRefresh, #branchSel," +
+    "#sideTools .btn, #mergeRows .btn, #btnMergeAbort, .row .act"
+  );
+  for (var i = 0; i < els.length; i++) {
+    if (els[i].classList.contains("act")) {          // span 不是按钮，只调样式
+      els[i].style.pointerEvents = b ? "none" : "";
+      els[i].style.opacity = b ? ".3" : "";
+      continue;
+    }
+    els[i].disabled = b;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   提示条
+   ══════════════════════════════════════════════════════════════════════ */
+
+function noteHtml(kind, html, closable) {
+  return '<div class="note ' + (kind || "") + '">' +
+    (closable ? '<span class="x" title="关闭">✕</span>' : "") +
+    html + "</div>";
+}
+function toast(kind, html) {
+  var box = $("diffBox");
+  var old = box.querySelector(".note");
+  if (old) old.parentNode.removeChild(old);
+  if (!html) return;
+  box.insertAdjacentHTML("afterbegin", noteHtml(kind, html, true));
+}
+function paneNote(id, kind, html, closable) {
+  $(id).innerHTML = html ? noteHtml(kind, html, closable) : "";
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   后端调用
+   ══════════════════════════════════════════════════════════════════════ */
+
+function api(path, opts) {
+  opts = opts || {};
+  var init = { method: opts.method || "GET", headers: {} };
+  if (opts.body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(opts.body);
+  }
+  setBusy(true);
+  return fetch(path, init)
+    .then(function (r) {
+      return r.text().then(function (t) {
+        var data;
+        try {
+          data = JSON.parse(t);
+        } catch (e) {
+          throw new Error("后端返回的不是 JSON（HTTP " + r.status + "）：\n" + t.slice(0, 600));
+        }
+        /* 后端统一用 {ok:false, error:"原文"} 表达失败 —— 原文照抄，不加工。
+           但 /api/gen 例外：它是 HTTP 200 + 完整场景数据 + ok:false，
+           含义是「生成器自检没全过」，不是「请求失败」。那种情况下把数据丢掉
+           反而会让用户看不到已经造出来的场景，所以用 tolerateOkFalse 放行。 */
+        if (data && data.ok === false && !opts.tolerateOkFalse) {
+          throw new Error(data.error || ("HTTP " + r.status));
+        }
+        return data;
+      });
+    })
+    .finally(function () { setBusy(false); });
+}
+
+/* POST 类操作后端会顺带返回最新 status，能省一次请求 */
+function applyStatus(d) {
+  if (d && typeof d.branch === "string" && Array.isArray(d.staged)) S.status = d;
+}
+function refresh(alsoBranches) {
+  var jobs = [api("/api/status")];
+  if (alsoBranches !== false) jobs.push(api("/api/branches"));
+  return Promise.all(jobs).then(function (r) {
+    S.status = r[0];
+    S.branches = r[1].branches || [];
+    renderTop();
+    renderSidebar();
+    if (S.tab === "merge") renderMerge();
+  });
+}
+/* 统一的错误呈现：红条 + 后端原文 */
+function fail(what, e) {
+  toast("err", "<b>" + esc(what) + "失败</b>\n" + esc(e.message || String(e)));
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   顶栏
+   ══════════════════════════════════════════════════════════════════════ */
+
+function renderTop() {
+  if (S.health) {
+    $("repoPath").textContent = S.health.root + (S.health.isRepo ? "" : "  （不是 git 仓库）");
+    $("repoPath").title = S.health.root;
+  }
+  var sel = $("branchSel");
+  var want = S.status ? S.status.branch : "";
+  sel.innerHTML = "";
+  if (!S.branches.length) {
+    var o0 = document.createElement("option");
+    o0.textContent = want || "（没有分支）";
+    o0.value = "";
+    sel.appendChild(o0);
+  }
+  for (var i = 0; i < S.branches.length; i++) {
+    var b = S.branches[i];
+    var o = document.createElement("option");
+    o.value = b.name;
+    o.textContent = b.name + (b.current ? "（当前）" : "");
+    if (b.name === want) o.selected = true;
+    sel.appendChild(o);
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   侧栏：扁平行 + 虚拟滚动
+   ══════════════════════════════════════════════════════════════════════ */
+
+function buildRows() {
+  var st = S.status;
+  var rows = [];
+  S.rows = rows;
+  if (!st) return;
+
+  function group(title, list, hot) {
+    if (!list.length) return;
+    rows.push({ type: "sec", title: title, n: list.length, hot: !!hot });
+    for (var i = 0; i < list.length; i++) {
+      rows.push({
+        type: "file",
+        item: list[i],
+        key: rowKey(list[i].path, list[i].staged)
+      });
+    }
+  }
+  function uniq(list) {
+    var seen = {}, out = [];
+    for (var i = 0; i < list.length; i++) {
+      var f = list[i];
+      var k = f.path + "|" + (f.staged ? 1 : 0);
+      if (seen[k]) continue;
+      seen[k] = 1;
+      out.push(f);
+    }
+    return out;
+  }
+
+  /* 冲突优先单列：冲突文件同时也会出现在下面两段里（UU / AA / DD） */
+  group("合并冲突", uniq(st.conflicted || []), true);
+  group("已暂存", uniq(st.staged || []));
+  group("未暂存", uniq(st.unstaged || []));
+}
+
+var ROW_H = 22, OVERSCAN = 8;
+
+function renderSidebar() {
+  buildRows();
+  var st = S.status;
+  if (!st) {
+    $("sideCount").textContent = "—";
+  } else {
+    var total = (st.staged || []).length + (st.unstaged || []).length;
+    var nc = (st.conflicted || []).length;
+    $("sideCount").textContent = nc > 0
+      ? total + " 项改动 · " + nc + " 冲突"
+      : total + " 项改动";
+  }
+
+  $("vspacer").style.height = (S.rows.length * ROW_H) + "px";
+  if (!S.rows.length) {
+    $("vrows").innerHTML = '<div class="empty">工作区干净，<br>没有待提交的改动。</div>';
+    $("vrows").style.transform = "";
+    return;
+  }
+  if (!$("vscroll").onscroll) $("vscroll").onscroll = paintV;
+  paintV();
+}
+
+/* 只渲染视口内 ±OVERSCAN 行。74+ 文件也不会卡。 */
+function paintV() {
+  var scroll = $("vscroll");
+  var top = scroll.scrollTop;
+  var h = scroll.clientHeight || 400;
+  var first = Math.max(0, Math.floor(top / ROW_H) - OVERSCAN);
+  var last = Math.min(S.rows.length, Math.ceil((top + h) / ROW_H) + OVERSCAN);
+  var html = "";
+  for (var i = first; i < last; i++) {
+    var r = S.rows[i];
+    if (r.type === "sec") {
+      html += '<div class="row sec">' + esc(r.title) +
+              ' <span class="badge' + (r.hot ? " hot" : "") + '">' + r.n + "</span></div>";
+      continue;
+    }
+    var it = r.item;
+    var act = it.status === "?"
+      ? '<span class="act warn" data-do="discard" data-path="' + esc(it.path) +
+        '" title="丢弃：直接删除这个未跟踪文件">✕ 丢弃</span>'
+      : '<span class="act" data-do="' + (it.staged ? "unstage" : "stage") +
+        '" data-path="' + esc(it.path) + '" title="' +
+        (it.staged ? "把改动移出索引" : "加入索引") + '">' +
+        (it.staged ? "取消暂存" : "暂存") + "</span>";
+    html += '<div class="row' + (r.key === S.openKey ? " active" : "") +
+            '" data-key="' + esc(r.key) + '" data-staged="' + (it.staged ? "1" : "0") +
+            '" title="' + esc(it.path) + '">' +
+            '<span class="' + stClass(it.status) + '">' + esc(it.status) + "</span>" +
+            '<span class="path">' + esc(it.path) + "</span>" + act + "</div>";
+  }
+  $("vrows").style.transform = "translateY(" + (first * ROW_H) + "px)";
+  $("vrows").innerHTML = html;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   diff 解析
+   ══════════════════════════════════════════════════════════════════════ */
+
+function summarize(text) {
+  var a = 0, d = 0, hunks = 0;
+  var lines = String(text || "").split("\n");
+  for (var i = 0; i < lines.length; i++) {
+    var L = lines[i];
+    if (L.indexOf("@@") === 0) { hunks++; continue; }
+    if (L.indexOf("+++") === 0 || L.indexOf("---") === 0) continue;
+    if (L.charAt(0) === "+") a++;
+    else if (L.charAt(0) === "-") d++;
+  }
+  if (!a && !d) return "";
+  return '<span style="color:' + "#73c991" + '">+' + a + "</span> / " +
+         '<span style="color:#f14c4c">-' + d + "</span> · " + hunks + " 处改动块";
+}
+
+/* unified diff → 可直接铺 DOM 的行数组 */
+function parseDiff(text) {
+  var out = [];
+  var lines = String(text || "").split("\n");
+  var oldN = 0, newN = 0, inHunk = false;
+  var META = /^(index |new file mode|deleted file mode|similarity index|rename |copy |old mode|new mode)/;
+
+  for (var i = 0; i < lines.length; i++) {
+    var L = lines[i];
+    if (L === "" && i === lines.length - 1) continue;
+
+    /* 新文件段开始。必须放在最前面判：上一个文件的 hunk 可能还开着，
+       不重置的话这一段会被当成上下文行吞掉（连二进制提示也会一起丢）。 */
+    if (L.indexOf("diff --git ") === 0) {
+      inHunk = false;
+      out.push({ k: "meta", a: "", b: "", t: L });
+      continue;
+    }
+
+    if (L.indexOf("@@") === 0) {
+      var m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/.exec(L);
+      if (m) {
+        oldN = parseInt(m[1], 10);
+        newN = parseInt(m[3], 10);
+        inHunk = true;
+        out.push({ k: "hunk", a: "", b: "", t: L });
+      }
+      continue;
+    }
+
+    if (!inHunk) {
+      if (L.indexOf("Binary files") === 0) {
+        out.push({ k: "meta", a: "", b: "", t: L });
+        out.push({ k: "meta", a: "", b: "", t: "（二进制文件：git 不提供文本差异）" });
+        continue;
+      }
+      /* --- / +++ 由 hunk 取代，不显示 */
+      if (META.test(L)) out.push({ k: "meta", a: "", b: "", t: L });
+      continue;
+    }
+
+    var c = L.charAt(0);
+    if (c === "+") out.push({ k: "add", a: "", b: newN++, t: L.slice(1) });
+    else if (c === "-") out.push({ k: "del", a: oldN++, b: "", t: L.slice(1) });
+    else if (c === "\\") out.push({ k: "nonew", a: "", b: "", t: "（文件末尾无换行符）" });
+    else out.push({ k: "ctx", a: oldN++, b: newN++, t: c === " " ? L.slice(1) : L });
+  }
+  return out;
+}
+
+/* 有没有真正的行级改动（区别于「只有权限/重命名等元信息变化」） */
+function hasLineChanges(rows) {
+  for (var i = 0; i < rows.length; i++) {
+    var k = rows[i].k;
+    if (k === "add" || k === "del" || k === "ctx") return true;
+  }
+  return false;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   diff 渲染（分段加载，滚到底再补）
+   ══════════════════════════════════════════════════════════════════════ */
+
+var DIFF_CHUNK = 1500;
+
+function rowHtml(r) {
+  return '<div class="dline ' + r.k + '">' +
+    '<div class="gut">' + (r.a === "" ? "" : r.a) + "</div>" +
+    '<div class="gut">' + (r.b === "" ? "" : r.b) + "</div>" +
+    '<div class="txt">' + (esc(r.t) || "&nbsp;") + "</div></div>";
+}
+
+function renderDiffBody(rows, emptyMsg) {
+  var box = $("diffBox");
+  var wrap = $("diffWrap");
+  wrap.onscroll = null;
+  box.innerHTML = "";
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">' + emptyMsg + "</div>";
+    return;
+  }
+  var n = Math.min(rows.length, DIFF_CHUNK);
+  var html = "";
+  for (var i = 0; i < n; i++) html += rowHtml(rows[i]);
+  if (rows.length > n) {
+    html += '<div class="dline meta"><div class="gut"></div><div class="gut"></div>' +
+      '<div class="txt">共 ' + rows.length + " 行，先显示前 " + n +
+      " 行，向下滚动到底会自动加载剩余 " + (rows.length - n) + " 行。</div></div>";
+  }
+  box.innerHTML = html;
+  if (rows.length > n) attachDiffLoader(rows, n);
+}
+
+function attachDiffLoader(rows, shown) {
+  var wrap = $("diffWrap");
+  var box = $("diffBox");
+  function more() {
+    if (shown >= rows.length) { wrap.onscroll = null; return; }
+    var next = Math.min(rows.length, shown + DIFF_CHUNK);
+    var html = "";
+    for (var i = shown; i < next; i++) html += rowHtml(rows[i]);
+    box.insertAdjacentHTML("beforeend", html);
+    shown = next;
+    if (shown >= rows.length) {
+      wrap.onscroll = null;
+      box.insertAdjacentHTML("beforeend",
+        '<div class="dline meta"><div class="gut"></div><div class="gut"></div>' +
+        '<div class="txt">已显示全部 ' + rows.length + " 行。</div></div>");
+    }
+  }
+  wrap.onscroll = function () {
+    if (wrap.scrollTop + wrap.clientHeight >= wrap.scrollHeight - 60) more();
+  };
+}
+
+/* 未跟踪 / 尚未加入索引的新文件：git diff 是空的。
+   退化成「把工作区当前内容整段当作新增行」，否则面板一片空白。 */
+function untrackedView(item) {
+  return api("/api/file?file=" + encodeURIComponent(item.path) + "&ref=HEAD")
+    .then(function (d) {
+      if (S.openKey !== rowKey(item.path, item.staged)) return;
+      var rows = [];
+      if (d.new !== null && d.new !== undefined) {
+        var lines = String(d.new).split("\n");
+        if (lines.length && lines[lines.length - 1] === "") lines.pop();
+        for (var i = 0; i < lines.length; i++) {
+          rows.push({ k: "add", a: "", b: i + 1, t: lines[i] });
+        }
+      }
+      if (!rows.length) {
+        renderDiffBody([], "这个文件是空的（0 字节），没有内容可显示。");
+        return;
+      }
+      toast("", "<b>未跟踪文件</b>：git 不会为尚未加入索引的文件生成 diff，" +
+        "所以这里拿不到行级差异。\n下面把工作区当前内容整段当作<b>新增行</b>显示。" +
+        "\n点左侧的「暂存」把它加入索引之后，就能看到正常差异了。");
+      renderDiffBody(rows);
+    })
+    .catch(function (e) { fail("读取文件内容", e); });
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   文件详情
+   ══════════════════════════════════════════════════════════════════════ */
+
+function showNoFile() {
+  $("fileName").textContent = "未选择文件";
+  $("stageToggle").style.display = "none";
+  $("summary").textContent = "在左侧点一个文件查看差异。";
+  var box = $("diffBox");
+  $("diffWrap").onscroll = null;
+  box.innerHTML = '<div class="empty">选择一个文件以查看它的差异。<br>' +
+    "文件较多时列表用虚拟滚动渲染，74 个文件也不会卡。</div>";
+}
+
+function openFile(key, staged) {
+  if (S.openKey === key) {            // 同一个文件再点一次 → 收起
+    S.openKey = null;
+    renderSidebar();
+    showNoFile();
+    return;
+  }
+  S.openKey = key;
+  S.openStaged = staged ? 1 : 0;
+  renderSidebar();
+  switchTab("diff");
+  loadDiff();
+}
+
+function findItem(path, staged) {
+  if (!S.status) return null;
+  var groups = [S.status.conflicted, S.status.staged, S.status.unstaged];
+  for (var g = 0; g < groups.length; g++) {
+    var list = groups[g] || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].path === path && (list[i].staged ? 1 : 0) === staged) return list[i];
+    }
+  }
+  return null;
+}
+
+function loadDiff() {
+  if (!S.openKey || !S.status) return;
+  var path = S.openKey.split(SEP)[0];
+  var staged = S.openStaged;
+  var ck = rowKey(path, staged);
+  var item = findItem(path, staged);
+
+  $("fileName").textContent = path;
+  $("stageToggle").style.display = "";
+  var b1 = $("stageToggle").children[0], b0 = $("stageToggle").children[1];
+  b1.classList.toggle("on", staged === 1);
+  b0.classList.toggle("on", staged === 0);
+  b1.disabled = b0.disabled = false;
+  /* 只有一边存在时禁用另一边，别让用户点进空面板 */
+  var otherExists = !!findItem(path, staged ? 0 : 1);
+  if (staged === 1) b1.disabled = !(item && findItem(path, 1));
+  else b0.disabled = !otherExists;
+
+  $("summary").innerHTML = "正在读取差异…";
+  $("diffWrap").onscroll = null;
+  $("diffBox").innerHTML = "";
+
+  return api("/api/diff?file=" + encodeURIComponent(path) + "&staged=" + staged)
+    .then(function (d) {
+      if (S.openKey !== ck) return;          // 用户已点别的文件，丢弃这次结果
+      var sum = summarize(d.diff);
+      var st = item ? item.status : "?";
+      $("summary").innerHTML =
+        '<span class="' + stClass(st) + '">' + esc(st) + "</span> " +
+        esc(statusText(st)) +
+        " · " + (staged ? "已暂存版本（索引 vs HEAD）" : "工作区版本（磁盘 vs 索引）") +
+        (sum ? " · " + sum : " · 无行级差异");
+      var rows = parseDiff(d.diff);
+      if (hasLineChanges(rows)) {
+        toast("");
+        renderDiffBody(rows);
+        return;
+      }
+      if (rows.length) {
+        /* 只有元信息：权限变更 / 纯重命名 / 二进制 —— 解释清楚，别丢一堆裸行 */
+        var meta = rows.filter(function (r) { return r.k === "meta"; })
+                       .map(function (r) { return r.t; });
+        toast("", "<b>没有行级差异</b>：文件内容一行都没改，只发生了下面这些属性变化。\n" +
+          esc(meta.join("\n")) +
+          "\n\n若你本该在这里看到 diff，多半是这个改动已经进了索引 —— 切到上面的「已暂存」再看一次。");
+        renderDiffBody([], "无行级差异可显示。文件属性变化列在上方提示里。");
+        return;
+      }
+      /* 空 diff：未跟踪 / 未加入索引的新文件 */
+      if (item && (item.status === "?" || item.status === "A")) return untrackedView(item);
+      renderDiffBody([], "该文件与所选版本之间没有任何差异。<br>" +
+        "（内容相同、没有改动，或者改动已经进了索引。）");
+    })
+    .catch(function (e) {
+      if (S.openKey !== ck) return;
+      $("summary").textContent = "";
+      toast("err", "<b>读取差异失败</b>\n" + esc(e.message || String(e)));
+    });
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   合并
+   ══════════════════════════════════════════════════════════════════════ */
+
+function freshBranches() {
+  var set = {};
+  for (var i = 0; i < S.scenarios.length; i++) {
+    var bs = S.scenarios[i].branches || [];
+    for (var j = 0; j < bs.length; j++) set[bs[j]] = 1;
+  }
+  return set;
+}
+
+function renderMerge() {
+  var cur = S.status ? S.status.branch : "";
+  var fresh = freshBranches();
+  var tb = $("mergeRows");
+  tb.innerHTML = "";
+  for (var i = 0; i < S.branches.length; i++) {
+    var b = S.branches[i];
+    var tr = document.createElement("tr");
+    if (b.current) tr.className = "cur";
+    else if (fresh[b.name]) tr.className = "fresh";
+    tr.innerHTML =
+      '<td class="msg">' + esc(b.name) +
+      (fresh[b.name] ? '<span class="tagnew">本次生成</span>' : "") + "</td>" +
+      "<td>" + (b.current ? "✓" : "") + "</td>" +
+      '<td><button class="btn ghost tiny" data-merge="' + esc(b.name) + '"' +
+      (b.current ? " disabled" : "") + "><span class=\"spinner\"></span>" +
+      (b.current ? "当前分支" : "合并进来") + "</button></td>";
+    tb.appendChild(tr);
+  }
+  if (!S.branches.length) {
+    tb.innerHTML = '<tr><td colspan="3" style="color:#6a6a6a">（没有分支）</td></tr>';
+  }
+
+  var out = $("mergeOut");
+  if (S.mergeResult) {
+    out.textContent = S.mergeResult.text;
+    out.className = "out " + (S.mergeResult.ok ? "ok" : "bad");
+  } else {
+    out.textContent = "（还没有执行过合并）";
+    out.className = "out";
+  }
+
+  var inMerge = !!(S.status && (S.status.conflicted || []).length);
+  $("btnMergeAbort").disabled = inMerge ? false : true;
+  $("btnMergeAbort").title = inMerge
+    ? "中止进行中的合并，回到合并前状态"
+    : "当前没有冲突，不需要中止合并";
+}
+
+function doMerge(name) {
+  var cur = S.status ? S.status.branch : "";
+  openModal({
+    title: "确认合并",
+    body: "把分支 <b>" + esc(name) + "</b> 合并进当前分支 <b>" + esc(cur) + "</b>。\n\n" +
+      "· 无冲突：git 自动生成一个合并提交，改动进入 <b>" + esc(cur) + "</b>。\n" +
+      "· 有冲突：仓库停在冲突状态，「改动详情」里会多出一个红色的「合并冲突」分组；\n" +
+      "  看完可以点「终止合并」回到合并前状态。",
+    okLabel: "执行合并",
+    onOk: function () {
+      closeModal();
+      api("/api/merge", { method: "POST", body: { name: name } })
+        .then(function (d) {
+          /* 后端 merge() 返回 {ok, output, conflicted}，
+             外层再 {"ok": True, **merge(...)} —— Python 字典字面量里内层
+             会覆盖外层，所以 JSON 里只剩一个 ok，它就是合并本身的结果。 */
+          S.mergeResult = {
+            ok: d.ok === true,
+            text: "分支：" + name + "\n合并结果：" +
+              (d.ok ? "成功（无冲突）" : "失败（存在冲突）") +
+              "\n冲突文件：" + ((d.conflicted || []).join(", ") || "无") +
+              "\n\ngit 输出：\n" + (d.output || "(无输出)")
+          };
+          S.openKey = null;
+          return refresh();
+        })
+        .then(function () {
+          showNoFile();
+          switchTab("merge");
+          if (S.mergeResult.ok) {
+            paneNote("mergeNote", "ok",
+              "合并 <b>" + esc(name) + "</b> 成功，无冲突。" +
+              "（若生成器写的是「预期冲突」，那就是后端行为与预期不符，值得记一笔。）", true);
+          } else {
+            var cf = (S.status && S.status.conflicted) || [];
+            paneNote("mergeNote", "warn",
+              "合并 <b>" + esc(name) + "</b> 产生冲突 —— 这正是生成器预期的对照组结果。\n" +
+              "冲突文件：<b>" +
+              (cf.length ? esc(cf.map(function (c) { return c.path; }).join("、")) : "（见下方 git 输出）") +
+              "</b>\n左侧「改动详情」里能看到带冲突标记的差异；看完点「终止合并」回退。", true);
+          }
+        })
+        .catch(function (e) {
+          S.mergeResult = { ok: false, text: "合并失败：\n" + (e.message || String(e)) };
+          switchTab("merge");
+          renderMerge();
+          paneNote("mergeNote", "err", "<b>合并失败</b>\n" + esc(e.message || String(e)), true);
+        });
+    }
+  });
+}
+
+function doMergeAbort() {
+  openModal({
+    title: "确认终止合并",
+    body: "执行 <code>git merge --abort</code>，把工作区恢复到开始这次合并之前的状态。\n\n" +
+      "· 本次合并引入的改动会被撤销。\n" +
+      "· 合并前就存在的未提交改动不受影响。\n" +
+      "已提交的历史不受影响。",
+    okLabel: "终止合并",
+    onOk: function () {
+      closeModal();
+      api("/api/merge-abort", { method: "POST", body: {} })
+        .then(function (d) {
+          applyStatus(d);
+          S.mergeResult = null;
+          S.openKey = null;
+          return refresh();
+        })
+        .then(function () {
+          showNoFile();
+          paneNote("mergeNote", "ok", "已终止合并，仓库回到合并前状态。", true);
+        })
+        .catch(function (e) {
+          switchTab("merge");
+          paneNote("mergeNote", "err", "<b>终止合并失败</b>\n" + esc(e.message || String(e)), true);
+        });
+    }
+  });
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   提交历史
+   ══════════════════════════════════════════════════════════════════════ */
+
+function renderLog() {
+  var tb = $("logRows");
+  if (!S.log.length) {
+    tb.innerHTML = '<tr><td colspan="4" style="color:#6a6a6a">（没有提交记录）</td></tr>';
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < S.log.length; i++) {
+    var r = S.log[i];
+    html += "<tr><td class=\"sha\">" + esc(r.sha) + "</td><td>" + esc(r.author) +
+      "</td><td>" + esc(r.date) + '</td><td class="msg">' + esc(r.subject) + "</td></tr>";
+  }
+  tb.innerHTML = html;
+}
+function loadLog() {
+  return api("/api/log?limit=30")
+    .then(function (d) { S.log = d.log || []; renderLog(); })
+    .catch(function (e) { paneNote("logNote", "err", "<b>读取提交历史失败</b>\n" + esc(e.message || String(e)), true); });
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   模态框：确认 / 输入
+   ══════════════════════════════════════════════════════════════════════ */
+
+var modalOnOk = null;
+
+function openModal(opts) {
+  var body = opts.body || "";
+  if (opts.input) {
+    body += '\n<input id="modalInput" placeholder="' + esc(opts.input.placeholder || "") +
+            '" value="' + esc(opts.input.value || "") + '">';
+  }
+  $("modalHead").textContent = opts.title || "";
+  $("modalBody").innerHTML = body;
+  $("modalFoot").innerHTML = "";
+  modalOnOk = opts.onOk || null;
+
+  var cancel = document.createElement("button");
+  cancel.className = "btn ghost";
+  cancel.textContent = opts.cancelLabel || "取消";
+  cancel.onclick = closeModal;
+  $("modalFoot").appendChild(cancel);
+
+  var ok = document.createElement("button");
+  ok.className = "btn" + (opts.danger ? " danger" : "");
+  ok.id = "modalOk";
+  ok.innerHTML = '<span class="spinner"></span>' + esc(opts.okLabel || "确定");
+  ok.onclick = function () { if (modalOnOk) modalOnOk(); };
+  $("modalFoot").appendChild(ok);
+
+  $("mask").classList.add("show");
+  setTimeout(function () {
+    var i = $("modalInput");
+    if (i) { i.focus(); i.select(); }
+    else ok.focus();
+  }, 0);
+}
+function closeModal() {
+  $("mask").classList.remove("show");
+  $("modalBody").innerHTML = "";
+  modalOnOk = null;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   标签页
+   ══════════════════════════════════════════════════════════════════════ */
+
+function switchTab(name) {
+  S.tab = name;
+  var tabs = document.querySelectorAll(".tab");
+  for (var i = 0; i < tabs.length; i++) {
+    tabs[i].classList.toggle("active", tabs[i].getAttribute("data-tab") === name);
+  }
+  var panes = document.querySelectorAll(".pane");
+  for (var j = 0; j < panes.length; j++) {
+    panes[j].classList.toggle("active", panes[j].id === "pane-" + name);
+  }
+  if (name === "log") loadLog();
+  if (name === "merge") { renderMerge(); renderScenarios(); }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   动作
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* 收集一组已跟踪改动的路径，用于「全部暂存 / 全部取消暂存」 */
+function trackedPaths() {
+  if (!S.status) return [];
+  var out = [], seen = {};
+  var list = (S.status.staged || []).concat(S.status.unstaged || []);
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].status === "?") continue;
+    if (seen[list[i].path]) continue;
+    seen[list[i].path] = 1;
+    out.push(list[i].path);
+  }
+  return out;
+}
+
+function doStage(paths, unstage) {
+  if (!paths.length) {
+    toast("warn", "没有可" + (unstage ? "取消暂存" : "暂存") + "的已跟踪改动。");
+    return Promise.resolve();
+  }
+  return api(unstage ? "/api/unstage" : "/api/stage", { method: "POST", body: { files: paths } })
+    .then(function (d) {
+      applyStatus(d);
+      S.openKey = null;
+      return refresh();
+    })
+    .then(function () {
+      showNoFile();
+      toast("ok", "<b>" + (unstage ? "已取消暂存 " : "已暂存 ") + "</b>" +
+        esc(paths.length + " 个文件：" + paths.join("、")));
+    })
+    .catch(function (e) { fail(unstage ? "取消暂存" : "暂存", e); });
+}
+
+function doDiscard(paths) {
+  var idx = {};
+  if (S.status) (S.status.unstaged || []).forEach(function (u) { idx[u.path] = u; });
+  var untracked = paths.filter(function (p) { return idx[p] && idx[p].status === "?"; });
+
+  openModal({
+    title: "确认丢弃改动",
+    body: "以下改动会<b class=\"danger\">永久丢失，无法撤销</b>：\n\n" +
+      "<ul><li>" + esc(paths.join("</li><li>")) + "</li></ul>\n" +
+      (untracked.length
+        ? "\n其中 <b>" + untracked.length + "</b> 个是未跟踪文件，" +
+          "<b class=\"danger\">会被直接删除</b>（不是恢复成旧版本）。\n"
+        : "\n这些是已跟踪文件，会被恢复到最近一次提交的内容。\n") +
+      "\n已暂存的改动也会丢失。确定继续吗？",
+    okLabel: "确认丢弃",
+    danger: true,
+    onOk: function () {
+      closeModal();
+      api("/api/discard", { method: "POST", body: { files: paths } })
+        .then(function (d) {
+          applyStatus(d);
+          S.openKey = null;
+          return refresh();
+        })
+        .then(function () {
+          showNoFile();
+          toast("ok", "已丢弃 " + paths.length + " 个文件的改动。" +
+            (untracked.length ? "（其中 " + untracked.length + " 个未跟踪文件已被删除）" : ""));
+        })
+        .catch(function (e) { fail("丢弃改动", e); });
+    }
+  });
+}
+
+function doReset() {
+  openModal({
+    title: "确认丢弃全部改动",
+    body: "这会执行 <code>git reset --hard HEAD</code> + <code>git clean -fd</code>，" +
+      "<b class=\"danger\">仓库内所有未提交改动会被永久删除，无法撤销</b>：\n\n" +
+      "<ul><li>已跟踪文件的修改会回到最近一次提交</li>" +
+      "<li>已暂存的改动会丢失</li>" +
+      "<li><b class=\"danger\">所有未跟踪文件和目录会被直接删除</b></li></ul>\n" +
+      "<b>已提交的分支和历史不受影响。</b>\n\n确定继续吗？",
+    okLabel: "全部丢弃",
+    danger: true,
+    onOk: function () {
+      closeModal();
+      api("/api/reset", { method: "POST", body: {} })
+        .then(function (d) {
+          applyStatus(d);
+          S.openKey = null;
+          S.mergeResult = null;
+          S.scenarios = [];
+          return refresh();
+        })
+        .then(function () {
+          showNoFile();
+          switchTab("merge");
+          renderScenarios();
+          paneNote("mergeNote", "ok", "已重置工作区到最近一次提交。", true);
+          toast("ok", "已重置工作区到最近一次提交。");
+        })
+        .catch(function (e) { fail("重置工作区", e); });
+    }
+  });
+}
+
+function doNewBranch() {
+  openModal({
+    title: "新建并切换分支",
+    body: "分支名只允许<b>字母、数字、下划线、点、斜杠、短横线</b>，长度 1–100（后端正则 <code>[\\w./-]</code>）。\n" +
+      "例：<code>feat/login</code>　<code>fix/typo-1</code>",
+    input: { placeholder: "分支名，例如 feat/login" },
+    okLabel: "创建并切换",
+    onOk: function () {
+      var el = $("modalInput");
+      var name = (el ? el.value : "").trim();
+      if (!name) {
+        if (el) { el.focus(); toast("warn", "分支名不能为空。"); }
+        return;
+      }
+      closeModal();
+      api("/api/branch", { method: "POST", body: { name: name } })
+        .then(function (d) {
+          applyStatus(d);
+          S.openKey = null;
+          return refresh();
+        })
+        .then(function () {
+          showNoFile();
+          toast("ok", "已创建并切换到分支 <b>" + esc(name) + "</b>。");
+        })
+        .catch(function (e) { fail("新建分支", e); });
+    }
+  });
+}
+
+function doCheckout(name) {
+  openModal({
+    title: "确认切换分支",
+    body: "切换到分支 <b>" + esc(name) + "</b>。\n" +
+      "若工作区有未提交改动，git 可能拒绝切换，或者把改动带到新分支上。",
+    okLabel: "切换",
+    onOk: function () {
+      closeModal();
+      api("/api/checkout", { method: "POST", body: { name: name } })
+        .then(function (d) {
+          applyStatus(d);
+          S.openKey = null;
+          S.mergeResult = null;
+          return refresh();
+        })
+        .then(function () {
+          showNoFile();
+          toast("ok", "已切换到 <b>" + esc(name) + "</b>。");
+        })
+        .catch(function (e) { fail("切换分支", e); });
+    }
+  });
+}
+
+function doCommit(thenLog) {
+  var msg = $("msg").value;
+  if (!msg || !msg.trim()) {
+    toast("warn", "提交信息不能为空。");
+    $("msg").focus();
+    return;
+  }
+  api("/api/commit", { method: "POST", body: { message: msg } })
+    .then(function (d) {
+      applyStatus(d);
+      $("msg").value = "";
+      S.openKey = null;
+      S.mergeResult = null;
+      S.scenarios = [];
+      return refresh().then(function () { return d; });
+    })
+    .then(function (d) {
+      showNoFile();
+      if (S.tab === "merge") { renderMerge(); renderScenarios(); }
+      toast("ok", "<b>提交成功</b>\n" + esc(d.output || "(git 无输出)") +
+        (thenLog ? "\n\n正在跳到「提交历史」。" : ""));
+      if (thenLog) switchTab("log");
+    })
+    .catch(function (e) { fail("提交", e); });
+}
+
+var KIND_LABEL = {
+  mergeable: "可合并", unrelated: "无关", adddel: "增删", conflict: "冲突"
+};
+
+/* 场景明细表。12 个场景塞不进提示条，所以放进合并页的表格里。 */
+function renderScenarios() {
+  var wrap = $("scenWrap");
+  if (!S.scenarios.length) {
+    wrap.innerHTML = '<div class="empty">还没有生成过场景。<br>' +
+      "用顶部的「测试数据」按钮造一批，造完在这里会列出每个场景该合并成什么样。</div>";
+    return;
+  }
+  var html = "<table><thead><tr>" +
+    "<th style=\"width:34px\">#</th><th style=\"width:78px\">类型</th>" +
+    "<th style=\"width:30%\">分支（按顺序合并）</th><th>涉及文件</th>" +
+    "<th>预期</th><th style=\"width:66px\">生成器自检</th>" +
+    "</tr></thead><tbody>";
+  for (var i = 0; i < S.scenarios.length; i++) {
+    var sc = S.scenarios[i];
+    var kind = sc.kind || "";
+    /* 分支名形如 feat/<kind>/<i>/a，kind 可以从分支名反推，兼容后端不返回该字段 */
+    if (!kind && sc.branches && sc.branches.length) {
+      var parts = String(sc.branches[0]).split("/");
+      if (parts.length >= 2) kind = parts[1];
+    }
+    var files = Array.isArray(sc.files) ? sc.files.join("、")
+             : (sc.file ? String(sc.file) : "");
+    var v = sc.verified;
+    /* 先逐个转义再拼标签 —— 反过来做会把 "<br>" 变成字面量显示出来 */
+    var brCell = (sc.branches || []).map(function (n) {
+      return '<div>' + esc(n) + "</div>";
+    }).join("") || "—";
+    html += '<tr' + (v === false ? ' class="bad"' : "") + ">" +
+      "<td>" + (i + 1) + "</td>" +
+      '<td><span class="kindtag">' + esc(KIND_LABEL[kind] || kind || "—") + "</span></td>" +
+      '<td class="br">' + brCell + "</td>" +
+      '<td class="msg">' + esc(files || "—") + "</td>" +
+      '<td class="msg">' + esc(sc.expect || "—") + "</td>" +
+      '<td class="verdict ' + (v === false ? "no" : "yes") + '">' +
+      (v === false ? "✗ 未达预期" : "✓ 通过") + "</td></tr>";
+  }
+  wrap.innerHTML = html + "</tbody></table>";
+}
+
+function doGen(kind) {
+  var label = {
+    mergeable: "可合并变更", unrelated: "无关变更",
+    adddel: "增删变更", conflict: "冲突变更", all: "四类全生成"
+  }[kind] || kind;
+
+  api("/api/gen", { method: "POST", body: { kind: kind, count: 3 }, tolerateOkFalse: true })
+    .then(function (d) {
+      /* 生成器会造出新分支 —— 必须同时刷状态和分支列表，否则看不见 */
+      return refresh().then(function () { return d; });
+    })
+    .then(function (d) {
+      /* d.scenarios 是完整结构；d.branches 是 server.py 退化后的 dict 列表。
+         两者都在就优先用 scenarios（字段更全）。 */
+      var raw = (Array.isArray(d.scenarios) && d.scenarios.length)
+        ? d.scenarios
+        : (Array.isArray(d.branches) ? d.branches : []);
+      S.scenarios = raw.filter(function (x) { return x && typeof x === "object"; })
+        .map(function (x) {
+          return {
+            id: x.id, kind: x.kind,
+            branches: Array.isArray(x.branches) ? x.branches : [],
+            files: x.files, file: x.file,
+            expect: x.expect,
+            verified: x.verified
+          };
+        });
+      S.openKey = null;
+      S.mergeResult = null;
+      showNoFile();
+      switchTab("merge");
+      renderMerge();
+      renderScenarios();
+
+      var bad = S.scenarios.filter(function (s) { return s.verified === false; });
+      var h = "<b>已生成 " + S.scenarios.length + " 个场景：" + esc(label) + "</b>\n\n" +
+        esc(d.note || d.summary || "(后端未返回 note)");
+
+      if (bad.length) {
+        /* 后端约定：ok=false 表示「生成器自检没全过」，不是请求失败。
+           所以这里不报错，而是如实点名哪几个没达标。 */
+        paneNote("scenNote", "warn",
+          "<b>生成器自检：部分场景未达预期。</b>\n" +
+          "后端返回 ok=false —— 含义是「有场景造出来就不符合它自己的预期」，" +
+          "不是请求失败（HTTP 仍是 200，数据完整）。\n" +
+          "未达预期的场景：" + esc(bad.map(function (s, i) {
+            return "#" + (S.scenarios.indexOf(s) + 1) + " " +
+              ((s.branches || []).join(" + ") || "?");
+          }).join("；")) + "\n" +
+          "下表「生成器自检」列标红的即是。", true);
+        h += "\n\n⚠ 有 " + bad.length + " 个场景没通过生成器自检，已在上方点名。";
+      } else if (S.scenarios.length) {
+        paneNote("scenNote", "ok",
+          "后端自检 <b>全部通过</b>（ok=true）：" + S.scenarios.length +
+          " 个场景都造出了它预期的形态。下面逐个点「合并进来」验证即可。", true);
+        h += "\n\n生成器自检全部通过。";
+      } else {
+        paneNote("scenNote", "warn", "后端没有返回场景明细，只造了分支。去下方分支表里看。", true);
+        h += "\n\n（后端没有返回场景明细，去下方分支表里看新分支。）";
+      }
+
+      h += "\n\n下一步：在上方表格里看每个场景的<b>预期</b>，然后逐个点分支右侧的「合并进来」，" +
+        "对照结果是否一致。合并完记得切回 " +
+        esc((S.status && S.status.branch) || "main") + " 并「丢弃全部改动」再生成下一批。";
+      toast("", h);
+    })
+    .catch(function (e) { fail("生成测试数据", e); });
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   事件绑定
+   ══════════════════════════════════════════════════════════════════════ */
+
+$("btnRefresh").onclick = function () {
+  refresh()
+    .then(function () { toast("ok", "已刷新状态与分支列表。"); })
+    .catch(function (e) { fail("刷新", e); });
+};
+
+$("branchSel").onchange = function () {
+  var name = $("branchSel").value;
+  if (name) doCheckout(name);
+};
+
+var genBtns = document.querySelectorAll("[data-gen]");
+for (var gi = 0; gi < genBtns.length; gi++) {
+  genBtns[gi].onclick = function () { doGen(this.getAttribute("data-gen")); };
+}
+$("btnReset").onclick = doReset;
+$("btnNewBranch").onclick = doNewBranch;
+$("btnMergeAbort").onclick = doMergeAbort;
+$("btnCommit").onclick = function () { doCommit(false); };
+$("btnLogRefresh").onclick = function () { switchTab("log"); };
+$("btnStageAll").onclick = function () { doStage(trackedPaths(), false); };
+$("btnUnstageAll").onclick = function () {
+  if (!S.status || !(S.status.staged || []).length) {
+    toast("warn", "当前没有已暂存的改动。");
+    return;
+  }
+  var seen = {};
+  var ps = (S.status.staged || []).filter(function (f) {
+    if (seen[f.path]) return false; seen[f.path] = 1; return true;
+  }).map(function (f) { return f.path; });
+  doStage(ps, true);
+};
+
+$("btnSplit").onclick = function (e) {
+  e.stopPropagation();
+  $("splitMenu").classList.toggle("show");
+};
+document.addEventListener("click", function (e) {
+  if (!$("splitMenu").contains(e.target) && e.target !== $("btnSplit")) {
+    $("splitMenu").classList.remove("show");
+  }
+});
+var splitItems = $("splitMenu").querySelectorAll("[data-cmd]");
+for (var si = 0; si < splitItems.length; si++) {
+  splitItems[si].onclick = function () {
+    var cmd = this.getAttribute("data-cmd");
+    $("splitMenu").classList.remove("show");
+    doCommit(cmd === "commit-log");
+  };
+}
+
+var tabEls = document.querySelectorAll(".tab");
+for (var ti = 0; ti < tabEls.length; ti++) {
+  tabEls[ti].onclick = function () { switchTab(this.getAttribute("data-tab")); };
+}
+
+/* 提示条上的 ✕ 关闭（事件委托，三个提示位共用一个容器类） */
+document.addEventListener("click", function (e) {
+  var x = e.target.closest(".note .x");
+  if (x) x.parentNode.parentNode.removeChild(x.parentNode);
+});
+
+var stBtns = $("stageToggle").querySelectorAll("button");
+for (var sti = 0; sti < stBtns.length; sti++) {
+  stBtns[sti].onclick = function () {
+    var v = parseInt(this.getAttribute("data-staged"), 10);
+    if (v === S.openStaged || !S.openKey) return;
+    S.openStaged = v;
+    S.openKey = S.openKey.split(SEP)[0] + SEP + v;
+    renderSidebar();
+    loadDiff();
+  };
+}
+
+/* 侧栏：文件行 + 行内暂存/丢弃按钮（事件委托，虚拟滚动下依然有效） */
+$("vrows").addEventListener("click", function (e) {
+  var act = e.target.closest("[data-do]");
+  if (act) {
+    e.stopPropagation();
+    var p = act.getAttribute("data-path");
+    if (act.getAttribute("data-do") === "discard") doDiscard([p]);
+    else doStage([p], act.getAttribute("data-do") === "unstage");
+    return;
+  }
+  var row = e.target.closest(".row[data-key]");
+  if (!row) return;
+  openFile(row.getAttribute("data-key"), row.getAttribute("data-staged") === "1");
+});
+
+$("mergeRows").addEventListener("click", function (e) {
+  var b = e.target.closest("[data-merge]");
+  if (b) doMerge(b.getAttribute("data-merge"));
+});
+
+$("mask").addEventListener("mousedown", function (e) {
+  if (e.target === $("mask")) closeModal();
+});
+document.addEventListener("keydown", function (e) {
+  if (e.key === "Escape" && $("mask").classList.contains("show")) { closeModal(); return; }
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); doCommit(false); }
+});
+
+/* ══════════════════════════════════════════════════════════════════════
+   启动
+   ══════════════════════════════════════════════════════════════════════ */
+
+api("/api/health")
+  .then(function (d) {
+    S.health = d;
+    renderTop();
+    return refresh();
+  })
+  .then(function () {
+    if (S.health && S.health.isRepo === false) {
+      toast("warn", "<b>当前目录不是 git 仓库</b>，源码管理功能不可用。");
+    } else {
+      toast("", "就绪。\n" +
+        "① 顶部「测试数据」一排按钮造场景（每个都会告诉你合并该成功还是该冲突）\n" +
+        "② 「合并」标签页顶部会列出每个场景的预期，逐个点「合并进来」验证\n" +
+        "③ 回到「改动详情」看彩色 diff，再提交。\n" +
+        "提示：生成器要求仓库是干净的，一批验完请「丢弃全部改动」再生成下一批。");
+    }
+    renderScenarios();
+  })
+  .catch(function (e) {
+    $("repoPath").textContent = "（无法连接后端）";
+    $("repoPath").title = "";
+    toast("err", "<b>无法连接后端</b>\n" + esc(e.message || String(e)) +
+      "\n\n请先启动服务：\npython tools/aigit/server.py --root <仓库路径>");
+  });
+</script>
+</body>
+</html>

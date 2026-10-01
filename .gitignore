@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 分发产物
+dist/
+build/
+*.pyz
+*.exe
+
+# 本地测试残留
+/tmp/
+/sandbox/

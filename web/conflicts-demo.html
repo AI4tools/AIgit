@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>aigit 冲突解决 · 自测页</title>
+<style>
+  :root { --bg:#1e1e1e; --fg:#d4d4d4; --dim:#858585; --line:#3c3c3c;
+          --ours:#0b3d2e; --theirs:#3d2a0b; --base:#2a2a2a; --accent:#4a9eff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:13px/1.5 "Cascadia Code",Consolas,monospace; }
+  header { padding:8px 12px; border-bottom:1px solid var(--line);
+           display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:14px; margin:0; font-weight:600; }
+  .pill { padding:1px 8px; border-radius:10px; font-size:11px; border:1px solid var(--line); }
+  .pill.merge { background:#0b3d2e; border-color:#1d6b4f; }
+  .pill.none  { background:#3c3c3c; }
+  .spacer { flex:1; }
+  button { background:#2d2d2d; color:var(--fg); border:1px solid #555;
+           border-radius:3px; padding:4px 10px; cursor:pointer; font:inherit; }
+  button:hover:not(:disabled) { background:#3d3d3d; }
+  button:disabled { opacity:.4; cursor:default; }
+  button.primary { background:#1d5c33; border-color:#2d8a4a; }
+  button.primary:hover:not(:disabled) { background:#26743f; }
+  main { display:flex; height:calc(100vh - 42px); }
+  #list { width:280px; border-right:1px solid var(--line); overflow:auto; }
+  .file { padding:7px 10px; border-bottom:1px solid #2a2a2a; cursor:pointer; }
+  .file:hover { background:#2a2a2a; }
+  .file.sel { background:#0d3b5c; }
+  .file .n { display:flex; align-items:center; gap:6px; }
+  .tag { font-size:10px; padding:0 5px; border-radius:8px; }
+  .tag.nb { background:#5c3d0b; color:#ffd479; }
+  .tag.uf { background:#0b5c3d; color:#79ffb0; }
+  .tag.bad { background:#5c0b0b; color:#ff7979; }
+  .tag.man { background:#3d3d0b; color:#d4d479; }
+  .file .m { color:var(--dim); font-size:11px; margin-top:2px; }
+  #detail { flex:1; overflow:auto; padding:0; }
+  .empty { padding:24px; color:var(--dim); }
+  .bar { padding:6px 12px; border-bottom:1px solid var(--line);
+         display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .bar .t { font-weight:600; }
+  .cols { display:flex; align-items:stretch; }
+  .col { flex:1; min-width:0; border-right:1px solid var(--line); }
+  .col:last-child { border-right:none; }
+  .col h3 { margin:0; padding:4px 10px; font-size:11px; background:#252525;
+            border-bottom:1px solid var(--line); display:flex; gap:6px; align-items:center; }
+  .col pre { margin:0; padding:6px 0; overflow-x:auto; font:inherit;
+             min-height:calc(100vh - 130px); }
+  .col.ours pre   { background:var(--ours); }
+  .col.theirs pre { background:var(--theirs); }
+  .col.base pre   { background:var(--base); }
+  .col .del { padding:20px 10px; color:#ff7979; font-style:italic; }
+  .mark { display:inline-block; width:52px; color:var(--dim); text-align:right;
+          padding-right:10px; user-select:none; }
+  .hl { background:#5c4a0b; display:block; }
+  .gaps { padding:4px 10px; color:var(--dim); font-style:italic; }
+  #edit { padding:10px 12px; border-top:1px solid var(--line); background:#252526; }
+  #edit textarea { width:100%; height:150px; background:#1a1a1a; color:var(--fg);
+                   border:1px solid #555; border-radius:3px; padding:6px;
+                   font:inherit; resize:vertical; }
+  #edit .hint { color:var(--dim); font-size:11px; margin:4px 0; }
+  #msg { padding:5px 12px; border-top:1px solid var(--line); font-size:12px;
+         display:none; }
+  #msg.err { display:block; background:#5c0b0b; color:#ffd0d0; }
+  #msg.ok  { display:block; background:#0b3d2e; color:#b0ffd8; }
+  #msg .x { cursor:pointer; float:right; }
+</style>
+</head>
+<body>
+<header>
+  <h1>aigit 冲突解决</h1>
+  <span id="st-pill" class="pill none">读取中…</span>
+  <span id="st-left" class="pill none"></span>
+  <span class="spacer"></span>
+  <button onclick="reload()">刷新</button>
+  <button onclick="aborted()">放弃合并</button>
+  <button id="btn-commit" class="primary" onclick="doCommit()">完成合并</button>
+</header>
+
+<main>
+  <div id="list"></div>
+  <div id="detail"><div class="empty">选一个文件</div></div>
+</main>
+
+<div id="edit" style="display:none">
+  <div class="hint">
+    编辑完点「写回并 add」。会用 <code>expect_sha256</code> 做乐观并发校验 ——
+    你在别处改过同一个文件的话会被拒绝,不会静默覆盖。
+  </div>
+  <textarea id="ta" spellcheck="false"></textarea>
+  <div style="margin-top:6px; display:flex; gap:8px; align-items:center">
+    <button class="primary" onclick="doResolve()">写回并 add</button>
+    <button onclick="pick('ours')">整份取 ours</button>
+    <button onclick="pick('theirs')">整份取 theirs</button>
+    <button onclick="pick('base')">整份取 base</button>
+    <span id="edit-note" style="color:var(--dim)"></span>
+  </div>
+</div>
+
+<div id="msg"><span class="x" onclick="this.parentNode.style.display='none'">×</span><span id="msg-t"></span></div>
+
+<script>
+"use strict";
+/* 这个页面只吃 conflicts.py 的字段名。字段表见 aigit-conflicts.md。
+   注意两组行号别混:
+     oursStart/oursEnd  = 工作区(带标记那份)里的行号
+     oursLineStart/…End = ours 文件里的行号
+   页面高亮用前者,右侧三栏显示用 sides.*.text。 */
+let STATE = null, CUR = null, CURD = null;
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s == null ? "" : s)
+  .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+
+async function api(path, body) {
+  const opt = body === undefined ? {} : {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)
+  };
+  const r = await fetch(path, opt);
+  const j = await r.json().catch(() => ({ok:false, error:"响应不是 JSON"}));
+  return j;
+}
+
+function note(msg, kind) {
+  const el = $("#msg");
+  el.className = kind || "";
+  $("#msg-t").textContent = msg;
+}
+
+function reload() {
+  api("/api/conflict/state").then(j => {
+    if (!j.ok) { note("读状态失败: " + j.error, "err"); return; }
+    STATE = j;
+    $("#st-pill").className = "pill " + (j.inMerge ? "merge" : "none");
+    $("#st-pill").textContent = j.inMerge
+      ? ("合并中 · " + (j.branches.join(" + ") || "?")) : "不在合并态";
+    $("#st-left").textContent = "未解决 " + j.remaining;
+    $("#btn-commit").disabled = !j.inMerge || j.remaining > 0;
+    drawList(j.files);
+  });
+}
+
+function drawList(files) {
+  const el = $("#list");
+  if (!files.length) {
+    el.innerHTML = '<div class="empty">没有冲突文件</div>';
+    return;
+  }
+  el.innerHTML = files.map(f => {
+    const tags = [];
+    if (f.noBase) tags.push('<span class="tag nb">no-base</span>');
+    if (f.manuallyEdited) tags.push('<span class="tag man">已手改</span>');
+    if (f.crossCheckMismatch && f.crossCheckMismatch.length)
+      tags.push('<span class="tag bad">三方不一致</span>');
+    if (f.verified === true) tags.push('<span class="tag uf">已核对</span>');
+    return `<div class="file${CUR===f.path?" sel":""}" onclick="open('${esc(f.path)}')">
+      <div class="n"><span class="tag">${f.columns}栏</span>${esc(f.name)}${tags.join("")}</div>
+      <div class="m">${f.regionCount} 块 · ${esc(f.oursLabel||"?")} vs ${esc(f.theirsLabel||"?")}</div>
+    </div>`;
+  }).join("");
+}
+
+function open(path) {
+  CUR = path;
+  api("/api/conflict/inspect?file=" + encodeURIComponent(path)).then(d => {
+    if (!d.ok) { note("读文件失败: " + d.error, "err"); return; }
+    CURD = d;
+    drawList(STATE ? STATE.files : []);
+    drawDetail(d);
+  });
+}
+
+/* 把一个 region 在三份文件里的位置渲染成带行号的高亮块。
+   三个字段组的含义完全不同,这里各用各的:
+     d.worktree.lineCount  —— 工作区总行数(算缝隙用)
+     side.lineCount         —— 该侧总行数
+     reg[key+"LineStart"]   —— 该块在**该侧文件**里的行号 */
+function sideCol(key, d, reg) {
+  const s = d.sides[key];
+  if (!s.exists) return `<div class="col ${key}"><h3>${key} <span class="tag bad">已删除</span></h3>
+                         <div class="del">这一侧在 base 之上不存在(被删除)</div></div>`;
+  const lines = (s.text || "").split("\n");
+  if (lines.length && lines[lines.length-1] === "") lines.pop();
+  let out = "";
+  for (let i=0;i<lines.length;i++) {
+    const a = i+1, b = i+1;
+    const hit = reg && reg[key+"LineStart"] != null
+                && a >= reg[key+"LineStart"] && b <= reg[key+"LineEnd"];
+    out += hit ? `<span class="hl"><span class="mark">${a}</span>${esc(lines[i])}</span>`
+               : `<span class="mark">${a}</span>${esc(lines[i])}`;
+  }
+  const h3 = `<h3>${key} <span class="tag">${esc(s.label||s.ref||"")}</span>
+              <span style="color:var(--dim)">${lines.length} 行</span></h3>`;
+  return `<div class="col ${key}">${h3}<pre>${out}</pre></div>`;
+}
+
+function drawDetail(d) {
+  const el = $("#detail");
+  const bars = d.regions.map((r,i) =>
+    `块 ${i}: 标记 L${r.oursMarkerLine}/L${r.sepLine}/L${r.theirsMarkerLine}`
+    + ` · ours=[${r.oursStart},${r.oursEnd}] theirs=[${r.theirsStart},${r.theirsEnd}]`
+    + ` · ${r.verified ? "已核对" : "未核对"}`).join("<br>");
+  const cols = ["ours","theirs","base"].filter(k => d.sides[k].exists);
+  const gap = `<div class="gaps">… 非冲突部分 ${Math.max(0, d.worktree.lineCount - d.regions.length*6)} 行 …</div>`;
+
+  el.innerHTML =
+    `<div class="bar"><span class="t">${esc(d.path)}</span>
+       <span class="pill">${d.columns} 栏</span>
+       <span class="pill">${d.regionCount} 块</span>
+       ${d.noBase ? '<span class="tag nb">no-base(无共同祖先)</span>' : ""}
+       ${d.binary ? '<span class="tag bad">二进制</span>' : ""}
+       ${d.worktree.manuallyEdited ? '<span class="tag man">标记已被手工删掉</span>' : ""}
+       <span style="color:var(--dim)">${esc(bars)}</span></div>
+     <div class="cols">${gap}${cols.map(k=>sideCol(k,d,null)).join("")}</div>`;
+
+  // 编辑框装工作区当前内容(含标记),用户改完写回
+  const ta = $("#ta");
+  ta.value = d.worktree.text || "";
+  $("#edit").style.display = "";
+  $("#edit-note").textContent = d.worktree.text == null
+    ? "二进制文件,用整份取用或 delete 动作" : "";
+  [...$("#edit").querySelectorAll("button")].forEach(x => {
+    if (/base/.test(x.textContent) && !d.sides.base.exists) x.disabled = true;
+  });
+
+  // 逐块渲染一次,让用户看到 base 到底对应哪几行
+  d.regions.forEach((r, i) => {
+    const row = document.createElement("div");
+    row.className = "gaps";
+    row.textContent = `── 块 ${i} ── ours ${r.oursLines} 行 / theirs ${r.theirsLines} 行`
+      + (r.baseLocatedText != null ? ` / base 在 ${d.sides.base.label||"base"} 的第 ${r.baseLineStart}–${r.baseLineEnd} 行` : "");
+    el.querySelector(".cols").appendChild(row);
+    ["ours","theirs","base"].filter(k=>d.sides[k].exists).forEach(k => {
+      row.appendChild(sideCol(k, d, r));
+    });
+  });
+}
+
+async function doResolve() {
+  if (!CUR) return;
+  const j = await api("/api/conflict/resolve", {
+    path: CUR, content: $("#ta").value, expectSha256: CURD.worktree.sha256
+  });
+  if (!j.ok) { note("写回被拒: " + j.error, "err"); return; }
+  note("已写回并 add。未解决 " + j.remainingCount, "ok");
+  reload();
+  if (j.remainingCount === 0) $("#detail").innerHTML = '<div class="empty">全部解决,可以完成合并了</div>';
+}
+
+async function pick(side) {
+  if (!CUR) return;
+  const j = await api("/api/conflict/choose", { path: CUR, side });
+  if (!j.ok) { note("取 " + side + " 被拒: " + j.error, "err"); return; }
+  note("已整份取 " + side + "。未解决 " + j.remainingCount, "ok");
+  reload();
+}
+
+async function doCommit() {
+  const j = await api("/api/conflict/commit", {});
+  if (!j.ok) { note("提交被拒: " + j.error, "err"); return; }
+  note("已提交 " + j.shortCommit + ": " + j.message.replace(/\n/g, " | "), "ok");
+  reload();
+}
+
+async function aborted() {
+  const j = await api("/api/conflict/abort", {});
+  if (!j.ok) { note("放弃失败: " + j.error, "err"); return; }
+  note("已放弃合并", "ok");
+  CUR = null; CURD = null;
+  $("#detail").innerHTML = '<div class="empty">选一个文件</div>';
+  $("#edit").style.display = "none";
+  reload();
+}
+
+reload();
+</script>
+</body>
+</html>
