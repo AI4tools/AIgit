@@ -46,6 +46,94 @@ tools\aigit\aigit.bat -Port 9000
 
 ---
 
+## 冲突解决与历史操作
+
+`conflicts.py` 与 `history_ops.py` 是两个独立模块（各自有自己的对抗性测试套件），
+`server.py` 接线后才对外可达。接线前这些接口全是 404 —— 模块测得再好，产品里够不着不算数。
+
+**冲突解决**（路径参数一律先过 `resolve_in_root`：`.git` 拦截与联接拦截同样生效）
+
+| 接口 | 做什么 |
+|---|---|
+| `GET /api/conflict/state` | 合并态快照：在不在合并中、参与分支、还剩几个没解决 |
+| `GET /api/conflict/list` | 冲突文件清单（每项带三栏/块数/是否已核对等摘要） |
+| `GET /api/conflict/inspect?file=` | 单个文件的三方全文与逐块对齐 |
+| `POST /api/conflict/resolve` | 写回用户编辑后的内容并 `git add`。**`content` 必须显式给** |
+| `POST /api/conflict/choose` | 整份取一侧（`side` ∈ `ours` / `theirs` / `base`） |
+| `POST /api/conflict/delete` | 「一边删一边改」时标记删除 |
+| `POST /api/conflict/commit` | 提交合并结果；还有未合并路径就 400 |
+| `POST /api/conflict/abort` | 放弃合并 |
+
+**历史与危险操作**（`history_ops.py`）。破坏性的几步是 `plan` / `do` 两步设计：
+`GET /api/history/plan/<op>` 只读预演，`POST` 那一步必须带 `confirmed: true`，
+**没有一步到位的入口**。可选 `<op>`：`stash` / `stash-drop` / `amend` /
+`undo-last-commit` / `reflog-restore` / `revert` / `branch-rename` / `branch-delete` / `tag-delete`。
+
+| 接口 | 做什么 |
+|---|---|
+| `GET /api/history/reflog` / `tags` / `stashes` | 三张清单 |
+| `GET /api/history/blame?file=&start=&end=` | 逐行归属 |
+| `GET /api/history/file?file=&limit=&follow=` | 单个文件的提交史 |
+| `POST /api/history/stash` / `stash/apply` / `stash/pop` / `stash/drop` | 暂存一组 |
+| `POST /api/history/amend` / `undo-last-commit` / `reflog/restore` | 改写或回退 |
+| `POST /api/history/revert` / `revert/abort` | 反向提交 |
+| `POST /api/history/branch/rename` / `branch/delete` | 分支增删改名 |
+| `POST /api/history/tag/create` / `tag/delete` | 标签增删 |
+
+两处接线时特意加严、值得记一笔的地方：
+
+- **`/api/conflict/resolve` 的 `content` 必须是字符串且必须显式给。**
+  `resolve()` 内部写的是 `(content or "").encode()`，于是「漏传字段」与
+  「用户故意把文件清空」在模块里是同一个结果：落一个 0 字节文件。清空是合法结果
+  （两边都删），所以不拒；但漏传是客户端 bug，让它变成静默数据丢失是接线引入的坑。
+- **请求体里的布尔开关只认真 `true` / `false`。** 这些开关里有 `confirmed`，
+  而 `"confirmed": "false"` 在 Python 里是**真的**。用 `bool(x)` 收字段等于把
+  「前端把 false 序列化成字符串」这个极常见的 bug 变成一次误删。
+
+---
+
+## 可选：性能层（默认**不生效**）
+
+`aigit_perf.py` 是一个**可选**的性能增强层，给大仓加三样东西：
+
+| 能力 | 接口 | 做什么 |
+|---|---|---|
+| 状态分页 | `GET /api/status?offset=&limit=` | 大仓一次只回一页，附 `page` / `totals` |
+| diff 截断 | `GET /api/diff?file=&maxLines=` | 超长 diff 只回头部，如实报告砍掉多少 |
+| status 快路径 | 同上 | `git status` 从两次子进程减到一次（分支名从同一次输出里拿） |
+
+**它默认不在启动路径上。** `aigit.bat` / `aigit.ps1` / `python server.py`
+三条都不调用 `install()`，所以上面三样一个都没生效。这是刻意的：性能工具应当
+**可选**，不该每次启动都跑（详见 `doc/aigit-E13-perf-layer.md` §4）。
+
+**要开就显式开，从仓库任何位置都能跑（不用先 `cd` 进 `tools\aigit`）：**
+
+```
+python tools\aigit\aigit_perf.py --serve --root <仓库> --port 8777
+```
+
+`--root` / `--port` / `--sandbox` 原样转交 `server.py`；本文件自己认的额外参数：
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `--max-diff-lines N` | 5000 | 单文件 diff 超过这么多行就截断 |
+| `--page-limit N` | 200 | 只给了 `offset` 没给 `limit` 时用多少条 |
+| `--no-fast-status` | 关 | 保留 `server.py` 原有的 v1 解析器（做对照测量用） |
+
+**不开就还是普通 aigit，功能不受任何影响。**
+
+跑它之前先看一眼自检（纯内存，不建仓、不碰 git、几毫秒，有失败退 1）：
+
+```
+python tools\aigit\aigit_perf.py
+```
+
+想看它到底省了什么，看 `doc/aigit-E13-perf-layer.md`；要提醒的两点：
+**它不是基准测试**（文件里一行计时代码都没有），以及**它靠 monkeypatch 与
+`server.py` 耦合**——`server.py` 改路由时它不会自动跟着改。
+
+---
+
 ## 启动器参数
 
 `aigit.bat` 和 `aigit.ps1` 认同一套核心参数。批处理版帮助是中文，PowerShell 版是英文
@@ -152,6 +240,12 @@ UI 里点分支行内按钮前，先用顶栏下拉切到 A。
 
 **注意**：`/api/commit` 内部会先跑 `git add -A`，所以**「提交」会把未暂存的改动一起提交**，
 不是只提交已暂存部分。这一点页面下方有常驻提示。
+
+提交前还有一道拦截：`git add -A` 会**穿过目录联接**，所以工作区里只要有一个指向
+仓外的联接（`mklink /J`、符号链接、挂载点），`/api/commit` 会返回 400 并列出那个路径，
+**一个字节都不提交**。原因在 `Repo.escaping_links()`：不拦住的话，一次提交就会把
+仓外文件复制进对象库，删掉联接也删不掉已经写进去的历史。这一点与已暂存/未暂存无关，
+所以它拦的是整次提交而不是某个文件。
 
 ---
 
@@ -416,6 +510,7 @@ python selftest.py
 | `smoke.py` | UTF-8 无 BOM + LF | 纯 stdlib 无头自检，62 条断言 |
 | `server.py` | — | HTTP 层，本机服务，只 bind `127.0.0.1` |
 | `gen.py` | — | 测试数据生成器，不依赖 HTTP，可单独跑 |
+| `aigit_perf.py` | UTF-8 无 BOM + LF | **可选**性能层（分页 / diff 截断 / status 快路径）。默认不挂，靠 `--serve` 显式开；不带参数跑 = 纯内存自检 |
 | `web/index.html` | UTF-8 | 前端整个界面（单文件） |
 | `gen-notes.md` | UTF-8 | 生成器设计与验证方法 |
 

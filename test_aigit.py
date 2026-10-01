@@ -42,7 +42,16 @@ import urllib.request
 AIGIT = os.path.dirname(os.path.abspath(__file__))
 SERVER_PY = os.path.join(AIGIT, "server.py")
 GEN_PY = os.path.join(AIGIT, "gen.py")
-TESTROOT = os.path.join(tempfile.gettempdir(), "aigit-test")
+# 临时仓根**必须带进程号**。这不是洁癖: `main()` 开头会 `shutil.rmtree(TESTROOT)`
+# 把整棵目录删掉, 而这个路径原来是全局固定的 `%TEMP%\aigit-test` ——
+# 于是两个 `test_aigit.py` 同时跑, 后启动的那个会把前一个**正在用**的仓删光。
+# 症状不是「测试失败」, 是**看起来像产品缺陷的假 FAIL**:
+#   * `/api/gen` 返 400, error='仓里还没有任何提交(HEAD 不存在)...'
+#   * 直接打 gen.py 的用例报 `fatal: not a git repository`(它自己的仓被删了)
+#   * 上一遍还绿的用例这一遍变红(被误伤, 不是回归)
+# 也就是说修好之前, 任何「N/55」都只在别的线静止时才是真的。
+# `test_aigit_extra.py:79` 早就为此改用了 `aigit-test-extra`; 这里补上 pid。
+TESTROOT = os.path.join(tempfile.gettempdir(), "aigit-test-%d" % os.getpid())
 
 GIT_ENV = dict(os.environ)
 GIT_ENV.update({
@@ -198,7 +207,12 @@ class HeadlessServer:
         return "http://127.0.0.1:%d%s" % (port, path)
 
     def _raw(self, port, method, path, body=None, ctype="application/json",
-             headers=None, timeout=180):
+             headers=None, timeout=180, with_headers=False):
+        """默认回 (code, body_str); `with_headers=True` 时回 (code, body_str, headers)。
+
+        加这个开关而不是新开一个方法: 50+ 处调用点都按 (code, body) 解包,
+        改返回值形状就得全改一遍, 而多带一个头只在查静态文件时才有意义。
+        """
         data = body
         if isinstance(data, str):
             data = data.encode("utf-8")
@@ -209,9 +223,12 @@ class HeadlessServer:
             req.add_header(k, v)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.status, r.read().decode("utf-8", "replace")
+                txt = r.read().decode("utf-8", "replace")
+                return (r.status, txt, dict(r.headers)) if with_headers \
+                    else (r.status, txt)
         except urllib.error.HTTPError as e:
-            return e.code, e.read().decode("utf-8", "replace")
+            txt = e.read().decode("utf-8", "replace")
+            return (e.code, txt, dict(e.headers)) if with_headers else (e.code, txt)
 
     def raw(self, method, path, body=None, **kw):
         return self._raw(self.port, method, path, body, **kw)
@@ -958,10 +975,20 @@ def t_c7c(ctx):
 
 @test("C", "checkout-has-no-whitelist", bug="C13-crit")
 def t_c7b(ctx):
-    """C7b /api/checkout 完全没有白名单(不像 /api/branch)。
+    """C7b /api/checkout 必须有白名单, 与 /api/branch 同一套。
 
-    这是接口之间的不一致: 建分支要过白名单, 切分支不过。
-    能拿它做什么? 至少要能拿到 git 的选项注入。
+    **这条断言的方向在 2026-10-01 修正过一次, 理由必须留着**:
+    原断言是 `ck(not accepted, "接口无任何校验")` + 「`a.txt` 必须变成 `'a\\n'`」
+    —— 后者要求 `-f` **被接受并丢弃用户的未提交改动**。那是在钉 bug。
+
+    回到规格原文(`doc/aigit-review.md:201`, F-04):
+        「**期望行为**: 这类值应被拒绝。」
+    以及修法表 `doc/aigit-review.md:691`:
+        「给 `checkout` 加和 `new_branch` 同一套白名单」
+
+    「应被拒绝」的推论是: 一次 `git checkout` 都没跑过 ⇒ 未提交改动**必须还在**。
+    原断言的期望值与规格直接矛盾, 不是实现偏离规格 —— 详见
+    `doc/aigit-close-3-failures.md` §3。
     """
     r = ctx.repo
     r.write("a.txt", "a\n")
@@ -983,21 +1010,31 @@ def t_c7b(ctx):
             accepted.append(name)
     # 先量后果, 最后才断言 —— ck() 是立刻抛的, 顺序反了就永远量不到证据。
     _checkout_impact(ctx, r)
-    ck(not accepted, "checkout 接受了这些值(接口无任何校验): %r" % accepted)
+    # 「这类值应被拒绝」= 白名单在生效。原值是 `not accepted`, 那在
+    # 「全被拒」与「全被接受」两种世界里都成立, 挡不住「只放行一个」。
+    ck_eq(accepted, [], "checkout 接受了这些值(白名单没拦住): %r" % accepted)
 
 
 def _checkout_impact(ctx, r):
-    """把 checkout 放行的后果量出来 —— 只列「被接受」不够, 要说清损失了什么。"""
+    """白名单拒绝之后, 断言工作区/分支/status **一个都没被动过**。
+
+    原版这里是反的: 它断言 `a.txt == "a\\n"`(改动被 force 丢掉了)与
+    「分支 != HEAD」(被 `--detach` 推走了)—— 两条都在要求危害发生。
+    现在这三条是钉住「拒绝即无副作用」, 比原版**更严**: 原版只查两个方向,
+    这里把 status 也钉住, 并且值从「危害已发生」翻成「危害未发生」。
+    """
     ctx.note("事后 git 认定的分支: %r"
              % r.out("rev-parse", "--abbrev-ref", "HEAD").strip())
     ctx.note("事后 a.txt 内容: %r  (HEAD 里是 'a\\n', 动手前工作区是 'modified\\n')"
              % r.read("a.txt"))
     ctx.note("事后 git status: %r  (空 = 未提交改动被静默丢弃)" % r.out("status", "--porcelain")[:160])
-    # -f 是 force checkout: 脏工作区会被直接扔掉, 用户没提交的东西消失且无提示
-    ck_eq(r.read("a.txt"), "a\n",
-          "checkout -f 之后 a.txt 的未提交改动消失了 —— force 丢弃了工作区改动")
-    ck(r.out("rev-parse", "--abbrev-ref", "HEAD").strip() != "HEAD",
-       "checkout --detach 之后仓库停在游离 HEAD 上, 而 aigit 自己不认这个状态")
+    ck_eq(r.read("a.txt"), "modified\n",
+          "未提交改动消失了 —— 而所有 hostile 值本该被 400 拒绝, 不该有任何副作用")
+    ck_eq(r.out("rev-parse", "--abbrev-ref", "HEAD").strip(), "main",
+           "被拒的 checkout 竟然改了当前分支(游离 HEAD 是 aigit 自己不认的状态)")
+    # 不 strip: git status --porcelain 的首列(X 索引位)是空格, 有意义
+    ck_eq(r.out("status", "--porcelain"), " M a.txt\n",
+          "被拒的 checkout 竟然改了 git status")
 
 
 @test("C", "reset-is-unconditional", bug="C14")
@@ -1763,6 +1800,20 @@ def t_x9(ctx):
     git 的 pathspec magic(`:(glob)` `:(exclude)` `:/` `:(top)`)不是文件系统路径,
     resolve_in_root 会把它当成一个普通文件名放行, 然后 git 按 magic 解释它。
     结果: 声称「stage 这一个文件」, 实际 stage 了一批。
+
+    **期望值在 2026-10-01 修正过一次, 理由必须留着**:
+    原断言是 `ck_eq(sorted(st), ["a.txt"], ...)`。规格原文
+    (`doc/aigit-review.md:281`, F-06)写的是:
+
+        「**期望行为**: 只 stage 那个字面名文件(不存在 → 无操作),
+          **或** 400 拒绝。」
+
+    两个合法结局是「无操作」(stage 不到任何东西)与「400 拒绝」,
+    **两个都不产生 `['a.txt']`**。而且 `['a.txt']` 不可达: 仓里 `a.txt` 与
+    `b.txt` 完全对称(同层、同后缀、同为已跟踪、同在 `c1`、同被改成
+    `modified`、同未暂存), 请求串 `:(glob)**/*.txt` 里没有任何东西能提供
+    区分依据 —— 按深度/后缀/状态/提交都区分不了。穷举与论证见
+    `doc/aigit-close-3-failures.md` §4。
     """
     r = ctx.repo
     for n in ["a.txt", "b.txt", "deep/c.txt", "keep.md"]:
@@ -1771,20 +1822,266 @@ def t_x9(ctx):
     for n in ["a.txt", "b.txt", "deep/c.txt"]:
         r.write(n, "modified\n")
 
-    code, j = ctx.srv.jpost("/api/stage", {"files": [":(glob)**/*.txt"]})
-    ctx.note("stage %-20r -> %s" % (":(glob)**/*.txt", code))
-    ck_eq(code, 200, "stage pathspec 状态码")
-    st = r.git("diff", "--cached", "--name-only").stdout.split()
-    ctx.note("实际被 stage 的文件: %r" % sorted(st))
-    ck_eq(sorted(st), ["a.txt"],
-          "只要求 stage 一个 pathspec, git 实际 stage 了 %r" % sorted(st))
+    # F-06 的核心: 声称 stage 一个 pathspec, 绝不能 stage 出一批。
+    # 「或 400 拒绝」是规格给的第二个合法结局, 所以两个都放行 ——
+    # 唯一不放行的是「stage 出多于请求范围的文件」。
+    for magic in (":(glob)**/*.txt", ":(exclude)a.txt", ":(top)", ":/"):
+        code, j = ctx.srv.jpost("/api/stage", {"files": [magic]})
+        st = sorted(r.git("diff", "--cached", "--name-only").stdout.split())
+        ctx.note("stage %-20r -> %-4s 实际被 stage 的: %r" % (magic, code, st))
+        ck(code == 400 or st == [],
+           "magic %r 必须被 400 拒绝或退化成无操作, 实际 code=%s staged=%r"
+           % (magic, code, st))
+        r.git("reset", "-q", "HEAD", "--")
 
+    # 对照: 正常字面名必须还能 stage —— 挡住「一律不 stage 也能过上面那组」。
+    code, j = ctx.srv.jpost("/api/stage", {"files": ["a.txt"]})
+    ctx.note("对照: stage 'a.txt' -> %s" % code)
+    ck_eq(code, 200, "正常字面名 stage 状态码")
+    ck_eq(sorted(r.git("diff", "--cached", "--name-only").stdout.split()), ["a.txt"],
+          "正常字面名文件没被 stage 成功 —— 修复不能是把 stage 整体弄坏")
     r.git("reset", "-q", "HEAD", "--")
-    code, j = ctx.srv.jpost("/api/stage", {"files": [":/"]})
-    ctx.note("stage %-20r -> %s" % (":/", code))
-    st = r.git("diff", "--cached", "--name-only").stdout.split()
-    ctx.note("用 :/ 之后被 stage 的: %r" % sorted(st))
-    ck_eq(sorted(st), [], ":/ 把整个仓都 stage 了")
+
+
+# ════════════════════════════════ N 组: 接线可达性(conflicts / history_ops)
+#
+# 这一组的存在理由与其他 54 条不同: 别的组测「接口做了什么」, 这组测
+# 「接口**存在**」。`conflicts.py`(40KB)与 `history_ops.py`(65KB)一直在仓里,
+# 也各有自己的测试套件(test_conflicts.py 14 条 / test_history_ops.py 37 条),
+# 但 server.py **从来没有 import 过它们** —— 于是 aigit 最有分量的这两块功能
+# 在产品里 100% 不可达: 所有 `/api/conflict/*` 与 `/api/history/*` 全是 404。
+# 「模块测得再好, 产品里够不着」不算数, 所以门禁必须落在 HTTP 这一层。
+#
+# ⚠ 方向:这组测的是**该通的通 + 该拒的拒**, 不是「某个洞存在」。
+#   反过来说, 如果哪天有人把接线摘掉, 这组会红 —— 那是**对**的。
+
+@test("N", "conflict-routes-wired", bug="N1-接线")
+def t_n1(ctx):
+    """N1 `/api/conflict/*`:真造一个冲突态, 把写路径端到端跑通。
+
+    为什么非要**真冲突**:只打 `GET /api/conflict/state` 只能证明路由活着。
+    `resolve` / `choose` / `commit` 三条路在「没有冲突」时会被模块自己的
+    「不在合并态」前置检查挡掉, 返回的 400 与「路由坏了」的 404 长得一样 ——
+    分不开。所以这里造两个冲突文件, 一个走 `choose`、一个走 `resolve`,
+    再提交合并, 并核对**磁盘上的内容**。
+    """
+    r = ctx.repo
+    for n in ("cf.txt", "cg.txt"):
+        r.write(n, "base\n")
+    r.commit("c1")
+    main_branch = r.out("rev-parse", "--abbrev-ref", "HEAD").strip()
+    r.git("checkout", "-b", "side")
+    for n in ("cf.txt", "cg.txt"):
+        r.write(n, "side\n")
+    r.commit("side change")
+    r.git("checkout", main_branch)          # 不写死 "main": git init 的默认名不是它
+    for n in ("cf.txt", "cg.txt"):
+        r.write(n, "main\n")
+    r.commit("main change")
+    mg = r.git("merge", "side", check=False)
+    ck(mg.returncode != 0, "没造出冲突,这一条后面全是空跑(merge rc=0)")
+    ck_eq(sorted(x for x in r.out("status", "--porcelain").split("\n") if x),
+          ["UU cf.txt", "UU cg.txt"], "冲突态没造出来")
+
+    code, j = ctx.srv.jget("/api/conflict/state")
+    ck_eq(code, 200, "/api/conflict/state 应 200")
+    ck_eq(j.get("inMerge"), True, "state 没认出合并态")
+    ck_eq(j.get("remaining"), 2, "state 报的未解决数不对")
+    ctx.note("参与分支 = %r" % (j.get("branches"),))
+
+    code, j = ctx.srv.jget("/api/conflict/list")
+    ck_eq(code, 200, "/api/conflict/list 应 200")
+    ck_eq(sorted(x["path"] for x in (j.get("files") or [])),
+          ["cf.txt", "cg.txt"], "冲突清单不对")
+
+    code, j = ctx.srv.jget("/api/conflict/inspect?file=" + urllib.parse.quote("cf.txt"))
+    ck_eq(code, 200, "/api/conflict/inspect 应 200")
+    ck(j.get("regionCount", 0) >= 1, "inspect 没给出冲突块数")
+
+    # 路径校验: 换了模块不等于少一道拦截
+    for bad_f in ("../x", ".git/config", "cf.txt/../../x"):
+        code, _ = ctx.srv.jget("/api/conflict/inspect?file="
+                              + urllib.parse.quote(bad_f))
+        ck_eq(code, 400, "inspect %r 期望 400" % bad_f)
+
+    # 未解决时不许提交合并
+    code, _ = ctx.srv.jpost("/api/conflict/commit", {"message": "m"})
+    ck_eq(code, 400, "还有未合并路径时 /api/conflict/commit 期望 400")
+
+    # 写路径 A: 整份取一侧
+    code, j = ctx.srv.jpost("/api/conflict/choose",
+                            {"file": "cf.txt", "side": "ours"})
+    ck_eq(code, 200, "choose ours 应 200")
+    ck_eq(j.get("stillUnmerged"), False, "choose 之后仍算未合并")
+    ck_eq(r.read("cf.txt"), "main\n", "choose ours 落盘的内容不对")
+
+    code, _ = ctx.srv.jpost("/api/conflict/choose",
+                            {"file": "cf.txt", "side": "evil"})
+    ck_eq(code, 400, "非法 side 期望 400")
+
+    # 写路径 B: 用户编辑的内容真落盘。
+    # `content` 的三种坏传法都必须 400 —— 模块里是 `(content or "").encode()`,
+    # 漏传字段与「故意清空」在模块里同义, 是接线层必须分开的那一刀。
+    marked = r.read("cg.txt")
+    for body, why in (({"file": "cg.txt"}, "漏传 content"),
+                      ({"file": "cg.txt", "content": None}, "content=null"),
+                      ({"file": "cg.txt", "content": 42}, "content=数字")):
+        code, _ = ctx.srv.jpost("/api/conflict/resolve", body)
+        ck_eq(code, 400, "resolve %s 期望 400" % why)
+        ck_eq(r.read("cg.txt"), marked, "resolve %s 却动了工作区" % why)
+
+    # expect_sha256 必须真的透传。**必须在成功 resolve 之前打这一发** ——
+    # resolve 之后该路径已不是未合并态, `resolve()` 里「有没有 U 条目」那道
+    # 检查排在 sha256 检查**前面**, 报出来的是「不是未合并路径」, 根本走不到
+    # sha256 那一步 —— 那样这条断言验证不了任何东西(这个坑我踩过两次)。
+    code, txt = ctx.srv.raw("POST", "/api/conflict/resolve", json.dumps(
+        {"file": "cg.txt", "content": "x\n", "expect_sha256": "0" * 64}))
+    ck_eq(code, 400, "错的 expect_sha256 期望 400")
+    ck("sha256" in txt, "报的错不是 sha256 不匹配,说明 expect_sha256 没接上: %r"
+       % txt[:140])
+    ck_eq(r.read("cg.txt"), marked, "expect_sha256 对不上却动了工作区")
+
+    merged = "手工合并结果\n第二行\n"
+    code, j = ctx.srv.jpost("/api/conflict/resolve",
+                            {"file": "cg.txt", "content": merged})
+    ck_eq(code, 200, "resolve 应 200")
+    ck_eq(r.read("cg.txt"), merged, "resolve 落盘的内容不对")
+    ck_eq(j.get("stillUnmerged"), False, "resolve 之后仍算未合并")
+
+    code, j = ctx.srv.jget("/api/conflict/list")
+    ck_eq(j.get("count"), 0, "解决完还有未合并文件")
+
+    code, j = ctx.srv.jpost("/api/conflict/commit", {"message": "merge side"})
+    ck_eq(code, 200, "提交合并应 200")
+    ck_eq(j.get("committed"), True, "commit_merge 没说自己提交了")
+    ck_eq(r.read("cg.txt"), merged, "提交后工作区内容被改了")
+    ck_eq(ctx.srv.jget("/api/conflict/state")[1].get("inMerge"), False,
+          "提交后还在合并态")
+
+    # 合并已结束: 任何写入都必须被拒(模块的 require_merge)
+    code, _ = ctx.srv.jpost("/api/conflict/resolve",
+                            {"file": "cg.txt", "content": "y\n"})
+    ck_eq(code, 400, "合并结束后 resolve 期望 400")
+    ck_eq(r.read("cg.txt"), merged, "合并结束后 resolve 却动了工作区")
+    ck(ctx.srv.alive(), "服务不健康")
+
+
+@test("N", "history-routes-wired", bug="N2-接线")
+def t_n2(ctx):
+    """N2 `/api/history/*`:只读清单、预演、危险操作的两步护栏。
+
+    危险操作一个都不真做(unconfirmed / wrong-sha / 非法名字 就该全被拒),
+    因为这条测的是**接线与护栏**, 不是 git 的行为 —— `test_history_ops.py`
+    37 条已经把模块本身测透了, 这里只保证产品够得着、且够着的方式是安全的。
+    """
+    r = ctx.repo
+    r.write("h.txt", "one\n")
+    r.commit("c1")
+    r.git("branch", "spare")           # 有一条「已存在但不是当前分支」可预演删除
+    r.write("h.txt", "two\n")
+    r.write("untracked.txt", "u\n")
+
+    # 预演分两类, 不能一律当 200:
+    #   * 会给出影响面的 -> 200(哪怕 safe:false / blocked 非空, 那都是**信息**)
+    #   * 一开始就没法做的 -> 400(分支不存在、工作区干净…) —— 那是模块的用法护栏,
+    #     不是接线坏了。所以下面两条单独断言 400。
+    for path, key in (("/api/history/reflog", None),
+                      ("/api/history/tags", None),
+                      ("/api/history/stashes", None),
+                      ("/api/history/plan/amend", "op"),
+                      ("/api/history/plan/undo-last-commit", "op"),
+                      ("/api/history/plan/undo-last-commit?drop_changes=1", "op"),
+                      ("/api/history/plan/revert?sha=HEAD", "op"),
+                      ("/api/history/plan/branch-delete?name=spare", "op"),
+                      ("/api/history/plan/stash", "op"),
+                      ("/api/history/plan/stash?include_untracked=1", "op")):
+        code, j = ctx.srv.jget(path)
+        ck_eq(code, 200, "%s 应 200" % path)
+        if key:
+            ck(j.get(key), "%s 没返回 %r" % (path, key))
+    # 分支不存在 -> 400: 预演也照样有用法护栏, 不是「一律返回 200 的空壳」
+    code, _ = ctx.srv.jget("/api/history/plan/branch-delete?name=no-such-branch")
+    ck_eq(code, 400, "预演删除一个不存在的分支期望 400")
+    ck(isinstance(ctx.srv.jget("/api/history/reflog")[1], list),
+       "reflog 应回一个数组")
+
+    for path in ("/api/history/blame?file=h.txt",
+                 "/api/history/file?file=h.txt"):
+        code, j = ctx.srv.jget(path)
+        ck_eq(code, 200, "%s 应 200" % path)
+        ck(j.get("ok") is True, "%s 没回 ok" % path)
+    code, _ = ctx.srv.jget("/api/history/blame?file=" + urllib.parse.quote("../x"))
+    ck_eq(code, 400, "blame 越界期望 400")
+
+    # op 来自 URL: 拼错一个字母必须 400, 而不是 getattr 到别的东西上
+    code, _ = ctx.srv.jget("/api/history/plan/rm-rf")
+    ck_eq(code, 400, "不存在的预演期望 400")
+    code, _ = ctx.srv.jget("/api/history/plan/__init__")
+    ck_eq(code, 400, "预演 op 不该能调到任意属性")
+
+    # 两步护栏: 没 confirmed 就必须被拒
+    for path, body in (("/api/history/amend", {"message": "x"}),
+                       ("/api/history/stash/drop", {"index": 0}),
+                       ("/api/history/branch/delete", {"name": "x"}),
+                       ("/api/history/tag/delete", {"name": "x"}),
+                       ("/api/history/undo-last-commit", {}),
+                       ("/api/history/reflog/restore", {"index": 0})):
+        code, txt = ctx.srv.raw("POST", path, json.dumps(body))
+        ck_eq(code, 400, "%s 未确认期望 400" % path)
+        ck("plan" in txt, "%s 的拒绝理由里没提到先看预演: %r" % (path, txt[:120]))
+
+    # 布尔开关只认真 bool —— `"confirmed": "false"` 在 Python 里是真的,
+    # 收得松一点就是把「前端把 false 序列化成字符串」变成一次误删
+    for body in ({"index": 0, "confirmed": "true"},
+                 {"index": 0, "confirmed": 1},
+                 {"message": "w", "include_untracked": "true"}):
+        path = ("/api/history/stash" if "include_untracked" in body
+                else "/api/history/stash/drop")
+        code, _ = ctx.srv.jpost(path, body)
+        ck_eq(code, 400, "%s 收到非布尔 %r 期望 400" % (path, body))
+
+    # 真做一步可恢复的(建 tag / stash / stash apply) —— 这几条不破坏历史
+    code, j = ctx.srv.jpost("/api/history/tag/create",
+                            {"name": "v1", "message": "m"})
+    ck_eq(code, 200, "建 tag 应 200")
+    ck(any(x.get("name") == "v1"
+           for x in ctx.srv.jget("/api/history/tags")[1]), "tag 列表里没有 v1")
+    code, _ = ctx.srv.jpost("/api/history/tag/create", {"name": "-x"})
+    ck_eq(code, 400, "以 - 开头的 tag 名期望 400")
+
+    code, j = ctx.srv.jpost("/api/history/stash",
+                            {"message": "wip", "include_untracked": True})
+    ck_eq(code, 200, "stash 应 200")
+    ck_eq(r.out("status", "--porcelain").strip(), "", "stash 之后工作区还脏")
+    code, j = ctx.srv.jpost("/api/history/stash/apply", {"index": 0})
+    ck_eq(code, 200, "stash apply 应 200")
+    ck(os.path.exists(os.path.join(r.dir, "untracked.txt")),
+       "stash apply 没把文件贴回来")
+    ck(ctx.srv.alive(), "服务不健康")
+
+
+@test("N", "static-pages-served", bug="N3-接线")
+def t_n3(ctx):
+    """N3 冲突演示页在产品里必须打得到。
+
+    以前 `web/conflicts-demo.html` 只存在于 test_aigit_web.py 自己起的那个
+    静态服务器里, aigit 自己不发它 —— 于是「演示页能跑」这件事只在测试里成立。
+    接口接上之后这页才有意义, 接上却不给人看等于没接。
+    """
+    for path, magic, ctype in (
+            ("/conflicts-demo.html", "onclick", "text/html"),
+            ("/virtuallist.js", "function", "application/javascript")):
+        code, body, hdrs = ctx.srv.raw("GET", path, with_headers=True)
+        ck_eq(code, 200, "GET %s 应 200" % path)
+        ck(magic in body, "%s 内容不像 %r" % (path, magic))
+        ck(ctype in (hdrs.get("Content-Type") or ""),
+           "%s 的 Content-Type 应含 %r, 实际 %r"
+           % (path, ctype, hdrs.get("Content-Type")))
+    # 白名单之外一律 404: 静态文件**不按路径拼**, 所以这两个必须是「没有这个接口」
+    for path in ("/conflicts.py", "/../server.py", "/web/../../server.py"):
+        code, _ = ctx.srv.raw("GET", path)
+        ck(code in (400, 404), "GET %s 返回 %s —— 不该发仓内文件" % (path, code))
+    ck(ctx.srv.alive(), "服务不健康")
 
 
 # ════════════════════════════════════════════════════════ 运行器
@@ -1913,6 +2210,10 @@ def main(argv=None):
             print("    [%s] %-14s %-26s bug=%s" % (st, t["id"], t["name"], t["bug"] or "-"))
             print("           %s" % d.split("\n")[0][:150])
     print("=" * 78)
+    # 根目录带 pid, 所以**只有自己**会 rmtree 它 —— 崩在半路的进程留下的目录
+    # 也不会被别人顺手清掉, 得以留作现场。--keep 时故意留着。
+    if not a.keep:
+        shutil.rmtree(TESTROOT, ignore_errors=True)
     return 0 if not bad else 1
 
 

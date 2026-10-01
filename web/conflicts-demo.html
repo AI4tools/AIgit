@@ -107,10 +107,27 @@
      oursLineStart/…End = ours 文件里的行号
    页面高亮用前者,右侧三栏显示用 sides.*.text。 */
 let STATE = null, CUR = null, CURD = null;
+// drawList 刚渲染出来的那些行, 按行里 data-i 的下标取。事件委托用它把点击
+// 还原成路径 —— 行里只留数字, 用户数据一个都不进 HTML 属性。
+let ROWS = [];
 
 const $ = (s) => document.querySelector(s);
+// esc() 必须转义**引号**,不只是 & < >。
+//
+// 原实现只转了 & < >,于是 `'` 与 `"` 原样穿过,再被 drawList 塞进内联
+// `onclick="open('<路径>')"` 的属性值里 —— 那就是可落地的注入点。
+//
+// 为什么转义了引号就真的挡住,而不只是「让 analyzer 好看」:
+// 事件处理器属性的值会**先做 HTML 实体解码、再当 JS 源码解析**。
+// `'` 变成 `&#39;` 之后,解码回 `'` 会把 JS 字符串字面量提前闭合,
+// 整段 JS 变成语法错误而不会执行。转义引号正是把攻击面从「能写 JS」
+// 降成「能写一个语法错误的 JS」。
+//
+// 另一头: `index.html` 里 esc 是**另一份实现**(转了 " 没转 ')。
+// 同一份需求两套规则, 审一处漏一处 —— 这里对齐成同一套。
 const esc = (s) => String(s == null ? "" : s)
-  .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+  .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
 
 async function api(path, body) {
   const opt = body === undefined ? {} : {
@@ -147,14 +164,30 @@ function drawList(files) {
     el.innerHTML = '<div class="empty">没有冲突文件</div>';
     return;
   }
-  el.innerHTML = files.map(f => {
+  // 行是 innerHTML 整体重画出来的, 事件只能挂**一次**在容器上做委托。
+  //
+  // 为什么不用内联 onclick 传路径: 事件处理器属性的值会被**先做 HTML 实体解码、
+  // 再当 JS 源码解析**(见上面 esc 的注释), 所以任何「转义一下再拼进去」的写法
+  // 都只在"转义得刚好让 JS 语法错"这一档成立 —— 那是拿安全性赌解析器, 不是修。
+  // 行里只放**下标**(纯数字, 不含任何用户数据), 路径走闭包。
+  if (!el.__rowsDelegated) {
+    el.__rowsDelegated = true;
+    el.addEventListener("click", (ev) => {
+      const row = ev.target.closest(".file[data-i]");
+      if (!row) return;
+      const f = ROWS[Number(row.dataset.i)];
+      if (f) open(f.path);
+    });
+  }
+  ROWS = files;
+  el.innerHTML = files.map((f, i) => {
     const tags = [];
     if (f.noBase) tags.push('<span class="tag nb">no-base</span>');
     if (f.manuallyEdited) tags.push('<span class="tag man">已手改</span>');
     if (f.crossCheckMismatch && f.crossCheckMismatch.length)
       tags.push('<span class="tag bad">三方不一致</span>');
     if (f.verified === true) tags.push('<span class="tag uf">已核对</span>');
-    return `<div class="file${CUR===f.path?" sel":""}" onclick="open('${esc(f.path)}')">
+    return `<div class="file${CUR===f.path?" sel":""}" data-i="${i}">
       <div class="n"><span class="tag">${f.columns}栏</span>${esc(f.name)}${tags.join("")}</div>
       <div class="m">${f.regionCount} 块 · ${esc(f.oursLabel||"?")} vs ${esc(f.theirsLabel||"?")}</div>
     </div>`;

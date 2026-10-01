@@ -48,6 +48,14 @@ class Fail(Exception):
     pass
 
 
+class Skip(Exception):
+    """测不了 —— 必须说清为什么(和 smoke.py 同一态度),不能默默算通过。
+
+    TAP 的做法是 `ok N - name # SKIP reason`。**它不算 fail**,但也绝不算 pass:
+    汇总里单列,`-v` 下逐条打出来。造不出前置条件就是造不出,假装测过了才是骗人。
+    """
+
+
 def ok(cond, what):
     if not cond:
         raise Fail(what)
@@ -130,6 +138,52 @@ def unmerged(root):
 
 def porcelain(root):
     return g(root, "status", "--porcelain=v1", "--untracked-files=all").stdout.strip()
+
+
+# ---- 护栏用例要用的哨兵 ------------------------------------------------
+
+def mk_junction(link, target):
+    """造**目录联接**。不需要特权 —— 这是相对 os.symlink 的关键优势:
+    本机实测 `whoami /priv` 里没有 SeCreateSymbolicLinkPrivilege(见
+    test_aigit_extra.py 的 L1 诚实 SKIP),所以 symlink 那条路在本机造不出来。
+    `mklink /J` 不需要任何特权, 并且 ntpath 的 resolve() 会跟着它走到目标 ——
+    正是第 3 道护栏(resolve 之后查归属)要治的那种形态。
+
+    写法和 test_aigit_extra.py:194 一致,没加花样。返回 True/False。
+    """
+    if os.path.lexists(str(link)):
+        try:
+            os.rmdir(str(link))
+        except OSError:
+            return False
+    p = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                       capture_output=True, timeout=30)
+    return os.path.lexists(str(link)) and os.path.isdir(str(link)) and p.returncode == 0
+
+
+def rmdir_junction(path):
+    """只删联接**本身**(rmdir 空目录项),不碰它的目标。"""
+    try:
+        os.rmdir(str(path))
+        return True
+    except OSError:
+        return False
+
+
+def outside_sentinel(root, name):
+    """在仓外造一个哨兵文件,返回 (路径, 期望内容)。
+
+    仓外 ≠ 仓内的任意子目录 —— 必须真的在 resolve 之后落到 repo 之外,
+    否则测不到东西。放在 root 的兄弟位置上,所以它跟仓在同一个 TEMP 沙箱里,
+    收尾时被 rmtree(SANDBOX) 一起带走。
+    """
+    d = root.parent / (root.name + "_outside")
+    rmtree(d)
+    d.mkdir(parents=True)
+    p = d / name
+    with open(p, "wb") as f:
+        f.write(b"CANARY-OUTSIDE\n")
+    return p, b"CANARY-OUTSIDE\n"
 
 
 # ---------------------------------------------------------------- 夹具
@@ -732,41 +786,159 @@ def t_guard_path(v):
     rel = unmerged(root)[0]
     r = ConflictResolver(root)
 
-    bad = [
-        "../../../Windows/System32/drivers/etc/hosts",
-        "..%s..%s..%sWindows%ssystem.ini" % ("\\", "\\", "\\", "\\"),
-        "/etc/passwd",
-        "C:/Windows/System32/config/SAM",
-        "subdir/../../outside.txt",
-        "",
-        "   ",
+    # ══════════════════════════════════════════════════════════════════
+    # ⚠ 本块被重写过。原写法是:
+    #     for p in bad:  ... ok("路径" in str(e) or "空" in str(e), ...)
+    # 它是**空断言**,不是「太松」—— 实测(见报告 doc/aigit-N1-suite-fixes.md §2)
+    # 把 _abs() 里四道路径护栏**全部删掉**, 本套件 13 条用例**依然 13/13 全绿**。
+    # 原因: resolve() 里有第二道**业务闸**(索引里没有该条目就拒), 它的消息是
+    #     「该路径不是未合并路径,拒绝写入:<路径>」
+    # 而「路径」二字它也有 —— 所以含「路径」等于在对着业务闸测。护栏被删光之后,
+    # 拒绝理由**整套换掉**, 断言一次都没红。
+    #
+    # 现在改成: 每条输入配一个**专属措辞**, 而这个措辞**只有那一道护栏会产出**
+    # (已逐条核对过业务闸的消息不含它们 —— 消息里那个路径是用户输入原样回显,
+    #  措辞本身对不上)。于是「删掉护栏 X」-> 「只剩业务闸拦」-> 措辞对不上 -> 红。
+    # ══════════════════════════════════════════════════════════════════
+
+    # 仓外哨兵 —— 断言不止「措辞对」, 还要证明**一个字节都没写出去**。
+    canary, canary_bytes = outside_sentinel(root, "ESCAPE-CANARY.txt")
+
+    # (p, 只有它能产生的措辞, 护栏编号, 护栏说的是哪一条)
+    exclusive = [
+        ("",                                 "路径为空",               "护栏1", "非空"),
+        ("   ",                              "路径为空",               "护栏1", "非空"),
+        ("/etc/passwd",                      "拒绝绝对路径",           "护栏1", "绝对路径/盘符"),
+        ("C:/Windows/System32/config/SAM",   "拒绝绝对路径",           "护栏1", "绝对路径/盘符"),
+        ("\\\\?\\C:\\Windows\\System32",      "拒绝绝对路径",           "护栏1", "绝对路径/盘符"),
+        ("../../../Windows/System32/drivers/etc/hosts",
+                                             "路径含 ..",              "护栏2", ".."),
+        ("..%s..%s..%sWindows%ssystem.ini" % ("\\", "\\", "\\", "\\"),
+                                             "路径含 ..",              "护栏2", ".."),
+        ("subdir/../../outside.txt",         "路径含 ..",              "护栏2", ".."),
+        (".git/config",                      "拒绝操作 .git 内的路径",  "护栏4", ".git"),
+        (".git/hooks/pre-commit",            "拒绝操作 .git 内的路径",  "护栏4", ".git"),
     ]
-    for p in bad:
+    pinned = set()
+    for p, needle, gid, which in exclusive:
+        reason = None
         try:
             r.resolve(p, "pwned\n")
-            raise Fail("越界路径 %r 竟然被接受" % p)
         except ConflictError as e:
-            ok("路径" in str(e) or "空" in str(e), "拒绝理由要讲路径: %s" % e)
-        v("resolve(%r) 被拒" % p)
+            reason = str(e)
+        else:
+            raise Fail("越界路径 %r 竟然被接受" % p)
+        contains(reason, needle,
+                 "%s(%s)必须由它自己拒,而不是下游那道「不是未合并路径」的业务闸 —— "
+                 "护栏被删掉的话这条会红,这正是它该有的表现" % (gid, which))
+        pinned.add(gid)
+        v("resolve(%r) 被 %s(%s)拒: %s"
+          % (p, gid, which, reason.split("——")[0].strip()))
+
+    # 措辞之外,还要证明真的没写出去。第二层纵深的价值就在这儿:
+    # 只删一层的话业务闸兜住, 措辞断言抓不到 —— 但仓外一旦被动过就是实打实的洞。
+    ok(canary.is_file(), "仓外哨兵自己不见了 —— 测试自身出问题")
+    eq(canary_bytes, canary.read_bytes() if canary.is_file() else b"<CANARY-GONE>",
+       "仓外哨兵内容被动过 —— 越界路径**真的写出去了**")
 
     # 越界也必须在 inspect 上被拒 —— 不能只保护写路径
     try:
         r.inspect("../outside.txt")
         raise Fail("inspect 越界竟然被接受")
-    except ConflictError:
-        v("inspect(../outside.txt) 被拒")
-
-    # .git 内的路径也要拒
-    try:
-        r.resolve(".git/config", "evil\n")
-        raise Fail(".git 内路径竟然被接受")
     except ConflictError as e:
-        contains(str(e), ".git", "拒绝理由")
-    v("resolve(.git/config) 被拒")
+        contains(str(e), "路径含 ..", "inspect 的越界拒绝也必须来自护栏2")
+        v("inspect(../outside.txt) 被护栏2 拒: %s" % e)
 
-    # 合法路径仍然能通过
+    # 合法路径仍然能通过 —— **双向都要钉住**。只堵洞不堵正常功能,那不叫护栏,
+    # 叫一刀切(那也是缺陷)。这一条挡住「有人为了绿就把护栏写成拒绝一切」。
+    head_before = g(root, "rev-parse", "HEAD").stdout.strip()
     r.resolve(rel, "ok\n")
-    v("合法路径 %r 正常写回" % rel)
+    ok(rel not in unmerged(root), "合法路径 %r 写回后仍然未合并" % rel)
+    v("合法路径 %r 正常写回, 已从 U 列表消失(HEAD 不动=%s)"
+      % (rel, g(root, "rev-parse", "HEAD").stdout.strip() == head_before))
+
+    # 本次运行到底钉住了几道护栏 —— 第 3 道(联接)由下一条 case 单独钉,
+    # 造不出联接时它会 SKIP, 那时候这里必须说出来,不能让人以为 4/4 都测了。
+    v("本条钉住的护栏: %s" % sorted(pinned))
+    print("    # 本条钉住 %d/4 道: %s (第 3 道 resolve 后查归属, "
+          "由 guard-path-escape 单独钉)" % (len(pinned), sorted(pinned)))
+    ok(pinned == {"护栏1", "护栏2", "护栏4"},
+       "本条应当钉住护栏 1/2/4, 实际只钉住 %s —— 有输入没触发它对应的那道" % sorted(pinned))
+
+
+@test("guard-path-escape: 目录联接指向仓外时被拒(专钉第 3 道护栏)")
+def t_guard_path_escape(v):
+    """第 3 道护栏 = **resolve() 之后再查归属**,专治符号链接/联接逃逸。
+
+    为什么必须单独一条: 另外三道护栏都能用「纯字面量」的输入触发
+    (`""` / `/etc/passwd` / `..` / `.git/config`), 唯独这一道不行 ——
+    要让 `resolve()` 的结果落到仓外, 输入里就必须有一个**指向仓外的目录联接**,
+    而 Windows 上造文件符号链接要 SeCreateSymbolicLinkPrivilege
+    (本机实测没有,见 test_aigit_extra.py 的 L-symlink-file-not-buildable
+    诚实 SKIP)。所以用 `mklink /J` 造**目录联接**:不需要特权,
+    而且 ntpath 的 resolve() 会跟着它走到目标 —— 正是这一道要治的形态。
+
+    单独成一条而不是并进 guard-path: 造不出联接时它抛 Skip,
+    并进去会连累另外三道护栏一起变成 SKIP, 覆盖面就无声无息地少了一道。
+    """
+    root, _sc = fixture_gen_conflict()
+    r = ConflictResolver(root)
+
+    canary, canary_bytes = outside_sentinel(root, "secret.txt")
+    outside = canary.parent
+    link = root / "escape_link"
+    if not mk_junction(link, outside):
+        raise Skip("mklink /J 造不出目录联接(需要同卷/同 NTFS 卷),"
+                   "第 3 道护栏(resolve 后查归属)在本机测不了。"
+                   "没有它的话,「仓内放一个指向仓外的目录联接」这条路就没人钉。")
+    try:
+        # 联接的这些性质是这一道护栏成立的前提,先自己核实一遍,
+        # 别拿一个「其实没生效」的联接去断言「它被拦住了」。
+        ok(os.path.isdir(link), "联接造出来了但不是目录")
+        ok(not os.path.islink(link),
+           "这个联接被 islink 认出来了 —— 说明造的不是 /J 目录联接,判据要重估")
+        resolved = (root / "escape_link" / "secret.txt").resolve()
+        ok(str(resolved).startswith(str(outside)),
+           "Path.resolve() 没有跟着联接走到仓外(落到了 %s)—— "
+           "第 3 道护栏的前提不成立,本条的结论无效" % resolved)
+        v("联接性质核实: is_dir=True is_symlink=False, resolve() 落到 %s" % resolved)
+
+        for p, what in (("escape_link/secret.txt", "联接下的文件"),
+                        ("escape_link", "联接自己"),
+                        ("./escape_link/secret.txt", "带 ./ 前缀的同一形态")):
+            reason = None
+            try:
+                r.resolve(p, "PWNED\n")
+            except ConflictError as e:
+                reason = str(e)
+            else:
+                raise Fail("顺着目录联接写仓外(%s)竟然被接受" % what)
+            contains(reason, "路径越界",
+                     "%s 的拒绝必须来自第 3 道护栏(resolve 后查归属)" % what)
+            v("resolve(%r) 被第 3 道护栏拒: %s" % (p, reason))
+
+        # read 侧也要拒
+        try:
+            r.inspect("escape_link/secret.txt")
+            raise Fail("inspect 顺着联接读仓外竟然被接受")
+        except ConflictError as e:
+            contains(str(e), "路径越界", "inspect 顺着联接读的拒绝理由")
+            v("inspect(escape_link/secret.txt) 被第 3 道护栏拒")
+
+        # 一个字节都没写出去
+        eq(canary_bytes, canary.read_bytes() if canary.is_file() else b"<CANARY-GONE>",
+           "仓外哨兵内容被动过 —— 联接这条路真的写出去了")
+        ok(canary.is_file(), "仓外哨兵被删了")
+
+        # ⚠ 合法路径不能被牵连。联接在仓里存在,不代表仓里别的东西写不回去。
+        rel = unmerged(root)[0]
+        r.resolve(rel, "ok\n")
+        ok(rel not in unmerged(root), "仓里明明有联接,合法路径却写不回去(%r)" % rel)
+        v("仓里有联接时,合法路径 %r 仍能正常写回" % rel)
+        print("    # 第 3 道护栏(resolve 后查归属)已钉住: 联接形态 3 条 + inspect 1 条")
+    finally:
+        rmdir_junction(link)
+        rmtree(outside)
 
 
 # ---- 9. 非冲突路径写入被拒 --------------------------------------------
@@ -915,9 +1087,15 @@ def main(argv=None):
             print("    %s" % msg)
 
     failed = 0
+    skipped = []
     for i, (name, fn) in enumerate(picked, 1):
         try:
             fn(v)
+        except Skip as e:
+            # 测不了 != 测过了。TAP 的 # SKIP 不算 fail,但**必须单列**,
+            # 免得「造不出前置条件」被读成「这条测过了、没问题」。
+            skipped.append((i, name, str(e)))
+            print("ok %d - %s # SKIP %s" % (i, name, e))
         except Exception as e:
             failed += 1
             print("not ok %d - %s" % (i, name))
@@ -929,10 +1107,14 @@ def main(argv=None):
         else:
             print("ok %d - %s" % (i, name))
 
+    for i, name, why in skipped:
+        print("# SKIPPED %d - %s: %s" % (i, name, why))
     if failed:
-        print("# failed %d among %d test(s)" % (failed, len(picked)))
+        print("# failed %d among %d test(s) (skipped %d)"
+              % (failed, len(picked), len(skipped)))
     else:
-        print("# passed all %d test(s)" % len(picked))
+        print("# passed %d of %d test(s), skipped %d"
+              % (len(picked) - len(skipped), len(picked), len(skipped)))
     rmtree(SANDBOX)
     return 1 if failed else 0
 

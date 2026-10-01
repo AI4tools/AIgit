@@ -618,11 +618,43 @@ def run_safety(rep, cli, sandbox):
               "%s 的存在性不变(False)" % escape.name,
               "exists=%s" % escape.exists())
 
-    st, obj = cli.call("POST", "/api/stage", {"files": ["a.txt; echo pwned > x"]})
-    rep.check("含 ; 的路径不会进 shell", st >= 400
-              and not (sandbox / "x").exists(),
-              "4xx,且 x 文件未被创建",
-              "status=%s %s  x 存在=%s" % (st, short(obj), (sandbox / "x").exists()), obj)
+    # ---- 名字里带 shell 元字符的**真实文件** ------------------------------
+    #
+    # ⚠ 这条断言是被重写过的,因为原来那条**测不到任何东西**。原写法:
+    #     cli.call("POST", "/api/stage", {"files": ["a.txt; echo pwned > x"]})
+    #     断言 st >= 400 and not (sandbox / "x").exists()
+    # 两半都不成立,所以它出厂就是红的,而且红了也说明不了任何事:
+    #   * `>` 是 NTFS 的**禁用**文件名字符, `a.txt; echo pwned > x` 在磁盘上根本
+    #     造不出来 —— 实测 `OSError: [Errno 22] Invalid argument`。于是
+    #     `x 不存在` 是**恒真**的:写什么都创建不出它,这一半是空断言。
+    #   * `st >= 400` 要求服务端有一条仓库里查不到规格的策略。实测
+    #     `POST /api/stage {"files":["nosuch.txt"]}` 同样返回 200 + staged=[],
+    #     即「文件不存在」本来就不算 4xx(`..` 越界才 400,见上面那条)。
+    #     所以 200 与契约**一致**,这一半是凭空加的严格性要求,不是缺陷。
+    # ⇒ 原来那条不是「太严」,是**既测不到安全、也测不到功能**。改成下面这条:
+    #   用**造得出来的**名字(Windows 合法:不含 `< > : " / \ | ? *`),
+    #   建 4 个真实文件,让服务端去 stage,并断言三件事:
+    #     (1) 200 —— 不要因为名字里带 ; & ` $ 就误伤正常功能(双向都要钉住);
+    #     (2) 响应 staged 里出现的是**逐字节相同的字面名** —— git 拿到的是
+    #         整个路径,而不是被 shell 拆开的那一段;
+    #     (3) 仓目录清单没有多出任何文件 —— 确实没有第二个进程跑起来。
+    # 若哪天服务端改成 shell=True + 字符串拼串,`git add "smoke; touch pwned"`
+    # 会变成 `git add smoke` + `touch pwned`:(2) 少了字面名、(3) 多出 pwned,两条都红。
+    meta = ["smoke; touch pwned", "smoke&&calc", "smoke`id`", "smoke$(id)"]
+    for n in meta:
+        (sandbox / n).write_text("payload %s\n" % n, encoding="utf-8", newline="\n")
+    before = set(os.listdir(str(sandbox)))
+    st, obj = cli.call("POST", "/api/stage", {"files": meta})
+    got_staged = sorted(x.get("path") for x in (obj.get("staged") or [])
+                        if isinstance(x, dict))
+    added = sorted(set(os.listdir(str(sandbox))) - before)
+    rep.check("含 shell 元字符的文件名进不了 shell",
+              st == 200 and got_staged == sorted(meta) and not added,
+              "200、staged 逐字节等于 %r、仓里不多出文件" % (sorted(meta),),
+              "status=%s  staged=%r  仓里新增=%r  %s"
+              % (st, got_staged, added, short(obj)), obj)
+    rep.note("shell 元字符文件名实测",
+             "status=%s staged=%r 仓里新增=%r" % (st, got_staged, added))
 
     st, obj = cli.call("GET", "/api/file?file=../../etc/passwd")
     rep.check("读接口也拒绝越界", st == 400 and "越界" in (obj.get("error") or ""),
