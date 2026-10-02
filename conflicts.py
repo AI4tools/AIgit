@@ -76,14 +76,21 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
-__all__ = ["ConflictError", "Git", "ConflictResolver", "parse_markers"]
+import gitguard
+
+__all__ = ["ConflictError", "Git", "ConflictResolver", "parse_markers",
+           "repo_git_lock", "escaping_links", "install_escaping_guard"]
 
 GIT_TIMEOUT = 120
 
 #: 传给 git 的一次性配置。与 gen.py 同款:**不改仓库的 .git/config**,
 #: 用 -c 逐条传,这样在别人的真实仓库上跑不留任何配置副作用。
+#:
+#: 这一组是**功能**配置(身份 / 换行),不是安全配置 —— 安全那一层是
+#: `gitguard`,由 `_argv()` 统一拼。两组都保留,gitguard 的排在后面。
 _GIT_CONFIG = [
     "-c", "user.name=aigit",
     "-c", "user.email=aigit@localhost",
@@ -93,8 +100,127 @@ _GIT_CONFIG = [
 ]
 
 
+def _argv(root, args):
+    """本模块**唯一**拼 git argv 的地方(两处 subprocess.run 都调它)。
+
+    形状固定为 `[git, -C, root, --literal-pathspecs, ...功能配置, ...安全配置, ...argv]`:
+      * `--literal-pathspecs` 与 `_GIT_CONFIG` 是原有行为,原样保留(走 extra_pre);
+      * `gitguard` 负责「仓库自带配置指向的程序一个都执行不到」,含在子命令**后面**
+        插 `--no-ext-diff --no-textconv` —— 本模块的 `_show()` / `_diff()` / `_log()`
+        都要渲染 diff,漏了这一步就会被打穿。这两个 flag **必须同时给**:实测
+        `--no-ext-diff` 压不住 `diff.<x>.textconv`,`--no-textconv` 也压不住
+        `diff.<x>.command`。
+      * 联网能力闸:本模块只做本地操作,恒为关 ⇒ 用户级配置整个不可达。
+    """
+    return gitguard.build(
+        "git", root, args, net_enabled=False,
+        extra_pre=["--literal-pathspecs"] + _GIT_CONFIG)
+
+
+def _env():
+    """本模块**唯一**造 env 的地方。
+
+    原来手写的 5 个变量全部保留(语义不许变),`GIT_EDITOR` 那两个也在,
+    再叠上 gitguard 的(其中就包括 `GIT_CONFIG_*` 的剥离 —— 这一条必需,
+    实测环境注入能带进枚举看不到的 driver)。
+    """
+    return gitguard.safe_env(net_enabled=False)
+
+
 class ConflictError(Exception):
     """可预期的失败:不在合并态、路径越界、文件没冲突、二进制……"""
+
+
+# ---------------------------------------------------------------- 仓库级互斥
+#
+# aigit 有三条会跑 git 的通路: server.Repo(有锁)、history_ops.HistoryOps(有锁)、
+# 以及本模块(修复前**一把锁都没有**)。三者在同一个仓库上跑 git ⇒ 同一个
+# .git/index 会被同时写。实测(见 doc/aigit-concurrency-audit.md F-01):
+# `stage` × `conflict/resolve` 每遍 20–23/72 的请求以
+# `Unable to create '.git/index.lock'` 失败。
+#
+# 这里按 realpath 记忆化: **同一仓库的所有入口拿同一把锁, 不同仓库仍然并行**。
+# 用模块级字典而不是实例属性 —— 实例属性会让每个 ConflictResolver 各拿一把,
+# 而 server.py 的 `conflict_resolver()` 是懒单例、测试又会另建实例, 用实例
+# 属性的话同一个仓上会出现 N 把互不相干的锁, 等于没加。
+#
+# ⚠ 必须是 **RLock** 不能是 Lock: 上层要在「读-校验-写」整段持锁, 而段内还会
+#   回调 Git.run —— 段内 Git.run 要再取同一把锁, 普通 Lock 在这里会自死锁。
+_GIT_LOCKS = {}
+_GIT_LOCKS_MU = threading.Lock()
+
+
+def repo_git_lock(root):
+    """返回该仓库唯一的 git 互斥锁。同一 root(按 realpath 归一)永远拿到同一把。
+
+    ⚠ **锁图无环**: `_GIT_LOCKS_MU` 只在这几行里被持有, **绝不会**在持有它的
+    期间去取仓库锁, 所以它与仓库锁之间不存在嵌套边。
+    """
+    key = os.path.normcase(os.path.realpath(str(root)))
+    with _GIT_LOCKS_MU:
+        lk = _GIT_LOCKS.get(key)
+        if lk is None:
+            lk = threading.RLock()
+            _GIT_LOCKS[key] = lk
+        return lk
+
+
+# ------------------------------------------------- 仓外联接防线(F-06 的根因)
+#
+# `git add -A` 的路径**不由我们提供**, 而 git 会**穿过**目录联接, 所以
+# 「显式请求某个越界路径」那道 `_abs()` 护栏完全管不住「提交一次」。
+# 实测(mklink /J, <root>/escape -> <root>/../outside):
+#
+#     git add -A ; git ls-files        ->  a.txt  escape/leak.txt
+#     git show HEAD:escape/leak.txt    -> rc=0, 内容就是仓外那份
+#
+# 也就是说仓外的文件被**复制**进了对象库, 永远留在历史里、随 push 一起走。
+# git 对被跟踪路径上的联接一律按普通文件处理, **没有任何开关能关掉这个行为**。
+#
+# 判定逻辑**只有一份**, 在 server.Repo.escaping_links()。本模块只做**取用**,
+# 不复制一份 —— 复制就会漂移, 而这正是 F-05/F-06 的成因: 防线写在了
+# `POST /api/commit` 一条路上, 「解决冲突 → 完成合并」这条路裸奔。
+_ESCAPING_GUARD = None
+
+
+def install_escaping_guard(fn):
+    """注入仓外联接防线。返回原值, 便于还原。
+
+    `fn(root) -> [(路径, 目标), ...]`。传 None 恢复默认实现。
+    生产代码不需要调它 —— 默认实现自己去取 server.Repo.escaping_links。
+    存在的意义是**可证伪**: 测试要能把防线故意关掉, 证明判据真的会红
+    (见 test_conflicts.py 的 t_guard_commit_merge_falsifiable)。
+    """
+    global _ESCAPING_GUARD
+    prev = _ESCAPING_GUARD
+    _ESCAPING_GUARD = fn
+    return prev
+
+
+def _default_escaping_guard(root):
+    """取 server.Repo.escaping_links —— 防线本体在 server.py, 这里只借用。
+
+    `import server` 必须是**函数内**的: server.py 顶层就 `import conflicts`,
+    模块级 import 会成环。这也顺带保证了本模块仍然「不起服务就能单测」
+    (server.py 的起服务逻辑在 `if __name__ == "__main__"` 之后)。
+    """
+    try:
+        import server
+    except Exception as e:                      # ImportError / 别的线把 server.py 改坏了
+        raise ConflictError(
+            "仓外联接防线不可用(%s:%s),已拒绝提交 —— 宁可拒绝也不能在拿不到"
+            "防线的情况下把仓外内容写进历史。" % (type(e).__name__, e))
+    return server.Repo(root).escaping_links()
+
+
+def escaping_links(root):
+    """列出**在仓里、但指向仓外**的 reparse point。同 server.Repo.escaping_links。
+
+    调用点必须**已经持有**该仓的 repo_git_lock(root) —— 扫描与 `add -A` 之间
+    有 TOCTOU 窗口, 没有互斥就等于没扫(这正是 F-05 那一类问题)。
+    """
+    guard = _ESCAPING_GUARD or _default_escaping_guard
+    return guard(root)
 
 
 # ---------------------------------------------------------------- git 封装
@@ -105,23 +231,77 @@ class Git:
 
     def __init__(self, root):
         self.root = Path(root).resolve()
+        # 仓库级互斥, 按 realpath 共享同一把(见上面的 repo_git_lock)。
+        # Git.run / Git.cat_batch 里的裸 subprocess.run 由它串行化 —— 修复前
+        # 本模块全文没有一把锁, 所以「同域内」也能撞 index.lock。
+        self._lock = repo_git_lock(self.root)
 
     def run(self, args, check=True, binary=False):
-        p = subprocess.run(
-            ["git", "-C", str(self.root)] + _GIT_CONFIG + list(args),
-            capture_output=True, text=not binary, encoding=None if binary else "utf-8",
-            errors=None if binary else "replace",
-            env={**os.environ, "GIT_PAGER": "cat", "GIT_TERGE_AUTOEDIT": "no",
-                 "GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true",
-                 "GIT_MERGE_AUTOEDIT": "no"},
-            timeout=GIT_TIMEOUT,
-        )
+        try:
+            with self._lock:
+                p = subprocess.run(
+                    _argv(self.root, args),
+                    capture_output=True, text=not binary, encoding=None if binary else "utf-8",
+                    errors=None if binary else "replace",
+                    env=_env(),
+                    timeout=GIT_TIMEOUT,
+                )
+        except subprocess.TimeoutExpired:
+            raise ConflictError("git 命令超时(>%ds): %s"
+                                % (GIT_TIMEOUT, " ".join(str(a) for a in args[:3])))
         if check and p.returncode != 0:
+            msg = ((p.stderr or p.stdout or b"") if binary
+                   else (p.stderr or p.stdout or "")).strip()
+            # 信息暴露防护: git 的错误信息有时会带仓库绝对路径(Windows 上尤甚),
+            # 这条消息最终会原样进 API 响应,必须把绝对路径抹掉。
+            msg = msg.replace(str(self.root), "<repo>")
+            msg = msg.replace(str(self.root).replace("\\", "/"), "<repo>")
             raise ConflictError("git %s 失败(rc=%d): %s"
-                                % (" ".join(args[:3]), p.returncode,
-                                   ((p.stderr or p.stdout or b"") if binary
-                                    else (p.stderr or p.stdout or "")).strip()))
+                                % (" ".join(str(a) for a in args[:3]), p.returncode, msg))
         return p
+
+    def cat_batch(self, specs):
+        """一次 `git cat-file --batch` 进程回答多个对象查询。
+
+        specs: 对象名(sha 或 "HEAD:path" 这类)。返回 {spec: (raw|None, is_binary)}。
+        取不到(对象不存在 / 路径不存在)记 (None, False) —— 与 _blob/_show 的
+        「不存在不是错误」语义一致。binary 判定口径也与 _blob 相同:
+        前 8000 字节里有 NUL 即当二进制。
+        """
+        if not specs:
+            return {}
+        try:
+            with self._lock:
+                p = subprocess.run(
+                    _argv(self.root, ["cat-file", "--batch"]),
+                    input=("\n".join(str(s) for s in specs) + "\n").encode("utf-8"),
+                    capture_output=True, timeout=GIT_TIMEOUT,
+                    env=_env(),
+                )
+        except subprocess.TimeoutExpired:
+            raise ConflictError("git cat-file --batch 超时(>%ds)" % GIT_TIMEOUT)
+        out = {}
+        data = p.stdout or b""
+        pos = 0
+        for spec in specs:
+            nl = data.find(b"\n", pos)
+            if nl < 0:
+                out[spec] = (None, False)
+                break
+            header = data[pos:nl]
+            pos = nl + 1
+            parts = header.rsplit(b" ", 2)
+            if len(parts) == 3 and parts[2].isdigit():
+                size = int(parts[2])
+                raw = data[pos:pos + size]
+                pos += size
+                if data[pos:pos + 1] == b"\n":
+                    pos += 1
+                out[spec] = (raw, b"\0" in raw[:8000])
+            else:
+                # "<spec> missing" 或其他单行错误头,本次没有 body
+                out[spec] = (None, False)
+        return out
 
     def out(self, args):
         return self.run(args).stdout
@@ -537,7 +717,12 @@ class ConflictResolver:
 
         # --- 3. 工作区当前内容 ----------------------------------------
         ap = self._abs(path)
-        wt_raw = ap.read_bytes() if ap.is_file() else b""
+        try:
+            wt_raw = ap.read_bytes() if ap.is_file() else b""
+        except OSError as e:
+            # e.filename 是绝对路径,不能原样进错误信息
+            raise ConflictError("读取工作区文件失败 —— %s: %s"
+                                % (path, e.strerror or type(e).__name__)) from e
         wt_text = None if binary else wt_raw.decode("utf-8", errors="replace")
 
         # --- 4. 拆块 --------------------------------------------------
@@ -668,34 +853,119 @@ class ConflictResolver:
         return regions
 
     def list_conflicts(self):
-        """冲突文件清单(面板左栏)。每项一行摘要,不展开全文。"""
+        """冲突文件清单(面板左栏)。每项一行摘要,不展开全文。
+
+        性能契约:这里**不能**逐文件调 inspect() —— inspect 每文件要做
+        ls-files / merge-base / 3 个 git show / 3 个 cat-file,40 个文件
+        就是 ~200 个 git 进程(实测 ~29s)。本函数把所有跨文件查询批成
+        常数个 git 进程:
+          1. diff 拿未合并清单;
+          2. 一次 ls-files -u 拿全仓 stage;
+          3. 一次 merge-base;
+          4. 一次 cat-file --batch 拿全部 stage blob;
+          5. 一次 cat-file --batch 拿全部 HEAD:/MERGE_HEAD:/mb: 内容。
+        每个文件剩下的就只是磁盘读 + 标记解析 + 锚点对齐(纯 CPU)。
+        字段名与 inspect 的摘要字段保持同名同义,UI 依赖不变。
+        """
         p = self.git.run(["diff", "--name-only", "--diff-filter=U", "-z"],
                          check=False)
         paths = [x for x in p.stdout.split("\0") if x.strip()]
+        in_merge = bool(self._read_gd("MERGE_HEAD"))
+        if not paths:
+            return {"ok": True, "inMerge": in_merge, "count": 0, "files": []}
+
+        stages_by_path = {}
+        p = self.git.run(["ls-files", "-u", "-z"], check=False)
+        for rec in p.stdout.split("\0"):
+            if not rec.strip():
+                continue
+            meta, _, name = rec.partition("\t")
+            parts = meta.split()
+            if len(parts) != 3:
+                continue
+            mode, sha, stage = parts
+            stages_by_path.setdefault(name, {})[int(stage)] = {
+                "mode": mode, "sha": sha, "path": name}
+
+        mb, _mb_reason = self._merge_base()
+        shas = sorted({s["sha"] for st in stages_by_path.values()
+                       for s in st.values()})
+        blobs = self.git.cat_batch(shas)
+
+        specs = []
+        for rel in paths:
+            specs.append("HEAD:" + rel)
+            specs.append("MERGE_HEAD:" + rel)
+            if mb:
+                specs.append(mb + ":" + rel)
+        heads = self.git.cat_batch(specs)
+
         files = []
         for rel in paths:
             item = {"path": rel, "name": rel.rsplit("/", 1)[-1]}
             try:
-                d = self.inspect(rel)
+                stages = stages_by_path.get(rel)
+                if not stages:
+                    raise ConflictError(
+                        "该路径没有未合并的索引条目,不是冲突文件:%s" % rel)
+
+                idx = {}
+                for stage, key in ((1, "base"), (2, "ours"), (3, "theirs")):
+                    if stage not in stages:
+                        idx[key] = {"exists": False, "sha": None, "raw": None,
+                                    "binary": False, "stage": stage, "mode": None}
+                        continue
+                    raw, binary = blobs.get(stages[stage]["sha"], (None, False))
+                    idx[key] = {"exists": raw is not None, "sha": stages[stage]["sha"],
+                                "raw": raw, "binary": binary, "stage": stage,
+                                "mode": stages[stage]["mode"]}
+
+                # crossCheckMismatch:只复算 inspect 同一公式,不要完整 xcheck 表
+                mismatch = []
+                ours_raw = heads.get("HEAD:" + rel, (None, False))[0]
+                theirs_raw = heads.get("MERGE_HEAD:" + rel, (None, False))[0]
+                base_raw = heads.get(mb + ":" + rel, (None, False))[0] if mb else None
+                if ours_raw is not None and not idx["ours"]["exists"]:
+                    mismatch.append("ours")
+                if theirs_raw is not None and not idx["theirs"]["exists"]:
+                    mismatch.append("theirs")
+                if base_raw is not None and not idx["base"]["exists"]:
+                    mismatch.append("base")
+
+                no_base = (idx["base"]["raw"] is None)
+                binary = any(v["binary"] for v in idx.values())
+
+                try:
+                    ap = self._abs(rel)
+                    wt_raw = ap.read_bytes() if ap.is_file() else b""
+                except (ConflictError, OSError) as e:
+                    raise ConflictError("读取工作区文件失败:%s" % rel) from e
+                wt_text = None if binary else wt_raw.decode("utf-8", errors="replace")
+
+                regions = []
+                if wt_text is not None:
+                    regions, skeleton = parse_markers(wt_text)
+                    regions = self._attach_bases(regions, skeleton, idx)
+
                 item.update({
-                    "noBase": d["noBase"], "binary": d["binary"],
-                    "regionCount": d["regionCount"],
-                    "manuallyEdited": d["worktree"]["manuallyEdited"],
-                    "verified": d["verified"],
-                    "hasMarkers": d["worktree"]["hasMarkers"],
-                    "columns": d["columns"],
-                    "oursLabel": d["oursLabel"], "theirsLabel": d["theirsLabel"],
-                    "baseDeleted": d["sides"]["base"]["deleted"],
-                    "oursDeleted": d["sides"]["ours"]["deleted"],
-                    "theirsDeleted": d["sides"]["theirs"]["deleted"],
-                    "crossCheckMismatch": d["crossCheckMismatch"],
+                    "noBase": no_base, "binary": binary,
+                    "regionCount": len(regions),
+                    "manuallyEdited": (not regions) and bool(stages),
+                    "verified": (all(r.get("verified") for r in regions)
+                                 if regions else None),
+                    "hasMarkers": bool(regions),
+                    "columns": 2 if no_base else 3,
+                    "oursLabel": regions[0]["oursLabel"] if regions else None,
+                    "theirsLabel": regions[0]["theirsLabel"] if regions else None,
+                    "baseDeleted": not idx["base"]["exists"],
+                    "oursDeleted": not idx["ours"]["exists"],
+                    "theirsDeleted": not idx["theirs"]["exists"],
+                    "crossCheckMismatch": mismatch,
                 })
-            except ConflictError as e:
+            except (ConflictError, OSError) as e:
                 item["error"] = str(e)
             files.append(item)
-        return {"ok": True,
-                "inMerge": bool(self._read_gd("MERGE_HEAD")),
-                "count": len(files), "files": files}
+        return {"ok": True, "inMerge": in_merge, "count": len(files), "files": files}
 
     # -- 写:解决冲突 ---------------------------------------------------
     def resolve(self, path, content, expect_sha256=None, encoding="utf-8"):
@@ -706,7 +976,19 @@ class ConflictResolver:
              绝不去动一个已经完成的仓库;
           2. 路径不越界(_abs);
           3. 这个路径确实是冲突文件(索引里有 U 条目)。
+
+        ⚠ **整个方法体在同一把 `self.git._lock` 里**(读-校验-写整段)。
+        `expect_sha256` 是**乐观并发护栏**, 它比的是「我写进去的时候」的磁盘状态;
+        一旦校验与写入之间能被插队, 这道护栏在并发下等于不存在 —— 两个请求
+        都能校验通过、都写、都 `git add`, 后写的把先写的整个吃掉, 而**两个
+        请求都返回 ok:true 与各自的 sha256**, 没有任何一方知道自己被覆盖
+        (实测 doc/aigit-concurrency-audit.md F-03: 每遍 15–23 次, 即 21%–32%)。
+        只锁 `open()` 那一下是没用的 —— 窗口在「校验」到「打开」之间。
         """
+        with self.git._lock:
+            return self._resolve_locked(path, content, expect_sha256, encoding)
+
+    def _resolve_locked(self, path, content, expect_sha256=None, encoding="utf-8"):
         merge_head = self.require_merge()
         ap = self._abs(path)
         rel = str(path).replace("\\", "/").strip()
@@ -734,10 +1016,14 @@ class ConflictResolver:
 
         # 二进制逐字节写,绝不经过文本转码 —— Windows 上 open(...,"w") 会
         # 把 \\n 变成 \\r\\n,那等于替用户改内容。
-        ap.parent.mkdir(parents=True, exist_ok=True)
-        with open(ap, "wb") as f:
-            f.write(raw)
-
+        try:
+            ap.parent.mkdir(parents=True, exist_ok=True)
+            with open(ap, "wb") as f:
+                f.write(raw)
+        except OSError as e:
+            # e.filename 是绝对路径,不能原样塞进会回给客户端的错误信息
+            raise ConflictError("写回工作区失败 —— %s: %s"
+                                % (rel, e.strerror or type(e).__name__)) from e
         self.git.run(["add", "--", rel])
         remaining = self.list_conflicts()
         still = any(f["path"] == rel for f in remaining["files"])
@@ -770,7 +1056,15 @@ class ConflictResolver:
         return self.resolve(rel, s["text"])
 
     def delete_file(self, path, expect_sha256=None):
-        """把冲突文件标记为删除并 git add(用于「一边删一边改」)。"""
+        """把冲突文件标记为删除并 git add(用于「一边删一边改」)。
+
+        ⚠ 与 resolve 同理: 校验 sha256 → unlink → `git rm` → `git add`
+        四步必须整段互斥, 只锁其中一步等于没锁。
+        """
+        with self.git._lock:
+            return self._delete_file_locked(path, expect_sha256)
+
+    def _delete_file_locked(self, path, expect_sha256=None):
         merge_head = self.require_merge()
         ap = self._abs(path)
         rel = str(path).replace("\\", "/").strip()
@@ -780,12 +1074,67 @@ class ConflictResolver:
             cur = ap.read_bytes() if ap.is_file() else b""
             if hashlib.sha256(cur).hexdigest() != expect_sha256:
                 raise ConflictError("工作区已被改动,拒绝删除。请重新读取:%s" % rel)
-        if ap.is_file():
-            ap.unlink()
+        try:
+            if ap.is_file():
+                ap.unlink()
+        except OSError as e:
+            raise ConflictError("删除工作区文件失败 —— %s: %s"
+                                % (rel, e.strerror or type(e).__name__)) from e
         self.git.run(["rm", "-q", "--", rel], check=False)
         self.git.run(["add", "--", rel], check=False)
         remaining = self.list_conflicts()
         return {"ok": True, "path": rel, "deleted": True,
+                "remainingCount": remaining["count"],
+                "remaining": [f["path"] for f in remaining["files"]],
+                "mergeHead": merge_head}
+
+    def unresolve(self, path, expect_sha256=None):
+        """把一个**已解决**的文件退回未解决态(取消「已解决」标记)。
+
+        机制:`git checkout --merge -- <path>` —— 它会重新做这条路径的三方
+        合并,把未合并的索引 stage 重建回来,并把带标记的内容写回工作区。
+        没有它,前端只能把「已解决」的文件记在 sessionStorage 里,回滚按钮
+        永远是 disabled —— 这正是之前缺的这条路。
+
+        保护:
+          1. 仍须在合并态;
+          2. 该路径必须是**已解决**态(索引里没有 U 条目)—— 还没解决就
+             取消就不构成「取消」,直接报错;
+          3. expect_sha256 对上才动 —— 已解决之后你又改过手,这里的再合并会
+             覆盖工作区内容,不校验等于在暗地里丢用户的编辑。
+
+        ⚠ 语义说明:退回的是「重新合并出来的冲突态」,工作区内容是标准标记
+        的冲突块,不是你解决之前手工编辑过的中间态 —— 那份内容不再值得
+        保护,它是要被替换的目标。
+
+        ⚠ 与 resolve 同理: 校验 → `checkout --merge`(重写工作区)→ 重新校验
+        整段互斥, 否则并发下「我刚校验过的内容」会被这次 checkout 覆盖掉。
+        """
+        with self.git._lock:
+            return self._unresolve_locked(path, expect_sha256)
+
+    def _unresolve_locked(self, path, expect_sha256=None):
+        merge_head = self.require_merge()
+        ap = self._abs(path)
+        rel = str(path).replace("\\", "/").strip()
+        if self._stages(rel):
+            raise ConflictError("该路径还没解决,无需「取消解决」:%s" % rel)
+        if expect_sha256:
+            cur = ap.read_bytes() if ap.is_file() else b""
+            if hashlib.sha256(cur).hexdigest() != expect_sha256:
+                raise ConflictError(
+                    "工作区已被改动(与期望 sha256 不符),拒绝覆盖。请重新读取:%s" % rel)
+        p = self.git.run(["checkout", "--merge", "--", rel], check=False)
+        if p.returncode != 0:
+            msg = (p.stderr or p.stdout or "").strip()
+            msg = msg.replace(str(self.git.root), "<repo>")
+            raise ConflictError("退回冲突态失败(rc=%d): %s" % (p.returncode, msg))
+        if not self._stages(rel):
+            # git 没报错但也没重建 stage —— 比如该路径的冲突态无从重建
+            # (一方远端不存在且 merge-base 也缺这条),当作明确失败而不是静默成功
+            raise ConflictError("无法重建该路径的冲突态:%s" % rel)
+        remaining = self.list_conflicts()
+        return {"ok": True, "path": rel, "unmerged": True,
                 "remainingCount": remaining["count"],
                 "remaining": [f["path"] for f in remaining["files"]],
                 "mergeHead": merge_head}
@@ -798,7 +1147,22 @@ class ConflictResolver:
           1. 仍在合并态;
           2. **没有未合并路径了** —— 有就必须先解决,不能带 U 提交;
           3. 提交信息里有参与分支名(从 .git/MERGE_MSG 读,不自己编)。
+
+        ⚠ **第四道(F-06): 仓里没有指向仓外的联接**, 与 `server.Repo.commit()`
+        用的是**同一份**判定逻辑(`escaping_links`)。
+        修复前这里是一个裸的 `git add -A`, 前面**一把锁都没有、一次扫描都没有**,
+        于是「解决冲突 → 完成合并」这条路把仓外文件复制进了对象库且永久留在
+        历史里 —— 同一次运行里 `POST /api/commit` 正确拒绝、这条路静默提交,
+        **串行即可复现, 不需要任何竞态**(实测见 f06_repro.py)。
+
+        ⚠ 整个方法体在同一把 `self.git._lock` 里。防线扫描是**纯文件系统扫描**,
+        不碰 git, 所以锁**管不到「扫描完到 add 之间」** —— 只有把
+        「扫描 + add -A + commit」放进同一个临界区, 才算把 TOCTOU 窗口关掉。
         """
+        with self.git._lock:
+            return self._commit_merge_locked(message)
+
+    def _commit_merge_locked(self, message=None):
         merge_head = self.require_merge()
         msg_raw = self._read_gd("MERGE_MSG") or ""
         branches = self._branches_from_merge_msg(msg_raw)
@@ -815,6 +1179,16 @@ class ConflictResolver:
             raise ConflictError(
                 "还有 %d 个文件没解决,已拒绝提交:\n      %s"
                 % (remaining["count"], "\n      ".join(f["path"] for f in remaining["files"])))
+
+        # F-06 防线。取用 server.Repo.escaping_links 的同一份判定逻辑, 不复制。
+        # 必须**在 add -A 之前**、且**在持锁状态里**。
+        leaks = escaping_links(self.git.root)
+        if leaks:
+            names = ", ".join("%s -> %s" % (p, t) for p, t in leaks[:8])
+            raise ConflictError(
+                "仓里有指向仓外的链接(%s),已拒绝提交。git add -A 会穿过目录联接,"
+                "把仓外的文件收进索引、再写进历史, 且删掉链接也删不掉历史。"
+                "请先把它移出工作区, 或把它移进仓内。共发现 %d 个。" % (names, len(leaks)))
 
         text = (message or "").strip() or default
         # 用户自带信息时,把参与分支补上 —— 要求是「提交信息里自动列出分支名」。
@@ -880,6 +1254,9 @@ def main(argv=None):
     p_ch.add_argument("path")
     p_ch.add_argument("side", choices=["ours", "theirs", "base"])
     sub.add_parser("abort", help="放弃合并")
+    p_un = sub.add_parser("unresolve", help="取消某个文件的「已解决」状态")
+    p_un.add_argument("path")
+    p_un.add_argument("--expect-sha256", default=None)
     p_cmt = sub.add_parser("commit", help="完成合并")
     p_cmt.add_argument("--message", default=None)
 
@@ -905,6 +1282,8 @@ def main(argv=None):
             _print(r.choose(a.path, a.side))
         elif a.cmd == "abort":
             _print(r.abort())
+        elif a.cmd == "unresolve":
+            _print(r.unresolve(a.path, a.expect_sha256))
         elif a.cmd == "commit":
             _print(r.commit_merge(a.message))
         else:

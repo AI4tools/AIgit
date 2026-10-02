@@ -273,7 +273,7 @@ function drawDetail(d) {
 async function doResolve() {
   if (!CUR) return;
   const j = await api("/api/conflict/resolve", {
-    path: CUR, content: $("#ta").value, expectSha256: CURD.worktree.sha256
+    file: CUR, content: $("#ta").value, expect_sha256: CURD.worktree.sha256
   });
   if (!j.ok) { note("写回被拒: " + j.error, "err"); return; }
   note("已写回并 add。未解决 " + j.remainingCount, "ok");
@@ -283,7 +283,7 @@ async function doResolve() {
 
 async function pick(side) {
   if (!CUR) return;
-  const j = await api("/api/conflict/choose", { path: CUR, side });
+  const j = await api("/api/conflict/choose", { file: CUR, side });
   if (!j.ok) { note("取 " + side + " 被拒: " + j.error, "err"); return; }
   note("已整份取 " + side + "。未解决 " + j.remainingCount, "ok");
   reload();

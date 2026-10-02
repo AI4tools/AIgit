@@ -37,6 +37,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import gitguard
+
 # ---------------------------------------------------------------- 常量
 
 #: 落盘文件前缀。护栏的核心:没有它,生成器就可能覆盖用户自己的文件。
@@ -57,6 +59,12 @@ KINDS = ("mergeable", "unrelated", "adddel", "conflict")
 #: - commit.gpgsign=false: 避免本机配了签名时卡在交互式密码输入上。
 #: - core.autocrlf=false: 避免 CRLF 把 diff 搅成整文件重写。
 #: - merge.ours.driver / diff.external 等一律不碰,只读原始字节。
+#:
+#: ⚠️ 上一行是**过时而且方向反了**的注释(gitguard 之前):「不碰」只说明
+#: 「不给它传值」,**不等于**「仓库自己写的 merge.<x>.driver 不会执行」。
+#: 实测:仓里 `merge.drv.driver` 指向探针时,裸 `git merge --no-edit` 会命中;
+#: `filter.<x>.clean` 同理,裸 `git add -A` 就命中。
+#: 「不传」不是「不执行」—— 这正是 gitguard 存在的理由。
 _GIT_CONFIG = [
     "-c", "user.name=aigit",
     "-c", "user.email=aigit@localhost",
@@ -81,11 +89,12 @@ class Git:
         self.root = Path(root).resolve()
 
     def run(self, args, check=True):
+        env = gitguard.safe_env(net_enabled=False)
         p = subprocess.run(
-            ["git", "-C", str(self.root)] + _GIT_CONFIG + list(args),
+            gitguard.build("git", self.root, args, net_enabled=False,
+                           base=env, extra_pre=_GIT_CONFIG),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            env={**os.environ, "GIT_PAGER": "cat", "GIT_TERMINAL_PROMPT": "0",
-                 "GIT_EDITOR": "true", "GIT_MERGE_AUTOEDIT": "no"},
+            env=env,
             timeout=GIT_TIMEOUT,
         )
         if check and p.returncode != 0:

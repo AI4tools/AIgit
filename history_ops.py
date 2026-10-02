@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""aigit 历史与危险操作层 —— 对齐 VSCode 源代码管理面板里 aigit 缺的那一批。
+"""aigit 历史与危险操作层 —— 这一族操作原先只有实现、没有入口,这里接上 HTTP 路由。
+
+**只有 API,网页界面上点不到。** 路由表见 README「冲突解决与历史操作」。
+界面上没有入口不等于功能不存在,但也不等于有图形界面 —— 别混淆这两件事。
 
 范围(本文件负责,一个不多):
     stash 存取 / amend / 撤销上次提交(保留 or 丢弃)/ revert / 分支改名 / 分支删除 /
@@ -43,6 +46,8 @@ import subprocess
 import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+import gitguard
 
 # ---------------------------------------------------------------- 常量
 
@@ -140,17 +145,21 @@ class HistoryOps:
     # ═══════════════════════════════════════════════════ 底层
 
     def _run(self, args, check=True, stdin=None, timeout=None):
-        """跑 git,参数列表形式。check=False 时返回 CompletedProcess(为了读退出码)。"""
+        """跑 git,参数列表形式。check=False 时返回 CompletedProcess(为了读退出码)。
+
+        **本模块唯一拼 git argv 的地方** —— 配置中和只需要在这里接一次。
+        原来手写的 4 个 env 变量(GIT_PAGER / GIT_TERMINAL_PROMPT / GIT_EDITOR /
+        GIT_SEQUENCE_EDITOR / GIT_MERGE_AUTOEDIT)全部保留,语义不变;
+        gitguard 在此之上再叠一层「仓库配置指向的程序一个都执行不到」,
+        其中包含必须剥离的 `GIT_CONFIG_*`(实测能注入枚举看不到的 driver)。
+        """
+        env = gitguard.safe_env(net_enabled=False)
         with self._lock:
             p = subprocess.run(
-                [self.git_bin, "-C", str(self.root)] + [str(a) for a in args],
+                gitguard.for_root(self.root, args, net_enabled=False, base=env),
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", input=stdin,
-                env={**os.environ, "GIT_PAGER": "cat",
-                     "GIT_TERMINAL_PROMPT": "0",
-                     # 关掉交互式凭证/编辑器,免得 do_* 在没有 tty 的环境里挂死
-                     "GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": "true",
-                     "GIT_MERGE_AUTOEDIT": "no"},
+                env=env,
                 timeout=timeout or self.timeout,
             )
         if check and p.returncode != 0:

@@ -12,7 +12,7 @@
 
 硬约束:
     * 纯标准库, 不用 pytest, 不开浏览器/窗口。
-    * 所有仓建在 %TEMP%\\aigit-test-extra\\ 下, 绝不碰任何真实仓库。
+    * 所有仓建在 %TEMP%\\aigit-test-extra-<pid>\\ 下, 绝不碰任何真实仓库。
     * 只读 server.py。发现 bug 只记录、不修(server.py 是 A1 线的地盘)。
     * 测试仓在 %TEMP% 下, 报告写到 doc/aigit-A3-extra-coverage.md。
 
@@ -74,9 +74,16 @@ import urllib.request
 
 AIGIT = os.path.dirname(os.path.abspath(__file__))
 SERVER_PY = os.path.join(AIGIT, "server.py")
-# 故意**不用** test_aigit.py 的 %TEMP%\aigit-test —— 那个目录在它启动时会被
-# 整个 rmtree 掉, 两份套件并行跑会互删对方的临时仓。
-TESTROOT = os.path.join(tempfile.gettempdir(), "aigit-test-extra")
+# 临时仓根**必须带进程号 + 固定标识**。这不是洁癖: `main()` 开头会 force_rmtree(TESTROOT)
+# 把整棵目录删掉, 而这个路径原来是全局固定的 `%TEMP%\aigit-test-extra` ——
+# 于是两个 `test_aigit_extra.py` 同时跑, 后启动的那个会把前一个**正在用**的仓删光。
+# 症状不是「测试失败」, 是**看起来像产品缺陷的假红**(同批实测, 见 test_history_ops.py):
+#   * `fatal: not a git repository` / `fatal: unable to read tree <sha>`
+#   * 上一遍还绿的用例这一遍变红(被误伤, 不是回归)
+# 只避开 `test_aigit.py` 的 `%TEMP%\aigit-test` **不够** —— 那只挡住了"跨文件"互删,
+# 挡不住"同文件两个进程"互删。必须落到 pid 这一级。
+# 写法照 `test_aigit.py:54` 的既有约定: 固定标识 + pid。
+TESTROOT = os.path.join(tempfile.gettempdir(), "aigit-test-extra-%d" % os.getpid())
 
 GIT_ENV = dict(os.environ)
 GIT_ENV.update({
@@ -692,7 +699,8 @@ def t_l1(ctx):
                  % (rp.replace(ctx.repo.dir, "<ROOT>"), follows))
         ck(follows, "造出来的符号链接 pathlib 不跟随, 这条测不出东西")
         code, txt = ctx.srv.raw("POST", "/api/discard",
-                                json.dumps({"files": ["link.txt"]}))
+                                json.dumps({"files": ["link.txt"],
+                                            "confirmed": True}))
         ctx.note("  discard link.txt -> %s %r" % (code, txt[:90]))
         ck(outside_intact(secret), "仓外哨兵被删 —— 符号链接越界成功")
         code, txt = ctx.srv.raw("GET", "/api/file?file=" + q("link.txt"))
@@ -764,7 +772,8 @@ def t_l2(ctx):
              "这是设计事实 + 实测, 不是 bug。")
 
     # (3) 硬不变量: discard 不得牵连仓外
-    code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": ["inrepo.txt"]}))
+    code, txt = ctx.srv.raw("POST", "/api/discard",
+                            json.dumps({"files": ["inrepo.txt"], "confirmed": True}))
     ctx.note("POST /api/discard {'files':['inrepo.txt']} -> %s %s"
              % (code, txt[:70].replace("\n", " ")))
     ck_eq(code, 200, "discard 一个未跟踪的仓内文件应 200")
@@ -845,7 +854,8 @@ def t_l3(ctx):
     #     (discard 对 tracked 走 `git --literal-pathspecs checkout -- <rel>`)。
     before_out = rd(outside_file)
     before_ino = os.stat(outside_file).st_ino
-    code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": ["shared.txt"]}))
+    code, txt = ctx.srv.raw("POST", "/api/discard",
+                            json.dumps({"files": ["shared.txt"], "confirmed": True}))
     ctx.note("POST /api/discard ['shared.txt'] -> %s %s"
              % (code, txt[:70].replace("\n", " ")))
     ck_eq(code, 200, "discard 一个已修改的已跟踪文件应 200")
@@ -900,7 +910,8 @@ def t_l4(ctx):
     ck_eq(code, 200, "换名后的硬链接就是工作区文件, 应当能读")
 
     code, txt = ctx.srv.raw("POST", "/api/discard",
-                            json.dumps({"files": ["stolen_config.txt"]}))
+                            json.dumps({"files": ["stolen_config.txt"],
+                                        "confirmed": True}))
     ctx.note("discard stolen_config.txt -> %s %s" % (code, txt[:70].replace("\n", " ")))
     ck_eq(code, 200, "discard 一个工作区未跟踪文件应 200")
     ck(not os.path.exists(leak), "换名后的硬链接没被删")
@@ -941,7 +952,8 @@ def t_l5(ctx):
 
     for files in (["escape/secret.txt"], ["escape"], ["escape/"],
                   ["./escape/secret.txt"], ["escape/../escape/secret.txt"]):
-        code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": files}))
+        code, txt = ctx.srv.raw("POST", "/api/discard",
+                                json.dumps({"files": files, "confirmed": True}))
         ctx.note("discard %-26s -> %-4s %s"
                  % (files, code, txt[:74].replace("\n", " ")))
         ck_eq(code, 400, "联接越界 %r 期望 400" % (files,))
@@ -1232,7 +1244,8 @@ def t_c2(ctx):
             code, txt = ctx.srv.raw("GET", ep + q(v))
             ck(code != 500, "%s%r 返回 500: %s" % (ep, v, txt[:100]))
     for v in vectors:
-        code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": [v]}))
+        code, txt = ctx.srv.raw("POST", "/api/discard",
+                                json.dumps({"files": [v], "confirmed": True}))
         ck(code != 500, "discard %r 返回 500: %s" % (v, txt[:100]))
         ck(os.path.exists(r.abspath(".git")), "discard %r 把 .git 弄没了" % v)
         ck(outside_intact(canary), "discard %r 动了仓外哨兵" % v)
@@ -1322,7 +1335,8 @@ def t_c3(ctx):
         ctx.note("%-56r -> %-4s %s" % (v, code, txt[:60].replace("\n", " ")))
         ck("CANARY:C3-SIBLING" not in txt, "短名向量 %r 读出了仓外文件" % v)
         ck_eq(code, 400, "短名越界向量 %r 期望 400" % v)
-        code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": [v]}))
+        code, txt = ctx.srv.raw("POST", "/api/discard",
+                                json.dumps({"files": [v], "confirmed": True}))
         ck_eq(code, 400, "discard 短名越界 %r 期望 400" % v)
         ck(os.path.exists(os.path.join(sib_long, "secret.txt")),
            "短名向量 %r 把仓外文件删了" % v)
@@ -2023,7 +2037,10 @@ def t_f8(ctx):
     attempts = 0
     codes = {}
     hits = []
-    payload = json.dumps({"files": ["sub/victim", "tracked.txt"]})
+    # confirmed 必须有: 判据是「仓外哨兵一个都不能少」, 不带的话闸门先把每次请求
+    # 都挡成 400, 竞态窗口根本不存在, 这条就变成测「闸门在不在」的空转
+    payload = json.dumps({"files": ["sub/victim", "tracked.txt"],
+                          "confirmed": True})
     deadline = time.time() + 25.0
     while time.time() < deadline:
         attempts += 1
@@ -2122,7 +2139,8 @@ def t_f8(ctx):
     try:
         ctx.note("确定性段: 对手预先用 DELETE 句柄握住 %s (handle=%s)" % (pin_dir, handle))
         code, txt = ctx.srv.raw("POST", "/api/discard",
-                                json.dumps({"files": ["pin_target"]}), timeout=30)
+                                json.dumps({"files": ["pin_target"],
+                                            "confirmed": True}), timeout=30)
         ctx.note("  对手握持期间 POST /api/discard -> %s  %s" % (code, txt[:150]))
         ck_eq(code, 400,
               "对手握着 DELETE 句柄时 /api/discard 必须 **400 拒绝**(fail closed), "
@@ -2142,7 +2160,8 @@ def t_f8(ctx):
         close_handle(handle)
     # 反向: 放开手柄之后同一个请求必须真能删 —— 挡住「一律拒绝」这种假修法
     code, txt = ctx.srv.raw("POST", "/api/discard",
-                            json.dumps({"files": ["pin_target"]}), timeout=30)
+                            json.dumps({"files": ["pin_target"], "confirmed": True}),
+                            timeout=30)
     ctx.note("  放开句柄后同一个请求 -> %s   真删掉了=%s" % (code, not os.path.exists(pin_dir)))
     ck_eq(code, 200,
           "放开句柄后同一个 /api/discard 必须 200 —— 返回 %s: %s。"
@@ -2236,7 +2255,8 @@ def t_f9(ctx):
         attempts += 1
         try:
             code, txt = ctx.srv.raw("POST", "/api/discard",
-                                    json.dumps({"files": ["victim", "tracked.txt"]}),
+                                    json.dumps({"files": ["victim", "tracked.txt"],
+                                                "confirmed": True}),
                                     timeout=20)
         except Exception:
             codes["exc"] = codes.get("exc", 0) + 1
@@ -2347,13 +2367,15 @@ def t_f11(ctx):
     # 1) 空串 / 点 必须被拒(F-01 的修法: 解析结果 == root 就拒)
     for f in ["", ".", "./", "..", ".git", ".git/", ".git/config",
               ".Git/Config", "./.git/config", "sub/../.git"]:
-        code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": [f]}))
+        code, txt = ctx.srv.raw("POST", "/api/discard",
+                                json.dumps({"files": [f], "confirmed": True}))
         ctx.note("discard %-18r -> %-4s %s" % (f, code, txt[:70].replace("\n", " ")))
         ck_eq(code, 400, "discard %r 期望 400" % f)
         ck(os.path.exists(r.abspath(".git")), "discard %r 把 .git 弄没了" % f)
     # .git 大小写折叠也要被拒
     for f in [".GIT", ".GIT/config", ".Git"]:
-        code, _txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": [f]}))
+        code, _txt = ctx.srv.raw("POST", "/api/discard",
+                                json.dumps({"files": [f], "confirmed": True}))
         ck_eq(code, 400, "discard %r 期望 400(大小写折叠的 .git)" % f)
 
     # 2) 正常路径仍然能用(F-02/F-06 的修法别把功能堵了)
@@ -2364,12 +2386,14 @@ def t_f11(ctx):
     ck_eq(st, ["sub/a.txt"], "stage './sub/a.txt' 暂存了别的")
     code, j = ctx.srv.jpost("/api/unstage", {"files": ["sub/../sub/a.txt"]})
     ck_eq(code, 200, "unstage 相对写法应 200")
-    code, j = ctx.srv.jpost("/api/discard", {"files": ["junk.txt"]})
+    code, j = ctx.srv.jpost("/api/discard",
+                             {"files": ["junk.txt"], "confirmed": True})
     ck_eq(code, 200, "discard 一个未跟踪文件应 200")
     ck(not r.exists("junk.txt"), "junk.txt 没被删")
 
     # 3) 已跟踪文件用相对写法 discard, 必须是 restore 而不是 unlink
-    code, j = ctx.srv.jpost("/api/discard", {"files": ["./sub/a.txt"]})
+    code, j = ctx.srv.jpost("/api/discard",
+                             {"files": ["./sub/a.txt"], "confirmed": True})
     ck_eq(code, 200, "discard 已跟踪文件应 200")
     ck(r.exists("sub/a.txt"), "discard 已跟踪文件把它删了而不是恢复")
     ck_eq(r.read("sub/a.txt"), "v1\n", "discard 已跟踪文件后内容没回到 HEAD")
@@ -2377,13 +2401,17 @@ def t_f11(ctx):
 
     # 4) 目录里含已跟踪文件时, 整目录 discard 必须被拒
     r.write("sub/extra.txt", "new\n")
-    code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": ["sub"]}))
+    code, txt = ctx.srv.raw("POST", "/api/discard",
+                                json.dumps({"files": ["sub"], "confirmed": True}))
     ctx.note("discard 含已跟踪文件的目录 sub -> %s %s" % (code, txt[:90].replace("\n", " ")))
     ck_eq(code, 400, "整目录 discard(含已跟踪文件)期望 400")
     ck(r.exists("sub/extra.txt"), "sub/extra.txt 被删了")
 
     # 5) reset 护栏仍在
-    code, j = ctx.srv.jpost("/api/reset", {})
+    # mode 填 "hard": 判据是下一行「sub/extra.txt 这个未跟踪文件被清掉」——
+    # clean -fd 只有 reset --hard 会跑, soft/mixed 都不会删未跟踪文件
+    code, j = ctx.srv.jpost("/api/reset",
+                             {"confirmed": True, "mode": "hard", "ref": "HEAD"})
     ck_eq(code, 200, "/api/reset 应 200")
     ck(not r.exists("sub/extra.txt"), "/api/reset 没清掉未跟踪文件")
     ck(os.path.exists(r.abspath(".git")), ".git 没了")

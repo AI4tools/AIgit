@@ -345,7 +345,12 @@ def t_a2(ctx):
         ck_eq(code, 200, "POST %s 状态码" % path)
         ck(j.get("ok") is True, "POST %s ok!=true, 返回=%r" % (path, j))
         ctx.note("POST %-18s ok=true" % path)
-    code, j = ctx.srv.jpost("/api/reset", {})
+    # reset 是闸门后的破坏性接口: confirmed 必须给 **JSON 的 true**(jpost 走
+    # json.dumps, Python 的 True 会序列化成 true, 不是字符串 "true")。
+    # mode 是三态显式值, 不给一律 400 —— 这里补 "hard", 因为**闸门之前**
+    # 这个路由就是无条件 REPO.hard_reset()(见 git show HEAD:server.py), 本用例
+    # 原来断言 200 断的正是 hard reset 那条语义。
+    code, j = ctx.srv.jpost("/api/reset", {"confirmed": True, "mode": "hard"})
     ck_eq(code, 200, "POST /api/reset 状态码")
     ck(j.get("ok") is True, "POST /api/reset ok!=true")
 
@@ -433,7 +438,7 @@ def t_a6(ctx):
         ("/api/stage", {"files": [123]}),
         ("/api/stage", {"files": "notalist"}),
         ("/api/stage", {"files": None}),
-        ("/api/discard", {"files": [None]}),
+        ("/api/discard", {"files": [None], "confirmed": True}),
         ("/api/commit", {"message": None}),
         ("/api/branch", {"name": 12345}),
         ("/api/checkout", {"name": ["a", "b"]}),
@@ -464,9 +469,18 @@ def t_a7(ctx):
 # ════════════════════════════════════════════════════════ B 组:路径越界
 
 def _reject(ctx, path, files, tag, what):
-    """POST 一个含 files 的破坏性接口, 要求被拒且外部哨兵不动。"""
+    """POST 一个含 files 的破坏性接口, 要求被拒且外部哨兵不动。
+
+    **一律带 `confirmed: true`**, 对 /api/discard 尤其关键: 这几条测的是
+    路径护栏, 不是闸门。不带 confirmed 的话 discard 会在闸门就 400,
+    下面 `ck_eq(code, 400)` 照样过 —— 看着绿, 其实测的是「闸门挡下了」,
+    而不是「越界路径被挡住了」。那正是加闸门最容易造出来的**假绿**。
+    带 confirmed 之后 400 只可能来自路径护栏, 用例恢复它本来的强度。
+    (/api/stage 没有这道闸门, 多带一个它不读的键无害。)
+    """
     canary = outside_marker(tag)
-    code, txt = ctx.srv.raw("POST", path, json.dumps({"files": files}))
+    code, txt = ctx.srv.raw("POST", path,
+                            json.dumps({"files": files, "confirmed": True}))
     ctx.note("%s %s -> code=%s  %s" % (what, json.dumps(files, ensure_ascii=False)[:44],
                                        code, txt[:90].replace("\n", " ")))
     ck_eq(code, 400, "%s %r 期望 400(拒绝)" % (what, files))
@@ -507,7 +521,9 @@ def t_b3(ctx):
     repo_gone = not os.path.exists(ctx.repo.dir)
     ctx.note("发请求前 repo 存在? %s" % (not repo_gone))
     canary = outside_marker("b3")
-    code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": [""]}))
+    # 带 confirmed: 见 _reject 的注释 —— 400 必须来自空文件名护栏, 不能来自闸门
+    code, txt = ctx.srv.raw("POST", "/api/discard",
+                            json.dumps({"files": [""], "confirmed": True}))
     ctx.note("POST /api/discard {\"files\": [\"\"]} -> code=%s  %s" % (code, txt[:120]))
     still = os.path.exists(ctx.repo.dir)
     ctx.note("请求后 repo 目录还在? %s" % still)
@@ -522,7 +538,8 @@ def t_b3(ctx):
 def t_b3b(ctx):
     """B3b file='.' 同样解析成 repo root, discard 会 rmtree 整个仓。"""
     canary = outside_marker("b3b")
-    code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": ["."]}))
+    code, txt = ctx.srv.raw("POST", "/api/discard",
+                            json.dumps({"files": ["."], "confirmed": True}))
     ctx.note("POST /api/discard {\"files\": [\".\"]} -> code=%s  %s" % (code, txt[:120]))
     ck_eq(code, 400, "discard '.' 期望 400")
     ck(os.path.exists(os.path.join(ctx.repo.dir, ".git")), ".git 没了 —— 仓库被摧毁")
@@ -585,7 +602,9 @@ def t_b6(ctx):
 
     canary = outside_marker("b6")
     for files in (["escape/secret.txt"], ["escape"], ["escape/"], ["./escape/secret.txt"]):
-        code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": files}))
+        # confirmed: 见 _reject —— 400 必须来自链接越界护栏, 不能来自闸门
+        code, txt = ctx.srv.raw("POST", "/api/discard",
+                                json.dumps({"files": files, "confirmed": True}))
         ctx.note("discard %-24s -> %-4s %s"
                  % (files, code, txt[:80].replace("\n", " ")))
         ck_eq(code, 400, "链接越界 %r 期望 400" % files)
@@ -659,7 +678,9 @@ def t_b7(ctx):
         for method, path, body in (
                 ("GET", "/api/diff?file=", None),
                 ("GET", "/api/file?file=", None),
-                ("POST", "/api/discard", json.dumps({"files": [v]})),
+                # discard 这一条带 confirmed: 判据是 code != 500, 不带的话闸门先挡下,
+            # 整条对 discard 就退化成「闸门挡住了 500」, 测不到 files 里的畸形项
+            ("POST", "/api/discard", json.dumps({"files": [v], "confirmed": True})),
                 ("POST", "/api/stage", json.dumps({"files": [v]}))):
             if method == "GET":
                 code, txt = ctx.srv.raw(method, path + urllib.parse.quote(v))
@@ -697,7 +718,8 @@ def t_b9(ctx):
     r.write("a.txt", "x\n")
     r.commit("c1")
     for files in [["a\x00.txt"], [123], [{"k": 1}], [True], [[]]]:
-        code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": files}))
+        code, txt = ctx.srv.raw("POST", "/api/discard",
+                                json.dumps({"files": files, "confirmed": True}))
         ctx.note("discard files=%-16r -> %s" % (files, code))
         ck(code != 500, "discard files=%r 返回 500: %s" % (files, txt[:140]))
         ck(code != 400 or os.path.exists(os.path.join(r.dir, ".git")),
@@ -795,7 +817,8 @@ def t_c1(ctx):
     r.commit("c1")
     r.write("junk.txt", "junk\n")
     ck(r.exists("junk.txt"), "前置: junk.txt 应存在")
-    code, j = ctx.srv.jpost("/api/discard", {"files": ["junk.txt"]})
+    code, j = ctx.srv.jpost("/api/discard",
+                             {"files": ["junk.txt"], "confirmed": True})
     ck_eq(code, 200, "discard 未跟踪文件")
     ck(j.get("ok") is True, "ok!=true")
     ck(not r.exists("junk.txt"), "junk.txt 没被删掉")
@@ -809,7 +832,8 @@ def t_c2(ctx):
     r.write("t.txt", "original\n")
     r.commit("c1")
     r.write("t.txt", "MODIFIED\n")
-    code, j = ctx.srv.jpost("/api/discard", {"files": ["t.txt"]})
+    code, j = ctx.srv.jpost("/api/discard",
+                             {"files": ["t.txt"], "confirmed": True})
     ck_eq(code, 200, "discard 已跟踪文件")
     ck_eq(r.read("t.txt"), "original\n", "还原后的内容")
 
@@ -821,7 +845,8 @@ def t_c3(ctx):
     r.write("t.txt", "a\n")
     r.commit("c1")
     for files in [["nope.txt"], ["a/b/c/deep.txt"], []]:
-        code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": files}))
+        code, txt = ctx.srv.raw("POST", "/api/discard",
+                                json.dumps({"files": files, "confirmed": True}))
         ctx.note("discard %-22r -> %s %s" % (files, code, txt[:70].replace("\n", " ")))
         ck(code in (200, 400), "discard %r 得到 %s" % (files, code))
         ck("Traceback" not in txt, "泄露堆栈")
@@ -848,7 +873,10 @@ def t_c4(ctx):
     before_status = r.out("status", "--porcelain")
     ctx.note("discard 前 git status: %r" % before_status[:160])
 
-    code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": ["tracked_dir"]}))
+    # confirmed: 判据是 code == 400, 必须来自「目录内含已跟踪文件」这条内层护栏,
+    # 而不是闸门 —— 否则这条用例变成闸门的假绿
+    code, txt = ctx.srv.raw("POST", "/api/discard",
+                            json.dumps({"files": ["tracked_dir"], "confirmed": True}))
     ctx.note("discard tracked_dir(里面有**已跟踪**文件) -> %s %s"
              % (code, txt[:80].replace("\n", " ")))
     after = r.out("status", "--porcelain")
@@ -878,7 +906,9 @@ def t_c4b(ctx):
                        capture_output=True, timeout=30)
     if not os.path.exists(link):
         raise Skip("本机造不出目录联接, 无法测这条")
-    code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": ["outlink"]}))
+    # confirmed: 400 必须来自「链接指向仓外」这条护栏, 不能来自闸门
+    code, txt = ctx.srv.raw("POST", "/api/discard",
+                            json.dumps({"files": ["outlink"], "confirmed": True}))
     ctx.note("discard outlink(指向仓库外) -> %s" % code)
     ck_eq(code, 400, "链接指向仓库外, 期望 400")
     ck(os.path.exists(canary), "仓库外的 canary 被删了 —— 越界成功")
@@ -1039,13 +1069,19 @@ def _checkout_impact(ctx, r):
 
 @test("C", "reset-is-unconditional", bug="C14")
 def t_c8(ctx):
-    """C8 /api/reset 没有任何护栏, 直接 hard reset + clean -fd。"""
+    """C8 /api/reset 没有任何**除确认外**的护栏: 给了 confirmed 就 hard reset + clean -fd。
+
+    mode 显式填 "hard": 这条用例的判据是「未跟踪文件被 clean 掉」(下面那行),
+    而 clean -fd 只有 reset --hard 会跑 —— soft/mixed 都不会删未跟踪文件。
+    原来不带 mode 却断言 200, 断的正是闸门之前那个无条件 hard_reset()。
+    """
     r = ctx.repo
     r.write("keep.txt", "keep\n")
     r.commit("c1")
     r.write("untracked.txt", "u\n")
     r.write("keep.txt", "modified\n")
-    code, j = ctx.srv.jpost("/api/reset", {})
+    code, j = ctx.srv.jpost("/api/reset",
+                             {"confirmed": True, "mode": "hard", "ref": "HEAD"})
     ctx.note("POST /api/reset -> %s ok=%s" % (code, j.get("ok")))
     ck_eq(code, 200, "reset 状态码")
     ck_eq(r.read("keep.txt"), "keep\n", "reset 后内容")
@@ -1748,7 +1784,9 @@ def t_x7(ctx):
     r.write("a.txt", "A\n")
     r.write("b.txt", "B\n")
     r.write("untracked.txt", "u\n")
-    code, j = ctx.srv.jpost("/api/discard", {"files": ["a.txt", "b.txt", "untracked.txt"]})
+    code, j = ctx.srv.jpost("/api/discard",
+                             {"files": ["a.txt", "b.txt", "untracked.txt"],
+                              "confirmed": True})
     ck_eq(code, 200, "批量 discard")
     ck_eq(r.read("a.txt"), "a\n", "a.txt 还原")
     ck_eq(r.read("b.txt"), "b\n", "b.txt 还原")
@@ -1777,7 +1815,8 @@ def t_x8(ctx):
     for spelling in ["./a.txt", "sub/../a.txt", "a.txt"]:
         r.write("a.txt", "MODIFIED-%s\n" % spelling)
         before = r.out("status", "--porcelain")
-        code, txt = ctx.srv.raw("POST", "/api/discard", json.dumps({"files": [spelling]}))
+        code, txt = ctx.srv.raw("POST", "/api/discard",
+                                json.dumps({"files": [spelling], "confirmed": True}))
         after = r.out("status", "--porcelain")
         ctx.note("discard %-16r -> %-4s  status 前=%r 后=%r"
                  % (spelling, code, before[:40], after[:40]))

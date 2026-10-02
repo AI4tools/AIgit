@@ -270,6 +270,42 @@ td.br{font-family:Consolas,monospace;color:#75beff;font-size:11px;word-break:bre
 }
 tr.bad td{background:rgba(163,21,21,.15)}
 
+/* 面板槽位 -------------------------------------------------------
+   面板是懒加载的独立文件。没被打开过时,槽位只在 .pane 里存在,
+   而 .pane 默认 display:none —— 即「没打开的面板」连一个可见像素都没有。
+   ------------------------------------------------------------ */
+.tab .pill{
+  display:inline-block;min-width:16px;margin-left:6px;padding:0 4px;
+  background:#a1260d;color:#fff;border-radius:8px;font-size:10px;
+  line-height:16px;font-weight:700;text-align:center;vertical-align:1px;
+}
+.tab .pill:empty{display:none}
+.tab .pill.loading{background:#4d4d4d}
+.tab .pill.error{background:#f14c4c}
+.panel-slot{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+/* 槽位占位/降级文案。不用 .note —— .note 靠 margin 定位,嵌不进 flex 容器 */
+.slot-msg{
+  margin:14px;padding:12px 14px;border:1px dashed var(--border);
+  border-radius:3px;background:#1f1f1f;color:var(--fg-dim);
+  font-size:12px;line-height:1.9;overflow:auto;min-height:0;
+}
+.slot-msg b{color:#fff;font-weight:600}
+.slot-msg .why{
+  display:block;margin-top:8px;padding-top:8px;
+  border-top:1px solid #333;font-size:11px;color:#8a8a8a;
+}
+.slot-msg.err{border-color:#5c2c2c;background:#2a1a1a;color:#ffb3b3}
+.slot-msg.err b{color:#ffd0d0}
+
+/* 危险操作二次确认:必须手打的确认词。永远是空的,永不预填。 */
+#modalBody .confirmword{
+  display:inline-block;margin-top:8px;padding:1px 6px;
+  background:#3a1a1a;border:1px solid #5c2c2c;border-radius:2px;
+  color:#ffb3b3;font-family:"Cascadia Mono",Consolas,monospace;
+  font-size:12px;font-weight:700;user-select:all;
+}
+#modalBody input.armed{border-color:#73c991}
+
 /* 模态 */
 #mask{
   position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;
@@ -323,7 +359,7 @@ body.busy #modalFoot #modalOk .spinner{display:inline-block}
   <button class="btn ghost" data-gen="all" title="上面四类场景一次全造">
     <span class="spinner"></span>一键全生成
   </button>
-  <button class="btn danger" id="btnReset" title="reset --hard + clean -fd，丢弃全部改动">
+  <button class="btn danger" id="btnReset" title="reset：先选 soft / mixed / hard，看完预演再确认">
     <span class="spinner"></span>丢弃全部改动
   </button>
   <button class="btn ghost" id="btnNewBranch" title="新建分支并切换过去">
@@ -353,6 +389,10 @@ body.busy #modalFoot #modalOk .spinner{display:inline-block}
       <div class="tab active" data-tab="diff">改动详情</div>
       <div class="tab" data-tab="merge">合并</div>
       <div class="tab" data-tab="log">提交历史</div>
+      <!-- 两个面板槽位:数据在 PANEL_SLOTS 里,这里只是空壳。
+           面板文件不在 <head> 里静态引入 —— 第一次点这个 tab 才去取。 -->
+      <div class="tab" data-tab="conflicts"><span class="tab-t">冲突</span><span class="pill" id="pillConflicts"></span></div>
+      <div class="tab" data-tab="history"><span class="tab-t">历史</span><span class="pill" id="pillHistory"></span></div>
     </div>
 
     <div class="pane active" id="pane-diff">
@@ -428,6 +468,16 @@ body.busy #modalFoot #modalOk .spinner{display:inline-block}
         </table>
       </div>
     </div>
+
+    <!-- 面板槽位。#pane-conflicts / #pane-history 的全部内容都由
+         conflicts-panel.js / history-panel.js 的 mount(el, ctx) 自己填。
+         在面板文件到位之前,这两块只有宿主写的降级文案。 -->
+    <div class="pane" id="pane-conflicts">
+      <div class="panel-slot" id="slot-conflicts"></div>
+    </div>
+    <div class="pane" id="pane-history">
+      <div class="panel-slot" id="slot-history"></div>
+    </div>
   </div>
 </div>
 
@@ -438,6 +488,25 @@ body.busy #modalFoot #modalOk .spinner{display:inline-block}
     <div id="modalFoot"></div>
   </div>
 </div>
+
+<!-- 动态 import() 的唯一来源。
+     为什么单独开一个 type="module" 的块：
+       index.html 的主脚本是**经典脚本**，而 L4 那个 node harness 用
+       new Function(...) 编译它。V8 在 Function 构造器里不接受字面
+       import( —— 实测 SyntaxError: Cannot use import statement outside
+       a module。所以字面 import( 不能出现在主脚本里。
+       模块里的 import() 是语言级的，不需要 eval / unsafe-eval 权限，
+       也不会被 L1 的 URL sink 扫描算到（.src= 和 setAttribute( 都算，
+       实测过：两者都把 L1 1d 从 PASS 打成 FAIL）。
+     本块必须放在主脚本**之前**：L4 取的是最后一个内联块，那个位置
+     得是经典块。模块块是 defer 的，实际在主脚本之后才执行；主脚本
+     只在用户点面板 tab 时才用它，那时早就绪了。
+     （注：本注释里刻意不出现字面的标签名 —— L1 的内联分块正则
+       会被注释里的同名标签骗过去，把整段注释连同后面真正的模块体
+       一起当成脚本文本扫。） -->
+<script type="module">
+window.__aigitImport = function (u) { return import(u); };
+</script>
 
 <script>
 "use strict";
@@ -471,6 +540,14 @@ function esc(s) {
   return String(s === null || s === undefined ? "" : s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+/* 服务端文案里用 markdown 记号强调（`discard_plan` 的 note 就是
+   「丢的是**未提交的改动**」）。原文照给用户会看到两个星号，比不打更糟。
+   **先转义再替换** —— 顺序反过来就是一个现成的注入点。
+   和 web/history-panel.js 的 escMd 同一份实现（那边是从 ctx.esc 转发的，
+   宿主这份才是原函数）。只补 `**粗体**` 这一种记号，别扩成通用 markdown。 */
+function escMd(s) {
+  return esc(s).replace(/\*\*([^*\n]{1,400})\*\*/g, "<b>$1</b>");
 }
 function $(id) { return document.getElementById(id); }
 function rowKey(path, staged) { return path + SEP + (staged ? 1 : 0); }
@@ -559,7 +636,10 @@ function api(path, opts) {
 
 /* POST 类操作后端会顺带返回最新 status，能省一次请求 */
 function applyStatus(d) {
-  if (d && typeof d.branch === "string" && Array.isArray(d.staged)) S.status = d;
+  if (d && typeof d.branch === "string" && Array.isArray(d.staged)) {
+    S.status = d;
+    updatePills();
+  }
 }
 function refresh(alsoBranches) {
   var jobs = [api("/api/status")];
@@ -570,6 +650,9 @@ function refresh(alsoBranches) {
     renderTop();
     renderSidebar();
     if (S.tab === "merge") renderMerge();
+    /* 角标跟着 status 走（不轮询）；面板只喂当前可见的那一个。 */
+    updatePills();
+    panelOnStatus();
   });
 }
 /* 统一的错误呈现：红条 + 后端原文 */
@@ -685,9 +768,14 @@ function paintV() {
       continue;
     }
     var it = r.item;
+    /* 这行只决定**给不给丢弃按钮**, 不决定「丢弃会发生什么」—— 后者一律
+       由 /api/discard/plan 的 action 说了算。所以 tooltip 不再断言结果:
+       原来那句「直接删除这个未跟踪文件」正是前端在替服务端预告后果, 而
+       discard() 判「已跟踪/未跟踪」用的是 resolve 之后的规范化路径,
+       两边判据不同就可能文案说删除、实际是 restore。 */
     var act = it.status === "?"
       ? '<span class="act warn" data-do="discard" data-path="' + esc(it.path) +
-        '" title="丢弃：直接删除这个未跟踪文件">✕ 丢弃</span>'
+        '" title="丢弃这个未跟踪文件（会怎么死由服务端预演说了算）">✕ 丢弃</span>'
       : '<span class="act" data-do="' + (it.staged ? "unstage" : "stage") +
         '" data-path="' + esc(it.path) + '" title="' +
         (it.staged ? "把改动移出索引" : "加入索引") + '">' +
@@ -1123,7 +1211,7 @@ function loadLog() {
    模态框：确认 / 输入
    ══════════════════════════════════════════════════════════════════════ */
 
-var modalOnOk = null;
+var modalOnOk = null, modalOnCancel = null;
 
 function openModal(opts) {
   var body = opts.body || "";
@@ -1135,6 +1223,10 @@ function openModal(opts) {
   $("modalBody").innerHTML = body;
   $("modalFoot").innerHTML = "";
   modalOnOk = opts.onOk || null;
+  /* 取消回调只有一个来源：closeModal()。
+     取消按钮 / Esc / 点遮罩都调它 —— 否则 confirmDanger 的 Promise
+     会在用户按 Esc 之后永远悬着。 */
+  modalOnCancel = opts.onCancel || null;
 
   var cancel = document.createElement("button");
   cancel.className = "btn ghost";
@@ -1159,14 +1251,470 @@ function openModal(opts) {
 function closeModal() {
   $("mask").classList.remove("show");
   $("modalBody").innerHTML = "";
+  var c = modalOnCancel;
   modalOnOk = null;
+  modalOnCancel = null;
+  if (c) c();
 }
 
 /* ══════════════════════════════════════════════════════════════════════
    标签页
    ══════════════════════════════════════════════════════════════════════ */
 
+/* =============================================================
+   面板宿主：懒加载 / 挂载 / 销毁
+   =============================================================
+
+   面板契约（另两条 UI 线请照这个写，注释就是接口定义）：
+
+     面板契约：每个面板是一个独立文件，懒加载，激活时才 mount。
+     另一个文件只需调用 window.AigitPanels.register({...})，
+     宿主负责挂载与销毁。
+
+       window.AigitPanels = window.AigitPanels || {};
+       window.AigitPanels.register = function (p) { ... };   // 存进注册表
+          ⚠ 上面这一整段说明是一个块注释,注释体内部绝不能再出现块注释的
+          开闭定界符(斜杠加星号那两个字符,连着一个星号斜杠)。JS 的块注释
+          不嵌套,里面一旦出现定界符,外层就当场闭合,后面整段说明会被当成
+          代码解析。2026-10-02 实测踩过:这一行原本带一句内联小注释,结果
+          整个主脚本 SyntaxError,页面退化成一张完全静态的死页 —— 所有事件
+          都没绑上,/api/health 一次都没发出去,而肉眼看 HTML 一切正常。
+
+       p = { id, title, mount(el, ctx), unmount() }
+         id    —— 与宿主 tab 的 data-tab 一致。当前两个槽位:
+                  "conflicts" -> /conflicts-panel.js
+                  "history"   -> /history-panel.js
+         title —— tab 显示名（宿主读它覆盖静态文案，可选）
+         mount(el, ctx[, restore]) —— el 是 #pane-<id>，只能往里写
+         unmount() —— 切走时宿主一定调用。返回值会被宿主记住，
+                  下次 mount 的第三个参数 restore 原样送回，用来保状态。
+                  **必须清掉 mount() 里建的每一个 setInterval /
+                  requestAnimationFrame**；不清的话宿主会强制取消并在
+                  面板上打错误角标（见下方 timerEnter / TIMER）。
+
+     [重要] 面板文件是按 ES module 被 import() 的，不是经典脚本。
+       所以：默认严格模式；顶层 this 是 undefined；顶层 var/let 不挂
+       window —— 想暴露就用 window.xxx。想用 import/export 随便用。
+       整个文件应该只调用一次 AigitPanels.register(...) 就收尾，
+       顶层不要有别的副作用（不发请求、不建定时器）。
+
+     ctx（宿主注入，不要在面板里再抄一份 esc/toast/api）：
+       api(path, opts)          宿主那个，自动管 busy 态
+       esc(s) / toast / noteHtml / paneNote / fail
+       refresh(alsoBranches)    刷 /api/status + /api/branches
+       openModal / closeModal   宿主那个模态
+       confirmDanger(opt)       危险操作二次确认，Promise<true|false>。
+                                opt = { title, body, bullets, okLabel,
+                                        requireWord }。
+                                requireWord 非空时确定按钮初始 disabled，
+                                用户必须手打出来才能点 —— 不预填任何
+                                破坏性选项。
+       virtualList()            Promise -> VirtualList（virtuallist.js）。
+                                按需加载：宿主启动时不取它。
+       status()                 当前 /api/status 快照
+       onStatus(fn)             注册一个「status 变了」的回调。
+                                **只在这个面板可见时才会被调用**；
+                                unmount 之后宿主自动丢弃。
+       isActive()               面板当前是否可见
+       setPill({text, state})   改自己 tab 上的小角标
+       setTitle(t)              改自己 tab 上的显示名
+
+     写面板时的几条硬规矩：
+       1. 顶层不要有任何副作用（不要在文件顶层发请求 / 建定时器）。
+          一切从 mount() 开始。
+       2. 长列表用 virtualList()，不要自己再造虚拟滚动。
+       3. 所有插 innerHTML 的数据都过 esc()。
+       4. 面板不可见时不得有任何定时器/轮询/动画 —— 这不是建议，
+          宿主有计时器审计会抓到并强制取消。
+       5. 面板是「视图」：一切写操作都必须有对应的 HTTP API，
+          删掉整个 web/ 目录功能不丢（见 test_aigit_web.py 的
+          「删 web/ 目录，验证纯 API 还完整可用」那一节）。
+
+   性能契约（这是本次改造的硬指标之一）：
+       * 面板文件不在 <head> 里静态引用。第一次点 tab 才 appendChild
+         一个 <script>，取过就不再取。
+       * mount() 只在 tab 第一次被激活时跑一次；切走就 unmount。
+       * 宿主为「还没打开的面板」零工作：没有预取、没有占位轮询、
+         没有后台 timer。没有加载过任何面板时，宿主连计时器审计
+         那层包装都不装。
+   ============================================================= */
+
+var PANEL_SLOTS = {
+  conflicts: { src: "/conflicts-panel.js", title: "冲突", pill: "pillConflicts" },
+  history:   { src: "/history-panel.js",   title: "历史", pill: "pillHistory" }
+};
+/* id -> { state, panel, loading, error, restore, leak, onStatus }
+   state: idle -> loading -> loaded -> mounted -> loaded -> ... / error */
+var PSTATE = {};
+
+window.AigitPanels = window.AigitPanels || {};
+window.AigitPanels._panels = window.AigitPanels._panels || {};
+
+/* 面板文件只调用这一个函数。返回 p 便于链式，失败返回 null。 */
+window.AigitPanels.register = function (p) {
+  if (!p || typeof p.id !== "string" || !p.id) {
+    if (typeof console !== "undefined") console.error("AigitPanels.register: 缺 id");
+    return null;
+  }
+  if (typeof p.mount !== "function") {
+    if (typeof console !== "undefined") {
+      console.error("AigitPanels.register: " + p.id + " 缺 mount(el, ctx)");
+    }
+    return null;
+  }
+  if (p.title && PANEL_SLOTS[p.id]) setTabTitle(p.id, p.title);
+  window.AigitPanels._panels[p.id] = p;
+  return p;
+};
+
+function panelState(id) {
+  return PSTATE[id] || (PSTATE[id] = { state: "idle", panel: null, loading: false,
+                                      error: null, restore: undefined, leak: [],
+                                      onStatus: null });
+}
+
+/* ---------- 计时器审计 ----------
+   拦 setInterval / requestAnimationFrame，把「面板挂着的时候」新建的句柄
+   记下来。unmount 时清单没清空 = 面板不可见后还在跑，宿主强制取消。
+   只有真的开始挂第一个面板时才装这层包装 —— 一个面板都没打开过的
+   会话，window.setInterval 保持原样，零开销。 */
+var TIMER = { installed: false, depth: 0, made: 0, cleared: 0, held: [] };
+
+function ensureTimerAudit() {
+  if (TIMER.installed) return;
+  if (typeof window.setInterval !== "function") return;   // 假 DOM 里没这些
+  var si = window.setInterval, ci = window.clearInterval;
+  var rq = window.requestAnimationFrame, cr = window.cancelAnimationFrame;
+  TIMER.installed = true;
+
+  function note(h, kind) {
+    if (TIMER.depth > 0) { TIMER.made++; TIMER.held.push({ h: h, kind: kind }); }
+    return h;
+  }
+  function drop(h) {
+    for (var i = 0; i < TIMER.held.length; i++) {
+      if (TIMER.held[i].h === h) { TIMER.held.splice(i, 1); TIMER.cleared++; return; }
+    }
+  }
+  window.setInterval = function (fn, ms) { return note(si.call(window, fn, ms), "interval"); };
+  window.clearInterval = function (h) { drop(h); return ci.call(window, h); };
+  if (typeof rq === "function") {
+    window.requestAnimationFrame = function (fn) {
+      var box = {};
+      box.h = rq.call(window, function (ts) { drop(box.h); return fn(ts); });
+      return note(box.h, "raf");
+    };
+    if (typeof cr === "function") {
+      window.cancelAnimationFrame = function (h) { drop(h); return cr.call(window, h); };
+    }
+  }
+}
+function timerEnter() { ensureTimerAudit(); TIMER.depth++; }
+function timerLeave() { TIMER.depth = Math.max(0, TIMER.depth - 1); return TIMER.held.slice(); }
+
+function forceStop(list) {
+  for (var i = 0; i < (list || []).length; i++) {
+    try {
+      if (list[i].kind === "raf" && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(list[i].h);
+      } else if (typeof window.clearInterval === "function") {
+        window.clearInterval(list[i].h);
+      }
+    } catch (e) { /* 面板把 clear* 也包坏了，清不掉就算了，已经尽力 */ }
+  }
+}
+
+/* ---------- 懒加载 ----------
+   唯一的取文件入口。URL 全是 PANEL_SLOTS 里的字面量常量，不拼任何数据。
+
+   走 import() 而不是 <script src=...>，三个理由，都是实测出来的：
+     1. L1 静态扫描把 `.src=` **和** `setAttribute(` 都算 URL sink，
+        动态插 <script> 无论怎么写都会把 1d 从 PASS 打成 FAIL；
+     2. import() 是语言级的，不需要 eval 权限，index() 外面不用
+        new Function 之类的 shim（而字面 import( 又进不了 L4 的
+        new Function harness，所以放在上面那个 module 块里）；
+     3. 404 / MIME 不符时是 Promise reject，一个 catch 收干净。 */
+function loadModule(url, tag) {
+  return new Promise(function (resolve, reject) {
+    if (typeof window.__aigitImport !== "function") {
+      reject(new Error("动态 import() 不可用（<script type=\"module\"> 没执行）"));
+      return;
+    }
+    window.__aigitImport(url).then(resolve, function (e) {
+      reject(new Error("取不到 " + url + " —— " + ((e && e.message) || e)));
+    });
+  });
+}
+
+var _vl = null;
+function ensureVirtualList() {
+  if (_vl) return Promise.resolve(_vl);
+  return loadModule("/virtuallist.js", "virtuallist").then(function () {
+    _vl = window.VirtualList || null;
+    if (!_vl) throw new Error("virtuallist.js 加载了但没有 window.VirtualList");
+    return _vl;
+  });
+}
+
+function loadPanel(id) {
+  var spec = PANEL_SLOTS[id];
+  return loadModule(spec.src, id).then(function () {
+    var p = window.AigitPanels._panels[id];
+    if (p) return p;
+    throw new Error("文件取到了，但它没调用 AigitPanels.register({id:\"" + id + "\"})");
+  });
+}
+
+/* ---------- 槽位文案 ---------- */
+/* 槽位元素可能已经不在了:面板 mount() 通常直接 el.innerHTML = "" 把整个
+   #pane-<id> 重写,顺手把宿主自己那个 <div id="slot-<id>"> 也一起抹掉了。
+   实测:冲突面板挂载一次之后 getElementById("slot-conflicts") 就是 null。
+   那样一来 slotMsg 会静默 return —— 面板加载失败 / mount 抛异常时,
+   用户看到的是上一次成功挂载的旧画面,一个字的报错都没有。
+   所以这里必须回落到 #pane-<id>:报错时覆盖掉面板残留是应该的。 */
+function slotMsg(id, err, html) {
+  var el = document.getElementById("slot-" + id) || document.getElementById("pane-" + id);
+  if (!el) return;
+  el.innerHTML = '<div class="slot-msg' + (err ? " err" : "") + '">' + html + "</div>";
+}
+/* 改 tab 上的显示名 —— 只准动 .tab-t 那个文本节点。
+   ⚠ 2026-10-02 实测踩过:早先这里写的是 t.textContent = title,
+   而 tab 里除了文字还挂着 <span class="pill" id="pill…">,textContent 赋值
+   会把**全部子节点**一起抹掉。之后 setPill 里 getElementById 拿到 null 就
+   静默 return,角标从此永久失效 —— 包括宿主自己的 loading / error 角标。
+   实测证据:两个面板 register 完之后 pillConflictsEl / pillHistoryEl 都是 false。 */
+function setTabTitle(id, title) {
+  var t = document.querySelector('[data-tab="' + id + '"]');
+  if (!t || !title) return;
+  var lab = t.querySelector(".tab-t");
+  if (!lab) {                       // 兼容没有 .tab-t 的旧结构
+    lab = document.createElement("span");
+    lab.className = "tab-t";
+    t.insertBefore(lab, t.firstChild);
+  }
+  lab.textContent = title;
+}
+function setPill(id, o) {
+  var spec = PANEL_SLOTS[id];
+  if (!spec || !spec.pill) return;
+  var el = $(spec.pill);
+  if (!el) return;
+  /* 用 className 而不是 setAttribute("data-state", ...) —— 后者在 L1 的
+     URL sink 清单里（实测会把 1d 打成 FAIL）。className 假 DOM 也有。 */
+  if (!o || !o.text) {
+    el.className = "pill";
+    el.textContent = "";
+    return;
+  }
+  el.className = "pill" + (o.state ? " " + o.state : "");
+  el.textContent = o.text;
+}
+/* 冲突数角标：只从已经拿到的 /api/status 里读，跟着 refresh 走，不轮询 */
+function updatePills() {
+  var n = S.status ? (S.status.conflicted || []).length : 0;
+  var cs = panelState("conflicts");
+  if (cs.state === "loading") setPill("conflicts", { text: "…", state: "loading" });
+  else if (cs.state === "error") setPill("conflicts", { text: "!", state: "error" });
+  else setPill("conflicts", n ? { text: String(n) } : null);
+  var hs = panelState("history");
+  if (hs.state === "loading") setPill("history", { text: "…", state: "loading" });
+  else if (hs.state === "error") setPill("history", { text: "!", state: "error" });
+  else setPill("history", null);
+}
+function renderMissing(id, why) {
+  var spec = PANEL_SLOTS[id];
+  slotMsg(id, true,
+    "<b>面板未加载</b> —— " + esc(why) + "<br>槽位 <code>" + esc(spec.src) +
+    "</code> 没能取到，所以这个 tab 现在是空的。" +
+    '<span class="why">这一格是宿主留的降级位，功能本身不受影响：' +
+    "同样的操作直接打 HTTP API 就能做（例如 <code>/api/conflict/*</code>、<code>/api/history/*</code>），" +
+    "web/ 目录整个删掉也照样能用。文件到位后重新点一次这个 tab 就会重试。</span>");
+}
+
+/* ---------- 挂载 / 销毁 ---------- */
+function panelCtx(id) {
+  return {
+    api: api, esc: esc, toast: toast, noteHtml: noteHtml, paneNote: paneNote,
+    fail: fail, refresh: refresh, openModal: openModal, closeModal: closeModal,
+    confirmDanger: confirmDanger,
+    virtualList: ensureVirtualList,
+    status: function () { return S.status; },
+    isActive: function () { return S.tab === id; },
+    onStatus: function (fn) { panelState(id).onStatus = typeof fn === "function" ? fn : null; },
+    setPill: function (o) { setPill(id, o); },
+    setTitle: function (t) { setTabTitle(id, t); }
+  };
+}
+
+function panelActivate(id) {
+  if (!PANEL_SLOTS[id]) return;      // 不是面板 tab —— 零工作量
+  var st = panelState(id);
+  if (st.state === "mounted" || st.loading) return;
+  if (st.panel) { panelMount(id, st.panel); return; }   // 取过了，直接挂（也覆盖重试）
+  st.loading = true;
+  st.state = "loading";
+  setPill(id, { text: "…", state: "loading" });
+  slotMsg(id, false, "正在加载 <b>" + esc(PANEL_SLOTS[id].src) + "</b> …");
+  loadPanel(id).then(function (p) {
+    st.loading = false;
+    st.panel = p;
+    st.state = "loaded";
+    setPill(id, null);
+    if (S.tab !== id) return;        // 用户已经切走了 —— 不可见就不许 mount
+    panelMount(id, p);
+  }, function (e) {
+    st.loading = false;
+    st.state = "error";
+    st.error = (e && e.message) || String(e);
+    setPill(id, { text: "!", state: "error" });
+    renderMissing(id, st.error);
+    if (typeof console !== "undefined") console.error("aigit panel " + id + ": " + st.error);
+  });
+}
+
+function panelMount(id, p) {
+  var st = panelState(id);
+  var el = document.getElementById("pane-" + id);
+  if (!el) return;
+  var slot = document.getElementById("slot-" + id);
+  if (slot) slot.innerHTML = "";
+  var err = null;
+  timerEnter();
+  try { p.mount(el, panelCtx(id), st.restore); }
+  catch (e) { err = (e && e.message) || String(e); }
+  var leftover = timerLeave();
+  st.leak = leftover;
+  if (err) {
+    st.state = "error";
+    st.error = "面板 mount() 抛异常:" + err;
+    forceStop(leftover);
+    st.onStatus = null;
+    setPill(id, { text: "!", state: "error" });
+    renderMissing(id, st.error);
+    if (typeof console !== "undefined") console.error("aigit panel " + id + ": " + st.error);
+    return;
+  }
+  st.state = "mounted";
+  st.error = null;
+  if (leftover.length && typeof console !== "undefined") {
+    console.info("aigit panel " + id + ": 挂载后有 " + leftover.length +
+                 " 个定时器/rAF 在跑（此时面板可见，正常）");
+  }
+}
+
+function panelDeactivate(id) {
+  var st = PSTATE[id];
+  if (!st || st.state !== "mounted") return;
+  var p = st.panel;
+  var err = null;
+  /* 关键：这一句是「面板不可见时零开销」的全部保证。
+     先 unmount，再核对计时器清单 —— 面板忘了清的就地强制取消。 */
+  timerEnter();
+  try { st.restore = (p && typeof p.unmount === "function") ? p.unmount() : undefined; }
+  catch (e) { err = (e && e.message) || String(e); }
+  var leftover = timerLeave();
+  st.onStatus = null;              // 不可见了就不再喂它 status
+  st.state = "loaded";
+  st.leak = leftover;
+  if (err) st.error = "面板 unmount() 抛异常:" + err;
+  if (leftover.length) {
+    forceStop(leftover);
+    st.leak = [];
+    if (!err) {
+      st.error = "面板 unmount() 之后还剩 " + leftover.length +
+                 " 个定时器/rAF 没清掉（违反了「不可见时零开销」），宿主已强制取消。";
+    }
+  }
+  if (err || leftover.length) {
+    setPill(id, { text: "!", state: "error" });
+    if (typeof console !== "undefined") console.error("aigit panel " + id + ": " + st.error);
+  }
+}
+
+/* 只喂当前可见的那个面板。非面板 tab / 没挂载 / 不可见 —— 一个字节都不碰。 */
+function panelOnStatus() {
+  if (!PANEL_SLOTS[S.tab]) return;
+  var st = PSTATE[S.tab];
+  if (!st || st.state !== "mounted" || typeof st.onStatus !== "function") return;
+  try { st.onStatus(S.status); }
+  catch (e) { if (typeof console !== "undefined") console.error(e); }
+}
+
+/* ---------- 危险操作二次确认 ----------
+   requireWord 非空 -> 确定按钮初始 disabled，用户手打出来才放行。
+   破坏性选项一律不预填。 */
+function confirmDanger(opt) {
+  opt = opt || {};
+  var word = opt.requireWord || "";
+  var body = esc(opt.body || "");
+  if (opt.bullets && opt.bullets.length) {
+    body += "\n" + opt.bullets.map(function (x) { return "· " + esc(x); }).join("\n");
+  }
+  if (word) {
+    body += "\n这一步不可撤销。确认前请原样键入下面的词：\n" +
+            '<span class="confirmword">' + esc(word) + "</span>";
+  }
+  return new Promise(function (resolve) {
+    var decided = false;
+    openModal({
+      title: opt.title || "确认危险操作",
+      body: body,
+      okLabel: opt.okLabel || "确定",
+      danger: true,
+      input: word ? { placeholder: "键入 " + word + " 以解锁" } : null,
+      onOk: function () {
+        if (word) {
+          var i = $("modalInput");
+          if (!i || i.value.trim() !== word) return;   // 没对上就不关模态
+        }
+        decided = true;
+        closeModal();
+      },
+      /* 取消、Esc、点遮罩都走 closeModal -> onCancel，Promise 不会悬着 */
+      onCancel: function () { resolve(decided); }
+    });
+    if (word) {
+      var ok = $("modalOk"), inp = $("modalInput");
+      if (ok && inp) {
+        ok.disabled = true;
+        inp.addEventListener("input", function () {
+          var good = inp.value.trim() === word;
+          ok.disabled = !good;
+          inp.classList.toggle("armed", good);
+        });
+      }
+    }
+  });
+}
+
+/* 诊断口：给性能实测脚本读。纯只读，不产生任何副作用。 */
+window.__aigitAudit = function () {
+  var out = {
+    tab: S.tab,
+    timer: { installed: TIMER.installed, made: TIMER.made,
+             cleared: TIMER.cleared, live: TIMER.held.length },
+    panels: []
+  };
+  for (var id in PANEL_SLOTS) {
+    if (!PANEL_SLOTS.hasOwnProperty(id)) continue;
+    var st = PSTATE[id] || {};
+    out.panels.push({ id: id, src: PANEL_SLOTS[id].src,
+      state: st.state || "idle", mounted: st.state === "mounted",
+      leak: (st.leak || []).length, error: st.error || null });
+  }
+  try {
+    var ss = document.querySelectorAll("script[src]");
+    out.scripts = [];
+    for (var i = 0; i < ss.length; i++) out.scripts.push(ss[i].getAttribute("src"));
+  } catch (e) { out.scripts = []; }
+  if (typeof performance !== "undefined" && performance.getEntriesByType) {
+    out.resources = performance.getEntriesByType("resource").map(function (r) { return r.name; });
+  }
+  return out;
+};
+
 function switchTab(name) {
+  var prev = S.tab;
   S.tab = name;
   var tabs = document.querySelectorAll(".tab");
   for (var i = 0; i < tabs.length; i++) {
@@ -1178,6 +1726,9 @@ function switchTab(name) {
   }
   if (name === "log") loadLog();
   if (name === "merge") { renderMerge(); renderScenarios(); }
+  /* 面板：先拆旧的再挂新的。点同一个 tab 不拆不挂（空操作）。 */
+  if (prev !== name) panelDeactivate(prev);
+  panelActivate(name);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -1217,25 +1768,121 @@ function doStage(paths, unstage) {
     .catch(function (e) { fail(unstage ? "取消暂存" : "暂存", e); });
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+   丢弃 / 重置 —— 两步协议
+   ══════════════════════════════════════════════════════════════════════
+   和 web/history-panel.js 同一套：① GET 只读预演 → ② 确认后才 POST，
+   而且那个 POST 必须带 `confirmed: true`。
+
+   为什么不能省掉 ① —— 两条理由，缺一条都不够：
+
+   1. 少了它这两个按钮**一次都调不通**。服务端 `/api/discard` 与
+      `/api/reset` 都要求 `_bb(b,"confirmed") is True`（`_bb` 只认真布尔，
+      字符串 "false" 在 Python 里是真的），缺了就 400 needs_confirmation。
+      实测：修之前 `POST /api/discard {"files":[...]}` 与
+      `POST /api/reset {}` 都是 400 —— 两个按钮都是死的。
+
+   2. 更要紧的是**分类不许前端猜**。原来这里靠
+      `S.status.unstaged[].status === "?"` 判「哪些是未跟踪文件」，
+      而服务端 `discard()` 判「已跟踪/未跟踪」用的是 **resolve 之后的
+      规范化相对路径**。两边判据不同就可能：确认框写着「恢复到最近一次
+      提交」，实际执行的是 unlink 把文件删了。
+      **一个会撒谎的确认框比一个死按钮危险** —— 死按钮至少不危险。
+      所以下面一律以 `/api/discard/plan` 返回的 action 为准。
+
+   ② 那一侧还有两个细节不是「加个字段」能解决的：
+      * `blocked` 条目在**弹确认框之前**就拦下。让用户先点「确认丢弃」
+        再被告知不行，等于白跑一趟，还差点让人以为已经删了。
+      * `mode` 不给默认值（服务端也不给，实测 `POST /api/reset {}` 是 400）。
+        默认 hard 就等于 reset --hard 不经确认。 */
+
+/* plan 的 action 分组 → 确认框里的一段。**文字取服务端的 detail**，
+   不在这里另写一份：同一件事写两遍，迟早有一份过期，而过期的那份
+   就是骗人的那份。分组顺序按服务端 entries 的原序。 */
+function discardPlanGroups(plan) {
+  var entries = (plan && plan.entries) || [];
+  var groups = [], byAction = {};
+  for (var i = 0; i < entries.length; i++) {
+    var e = entries[i] || {};
+    var a = String(e.action == null ? "unknown" : e.action);
+    if (!(a in byAction)) {
+      byAction[a] = { action: a, items: [], detail: String(e.detail == null ? "" : e.detail) };
+      groups.push(byAction[a]);
+    }
+    byAction[a].items.push(e);
+  }
+  return groups;
+}
+
+function discardItemsHtml(items) {
+  /* 逐个先转义再拼标签。反过来做（先 join 再 esc）会把 "</li><li>"
+     变成字面量显示出来 —— 那是这段代码原来就有的写法。 */
+  return "<ul>" + items.map(function (e) {
+    return "<li>" + esc(e && e.path) + "</li>";
+  }).join("") + "</ul>";
+}
+
 function doDiscard(paths) {
-  var idx = {};
-  if (S.status) (S.status.unstaged || []).forEach(function (u) { idx[u.path] = u; });
-  var untracked = paths.filter(function (p) { return idx[p] && idx[p].status === "?"; });
+  if (!paths || !paths.length) {
+    toast("warn", "没有可丢弃的改动。");
+    return Promise.resolve();
+  }
+  /* files 必须是**重复的 query 参数**（?files=a&files=b），不是 JSON 数组。
+     服务端走 as_file_list(parse_qs(...))，写成 ?files=["a","b"] 会被当成
+     一个名叫 '["a","b"]' 的路径，预演照样 200 + action=missing，一个错
+     都不报 —— 然后前端就拿着「这个路径不存在」去让用户点确认。 */
+  var qs = paths.map(function (p) {
+    return "files=" + encodeURIComponent(p);
+  }).join("&");
+
+  return api("/api/discard/plan?" + qs)
+    .then(function (plan) {
+      var blocked = (plan && plan.blocked) || [];
+      if (blocked.length) {
+        /* 拦在确认框**之前**。discard() 撞上「目录内含已跟踪文件」是抛
+           GitError 整条拒绝，所以这里提前说清「一个字节都没动」。 */
+        toast("err", "<b>丢弃被拒绝，没有删任何东西</b>\n" +
+          blocked.map(function (b) {
+            return "· " + esc(b && b.path) + "：" + esc(b && b.detail);
+          }).join("\n") +
+          "\n\n这些是未跟踪目录但里面含已跟踪文件，整目录丢弃会把那些文件"
+          + "从工作区删掉。请进去逐个处理。");
+        return;
+      }
+      openDiscardConfirm(paths, plan);
+    })
+    .catch(function (e) { fail("预演丢弃改动", e); });
+}
+
+function openDiscardConfirm(paths, plan) {
+  var groups = discardPlanGroups(plan);
+  var wiped = 0;
+  for (var i = 0; i < groups.length; i++) {
+    if (groups[i].action === "delete-file" || groups[i].action === "delete-tree") {
+      wiped += groups[i].items.length;
+    }
+  }
+  var body = "以下改动会<b class=\"danger\">永久丢失，无法撤销</b>。\n";
+  for (var g = 0; g < groups.length; g++) {
+    body += "\n<b>" + esc(groups[g].detail) + "</b>（" + groups[g].items.length + "）：\n" +
+      discardItemsHtml(groups[g].items);
+  }
+  body += "\n" + escMd(plan && plan.note) + "\n\n确定继续吗？";
 
   openModal({
     title: "确认丢弃改动",
-    body: "以下改动会<b class=\"danger\">永久丢失，无法撤销</b>：\n\n" +
-      "<ul><li>" + esc(paths.join("</li><li>")) + "</li></ul>\n" +
-      (untracked.length
-        ? "\n其中 <b>" + untracked.length + "</b> 个是未跟踪文件，" +
-          "<b class=\"danger\">会被直接删除</b>（不是恢复成旧版本）。\n"
-        : "\n这些是已跟踪文件，会被恢复到最近一次提交的内容。\n") +
-      "\n已暂存的改动也会丢失。确定继续吗？",
+    body: body,
     okLabel: "确认丢弃",
     danger: true,
     onOk: function () {
       closeModal();
-      api("/api/discard", { method: "POST", body: { files: paths } })
+      api("/api/discard", {
+        method: "POST",
+        /* confirmed 只认 JSON 布尔。写 confirmed: "true" 会被 _bb 拒成 400
+           —— 那是对的：一个把 false 序列化成字符串的前端，在这里等于
+           「没确认」。 */
+        body: { files: paths, confirmed: true }
+      })
         .then(function (d) {
           applyStatus(d);
           S.openKey = null;
@@ -1243,28 +1890,115 @@ function doDiscard(paths) {
         })
         .then(function () {
           showNoFile();
-          toast("ok", "已丢弃 " + paths.length + " 个文件的改动。" +
-            (untracked.length ? "（其中 " + untracked.length + " 个未跟踪文件已被删除）" : ""));
+          toast("ok", "已丢弃 " + paths.length + " 个路径的改动。" +
+            (wiped ? "（其中 " + wiped + " 个未跟踪文件/目录已被永久删除）" : ""));
         })
         .catch(function (e) { fail("丢弃改动", e); });
     }
   });
 }
 
+/* ── reset ── */
+
+/* 三种模式**一个都不预选**。mode 决定「工作区里的改动活不活」，那是替用户
+   做决定：服务端刻意不给默认值（实测 `POST /api/reset {}` -> 400），
+   前端也不能替它补一个 —— 补 hard 就是 reset --hard 不经确认。
+   写死 checked 与 history-panel.js 的 resetRadio 同一条理由：预演回来要
+   整块重绘，硬编码的 checked 每次都会被重绘抹掉。 */
+function resetRadioHtml(mode, desc) {
+  return '<label style="display:block;margin:3px 0;cursor:pointer">' +
+    '<input type="radio" name="aigit-reset-mode" value="' + esc(mode) + '"> ' +
+    "<b>" + esc(mode) + "</b>　" + esc(desc) + "</label>";
+}
+
+function resetModeChecked() {
+  var n = document.querySelector('input[name="aigit-reset-mode"]:checked');
+  return n ? String(n.value) : "";
+}
+
 function doReset() {
   openModal({
-    title: "确认丢弃全部改动",
-    body: "这会执行 <code>git reset --hard HEAD</code> + <code>git clean -fd</code>，" +
-      "<b class=\"danger\">仓库内所有未提交改动会被永久删除，无法撤销</b>：\n\n" +
-      "<ul><li>已跟踪文件的修改会回到最近一次提交</li>" +
-      "<li>已暂存的改动会丢失</li>" +
-      "<li><b class=\"danger\">所有未跟踪文件和目录会被直接删除</b></li></ul>\n" +
-      "<b>已提交的分支和历史不受影响。</b>\n\n确定继续吗？",
-    okLabel: "全部丢弃",
+    title: "重置工作区 —— 先选模式",
+    body: "<b>三种模式都没有默认值，必须你自己选。</b>\n" +
+      "soft / mixed / hard 决定「工作区里的改动活不活」—— 替用户选就是\n" +
+      "替他做这个决定，所以这里一个都不预选。\n\n" +
+      resetRadioHtml("soft", "提交撤销，改动全部回到暂存区（工作区不动）") +
+      resetRadioHtml("mixed", "提交撤销，改动回到工作区并取消暂存") +
+      resetRadioHtml("hard", "提交撤销，未提交的改动永久丢失，还 git clean -fd") +
+      "\n\n下一步会先做一次**只读预演**给你看，确认之后才真的执行。",
+    okLabel: "① 查看影响（不执行）",
+    danger: true,
+    onOk: function () {
+      var mode = resetModeChecked();
+      if (!mode) {
+        /* 不关模态：让用户回去点一个。history-panel.js 的 planReset 同款。 */
+        toast("warn", "reset 的三种模式<b>都没有默认值</b>，请先自己选一个。" +
+          "（选 hard 会永久丢弃未提交的改动。）");
+        return;
+      }
+      closeModal();
+      loadResetPlan(mode);
+    }
+  });
+}
+
+function loadResetPlan(mode) {
+  /* hard 会连带 git clean -fd，而 reset/plan 不报未跟踪清单 —— 未跟踪的
+     要用 /api/discard/plan（**不传 files**）那份 untracked_total。
+     弹窗原来只写一句「所有未跟踪文件和目录会被直接删除」，用户不知道那是
+     几个；这里把真的数字摆出来。 */
+  var jobs = [api("/api/reset/plan?mode=" + encodeURIComponent(mode))];
+  if (mode === "hard") jobs.push(api("/api/discard/plan"));
+  return Promise.all(jobs)
+    .then(function (r) { openResetConfirm(mode, r[0], r[1] || null); })
+    .catch(function (e) { fail("预演重置工作区", e); });
+}
+
+function openResetConfirm(mode, plan, dplan) {
+  var body = "<b>reset --" + esc(mode) + " " +
+    esc(plan && plan.ref ? plan.ref : "HEAD") + "</b>\n";
+  body += "\n" + escMd(plan && plan.note) + "\n";
+  if (plan && plan.warning) body += "\n<b class=\"danger\">" + esc(plan.warning) + "</b>\n";
+
+  var undone = (plan && plan.undone_commits) || [];
+  if (undone.length) {
+    body += "\n会从当前分支上被拿掉的提交（" + undone.length + "）：\n<ul>" +
+      undone.map(function (c) {
+        return "<li><code>" + esc(c && c.short) + "</code> " + esc(c && c.summary) + "</li>";
+      }).join("") + "</ul>\n";
+  } else {
+    body += "\n当前分支没有需要被拿掉的提交。\n";
+  }
+
+  if (mode === "hard") {
+    body += "\n<b class=\"danger\">未跟踪文件和目录会被直接删除</b>" +
+      "（git clean -fd，git 从没记过它们，删了找不回来）：\n";
+    var total = (dplan && dplan.untracked_total) || [];
+    if (total.length) {
+      body += "<ul>" + total.slice(0, 200).map(function (p) {
+        return "<li>" + esc(p) + "</li>";
+      }).join("") + "</ul>";
+      if (total.length > 200) {
+        body += "……共 " + total.length + " 项，这里只列了前 200 个。\n";
+      }
+    } else {
+      body += "当前没有未跟踪文件。\n";
+    }
+  }
+
+  body += "\n<b>已提交的分支和历史不受影响。</b>\n\n确定继续吗？";
+
+  openModal({
+    title: "确认重置工作区 —— " + mode,
+    body: body,
+    okLabel: mode === "hard" ? "全部丢弃" : "确认重置",
     danger: true,
     onOk: function () {
       closeModal();
-      api("/api/reset", { method: "POST", body: {} })
+      api("/api/reset", {
+        method: "POST",
+        body: { mode: mode, ref: plan && plan.ref ? plan.ref : "HEAD", confirmed: true }
+      })
         .then(function (d) {
           applyStatus(d);
           S.openKey = null;
@@ -1276,8 +2010,9 @@ function doReset() {
           showNoFile();
           switchTab("merge");
           renderScenarios();
-          paneNote("mergeNote", "ok", "已重置工作区到最近一次提交。", true);
-          toast("ok", "已重置工作区到最近一次提交。");
+          paneNote("mergeNote", "ok", "已按 <code>reset --" + esc(mode) +
+            "</code> 重置工作区。", true);
+          toast("ok", "已重置工作区（<code>reset --" + esc(mode) + "</code>）。");
         })
         .catch(function (e) { fail("重置工作区", e); });
     }

@@ -367,7 +367,7 @@ def merge_and_check(rep, cli, sandbox, tag, file_hint, a, b, expect_clean):
 
     # 收尾:冲突用 merge-abort,合并成功的用 reset,都回到 main。
     cli.call("POST", "/api/merge-abort")
-    cli.call("POST", "/api/reset")
+    cli.call("POST", "/api/reset", {"mode": "hard", "confirmed": True})
     st, obj = cli.call("POST", "/api/checkout", {"name": "main"})
     rep.check("%s 复位回 main" % tag, st == 200 and obj.get("branch") == "main",
               "200 且 branch=main", "%s %s" % (st, short(obj)), obj)
@@ -554,7 +554,10 @@ def run_unstage_discard(rep, cli, sandbox, tracked):
               % (st, short(paths_of(obj.get("staged"))),
                  short(paths_of(obj.get("unstaged")))), obj)
 
-    st, obj = cli.call("POST", "/api/discard", {"files": [tracked, untracked]})
+    # confirmed=true 是 discard 闸门要求的: 它是破坏性操作, 不带这个
+    # 一律 400 + code=needs_confirmation(改动前这里不传, 靠默认放行)。
+    st, obj = cli.call("POST", "/api/discard",
+                       {"files": [tracked, untracked], "confirmed": True})
     rep.check("discard 丢弃改动", st == 200 and obj.get("ok") is True,
               "200 且 ok=true", "%s %s" % (st, short(obj)), obj)
     rep.check("discard 后文件已还原",

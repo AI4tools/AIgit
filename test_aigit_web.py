@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """aigit 前端无头审计 —— 补 doc/aigit-review.md §4.5「前端一行都没测」那个洞。
 
@@ -642,18 +642,53 @@ function loadIndex(){
   if (!blocks.length) throw new Error('index.html 里找不到内联 <script>');
   const src = blocks[blocks.length-1];
   const {document} = buildDom(html);
-  const fetch = (url) => Promise.resolve({
-    status: 200,
-    text: () => Promise.resolve(JSON.stringify(FETCH_DATA[String(url).split('?')[0]] || {ok:true}))
-  });
+  /* 破坏性操作走两步之后，doDiscard/doReset 一进来就 GET 预演, 所以这个
+     fetch 桩**第一次被真正用上了**(改之前只有 onOk 里那次 POST,而用例从不
+     点确定)。FETCH_DATA 以前在这里被引用却**从没定义过** —— 那时是无害的,
+     因为没有一条用例真的调 api(); 现在它是被依赖的, 缺了就是 ReferenceError。
+
+     预演响应里**故意塞 payload**: 确认框现在渲染的是服务端回的 path/detail,
+     所以真正要验的注入面从「点击时传的参数」搬到了「服务端响应」——
+     桩不给 payload 的话这条用例会测一个已经没人走的 sink。 */
+  const FETCH_DATA = {
+    '/api/discard/plan': {
+      ok: true, op: 'discard',
+      entries: (process.env.A2_PAYLOADS ? JSON.parse(process.env.A2_PAYLOADS) : [])
+        .map((p, i) => ({path: p, action: ['restore','delete-file','delete-tree'][i % 3],
+                         detail: 'detail-' + p})),
+      blocked: [],
+      untracked_total: process.env.A2_PAYLOADS ? JSON.parse(process.env.A2_PAYLOADS) : [],
+      untracked_count: 1,
+      note: 'note **强调** <b>raw</b>'
+    },
+    '/api/reset/plan': {
+      ok: true, op: 'reset', mode: 'hard', ref: 'HEAD',
+      undone_commits: (process.env.A2_PAYLOADS ? JSON.parse(process.env.A2_PAYLOADS) : [])
+        .map(p => ({sha: '0'.repeat(40), short: p.slice(0,8), summary: 'sum-' + p})),
+      note: 'hard: note **强调** <b>raw</b>',
+      warning: 'warning <b>raw</b>'
+    }
+  };
+  const calls = [];
+  const fetch = (url, init) => {
+    calls.push({url: String(url), method: (init && init.method) || 'GET',
+                body: init && init.body});
+    return Promise.resolve({
+      status: 200,
+      text: () => Promise.resolve(JSON.stringify(
+        FETCH_DATA[String(url).split('?')[0]] || {ok:true}))
+    });
+  };
   const fn = new Function('document','fetch','window','setTimeout','console', src + `
 ;return {S:S, esc:esc, paintV:paintV, renderLog:renderLog, renderMerge:renderMerge,
  renderScenarios:renderScenarios, renderDiffBody:renderDiffBody, parseDiff:parseDiff,
  renderSidebar:renderSidebar, renderTop:renderTop, toast:toast, fail:fail,
- openModal:openModal, doCheckout:doCheckout, doDiscard:doDiscard, summarize:summarize,
+ openModal:openModal, doCheckout:doCheckout, doDiscard:doDiscard, doReset:doReset,
+ resetModeChecked:resetModeChecked, loadResetPlan:loadResetPlan,
+ summarize:summarize,
  noteHtml:noteHtml, stClass:stClass, rowKey:rowKey, trackedPaths:trackedPaths,
  buildRows:buildRows, findItem:findItem, loadDiff:loadDiff, switchTab:switchTab};`);
-  return {api: fn(document, fetch, {}, setTimeout, console), document};
+  return {api: fn(document, fetch, {}, setTimeout, console), document, calls};
 }
 
 function loadConflicts(){
@@ -670,9 +705,32 @@ function loadConflicts(){
 const PAYLOADS = JSON.parse(process.env.A2_PAYLOADS);
 const WEBDIR = process.env.A2_WEBDIR;
 
+/* 点模态框的「确定」。openModal 往 #modalFoot 里 appendChild 的顺序是
+   [取消, 确定], 确定那个的 onclick 就是 modalOnOk。用例要走到 POST 就必须
+   真点它 —— 否则序列里只有预演那一次 GET, 断言「POST 带 confirmed」就成了
+   自欺欺人(实测踩过: 没点确定时「一次 POST 都没有」被当成产品缺陷报了 FAIL,
+   其实只是用例没点到按钮)。
+
+   document 必须由调用方传进来: 桩身是 loadIndex() 里的局部变量, 外面那个
+   标识符根本不存在(第一版就这么写的, 直接 ReferenceError)。 */
+function clickModalOk(doc){
+  const foot = doc.getElementById('modalFoot');
+  const btns = (foot && foot.children) || [];
+  const ok = btns[btns.length - 1];
+  if (ok && typeof ok.onclick === 'function') ok.onclick();
+  else OUT.errors.push('clickModalOk: #modalFoot 里没找到带 onclick 的确定按钮');
+}
+/* 让 fetch 桩那些已经 resolve 的 promise 链跑完(微任务 + 一层 then)。 */
+function tick(){ return new Promise(r => setTimeout(r, 0)); }
+
 // ---------- index.html ----------
+/* async: 破坏性操作改成两步之后, doDiscard / loadResetPlan 一进来就 GET 预演,
+   确认框要等那个 promise 落地才写进 #modalBody。同步取的话读到的是**上一个**
+   模态框(第 8 条 doCheckout 那个)的残留 —— 用例照样 PASS, 但它验的是错的
+   sink。宁可 await, 也不要一个看起来绿、其实没测到东西的用例。 */
+async function runIndex(){
 try {
-  const {api} = loadIndex();
+  const {api, calls, document} = loadIndex();
   OUT.esc.index = {
     lt: api.esc('<'), gt: api.esc('>'), amp: api.esc('&'),
     dq: api.esc('"'), sq: api.esc("'"),
@@ -746,11 +804,58 @@ try {
         html:(OUT.writes.filter(x=>x.id==='modalBody').pop()||{value:''}).value,
         payload: PAYLOADS[0] });
 
-  // 9 discard 确认框(路径被 esc 后还塞在 </li><li> 结构里)
-  I.doDiscard([PAYLOADS[0], PAYLOADS[1]]);
+  // 9 discard 确认框。两步协议: 渲染的是**服务端预演回的** path/detail,
+  //   所以注入面从「点击时传的参数」搬到了「服务端响应」。
+  OUT.writes = [];
+  await I.doDiscard([PAYLOADS[0], PAYLOADS[1]]);
   out({ case:'discard-modal', sink:'#modalBody.innerHTML',
         html:(OUT.writes.filter(x=>x.id==='modalBody').pop()||{value:''}).value,
         payload: PAYLOADS[0] });
+
+  // 点「确定」, 让那个 POST 真的发出去。不点的话 calls 里只有预演那一次 GET,
+  //   而「POST 带没带 confirmed」正是这条用例的全部意义 —— 只 GET 的话
+  //   接线断言会自己骗自己。
+  OUT.writes = [];
+  clickModalOk(document);
+  await tick();
+  OUT.discardCalls = calls.slice();
+
+  // 9c reset 的模式选择框。**不走注入判定**: 这个框里没有一行服务端数据,
+  //    全是我们自己写的静态文案 + 一个硬编码的 radio 列表, payload 是空串。
+  //    喂给 classify 只会把正文里我们自己写的 <b> 报成 DANGER_TAG(实测踩过:
+  //    「必须显式选」那几个 <b> 被判成危险标签)。它真正要证明的是
+  //    「三个模式都在、且一个都没预选」—— 那是需求, 交给下面的结构断言。
+  OUT.writes = [];
+  I.doReset();
+  OUT.resetModalHtml =
+    (OUT.writes.filter(x=>x.id==='modalBody').pop()||{value:''}).value;
+  OUT.resetModeDefault = I.resetModeChecked();
+
+  // 9d reset 走完两步: 预演回来之后弹第二个框, 渲染 note / undone_commits /
+  //    untracked_total —— 全是服务端给的字符串, 同样要过 esc。
+  OUT.writes = [];
+  await I.loadResetPlan('hard');
+  out({ case:'reset-plan-modal', sink:'#modalBody.innerHTML',
+        html:(OUT.writes.filter(x=>x.id==='modalBody').pop()||{value:''}).value,
+        payload: PAYLOADS[0] });
+  // 点「确定」—— 不点就永远看不到 POST, 而 POST 带没带 confirmed 正是这条
+  //   用例的全部意义。modalFoot.children = [取消, 确定](openModal 里的顺序)。
+  OUT.writes = [];
+  clickModalOk(document);
+  await tick();
+  OUT.resetHardCalls = calls.slice();
+  calls.length = 0;          // 两条流程的调用序列必须分开记, 否则混在一起看不出谁是谁
+
+  // 9e **再走一遍 soft**。这一遍专门是为了钉住「mode 是用户选的那个」:
+  //     只跑 hard 的话, 把 body 里的 mode 写死成 "hard" 是**测不出来的**
+  //     —— "hard" 是合法三态之一, 断言 in (soft,mixed,hard) 照样过。
+  //     实测踩过: 变异体把 mode 硬编码成 "hard", 第一版接线断言全绿。
+  //     跑一遍非 hard 的档, 「写死」就立刻现形。
+  OUT.writes = [];
+  await I.loadResetPlan('soft');
+  clickModalOk(document);
+  await tick();
+  OUT.resetSoftCalls = calls.slice();
 
   // 10 esc() 单元行为
   OUT.esc.samples = PAYLOADS.map(p => ({p:p, out:I.esc(p)}));
@@ -778,6 +883,7 @@ try {
 } catch (e) {
   OUT.errors.push('index: ' + (e && e.stack || e));
 }
+}
 
 // ---------- conflicts-demo.html ----------
 try {
@@ -796,7 +902,14 @@ try {
   OUT.errors.push('conflicts: ' + (e && e.stack || e));
 }
 
-process.stdout.write('@@A2@@' + JSON.stringify(OUT));
+/* 收尾必须排在 runIndex() 之后 —— 里面有两个 await, 同步 write 的话
+   9d 那条会在预演回来之前就把结果吐出去, OUT.resetCalls 整个是 undefined。 */
+runIndex().then(function(){
+  process.stdout.write('@@A2@@' + JSON.stringify(OUT));
+}).catch(function (e) {
+  process.stdout.write('@@A2@@' + JSON.stringify(
+    Object.assign(OUT, {errors: OUT.errors.concat(['tail: ' + (e && e.stack || e)])})));
+});
 """
 
 
@@ -1139,6 +1252,120 @@ def _node_layer(tmp: Path, live: dict):
         "两段各出现一次,而且带可点的「取消暂存」「暂存」按钮 —— 点下去会把幽灵路径"
         "原样 POST 回 /api/unstage、/api/stage" if bad_status
         else "本次 /api/status 里没有非法 status 字母")
+
+    # ══════════════════════════════════════════════════ 破坏性操作的接线
+    #
+    # 上面那些用例全在验「注入」, 这里验的是另一件事: **前端到底发不发得动
+    # 那两个路由**。这是一件已经被实测确认过的产物缺陷 ——
+    #   POST /api/discard {"files":[...]}  -> 400 needs_confirmation
+    #   POST /api/reset {}                 -> 400(三态没给默认值)
+    # 两个按钮一次都没调通过, 界面上表现为「点了没反应 / 一条红色报错」。
+    #
+    # 为什么不用「真打一次 HTTP」来测: 那是 test_aigit_gate.py 的活(它已经在
+    # 测三条拒绝路径了)。这里要钉的是**另一头** —— 前端这个调用方有没有跟着
+    # 接线走两步。闸门在服务端测过了, 但闸门挡不住「调用方没跟上」:
+    # 一个从不发 confirmed 的前端, 在服务端那 10 条用例里全绿。
+    _destructive_wiring(data)
+
+
+def _destructive_wiring(data):
+    """discard / reset 的两步协议接线断言。
+
+    判据全部来自 harness 记下的**真实 fetch 调用序列**, 不是对源码做 grep ——
+    grep 只能证明字符串在文件里, 证明不了它真的被发出去过。
+    """
+    bad = []
+
+    # ---- discard: 先 GET /api/discard/plan, 再 POST /api/discard 带 confirmed
+    dc = data.get("discardCalls") or []
+    gets = [c for c in dc if c["method"] == "GET"]
+    posts = [c for c in dc if c["method"] == "POST"]
+    if not any(c["url"].startswith("/api/discard/plan") for c in gets):
+        bad.append("doDiscard 没有先 GET /api/discard/plan —— 两步协议的第一步不见了。"
+                   "分类就退回前端用 status==='?' 猜, 而服务端 discard() 判"
+                   "「已跟踪/未跟踪」用的是 resolve 之后的规范化路径, "
+                   "两边判据不同就可能「确认框说恢复、实际 unlink」。")
+    if not posts:
+        bad.append("doDiscard 整个序列里**一次 POST 都没有** —— 连确认后执行那步都没有。")
+    for p in posts:
+        if p["url"] != "/api/discard":
+            continue
+        body = json.loads(p["body"]) if p.get("body") else {}
+        # `is True` 而不是「有就行」: _bb 只认真布尔, 字符串 "true" 会被 400。
+        # 而把 false 序列化成字符串是极常见的 bug, 在这里等于「没确认」。
+        if body.get("confirmed") is not True:
+            bad.append(f"POST /api/discard 的 body 里 confirmed={body.get('confirmed')!r}, "
+                       "不是 JSON 布尔 true —— 服务端 _bb 会拒成 400。"
+                       "必须是字面量 true, 不能是 \"true\"。")
+        if not isinstance(body.get("files"), list) or not body["files"]:
+            bad.append(f"POST /api/discard 的 files 不是非空数组: {body.get('files')!r}")
+
+    # ---- reset: 预演 GET, mode 显式给, confirmed:true
+    #
+    # 分 hard / soft 两条流程各记一次调用序列。**必须分**: 只跑 hard 的话
+    # 把 body 的 mode 写死成 "hard" 测不出来 —— "hard" 是合法三态之一,
+    # `mode in (soft,mixed,hard)` 照样过(实测踩过这一版)。
+    # 跑一条非 hard 的, 「写死」立刻现形。
+    for tag, want_mode in (("hard", "hard"), ("soft", "soft")):
+        rc = data.get("reset%sCalls" % tag.capitalize()) or []
+        if not rc:
+            bad.append(f"reset {tag} 那条流程一个请求都没发 —— "
+                       "harness 没跑到(看 L4 harness 异常那几行)。")
+            continue
+        if not any(c["url"].startswith("/api/reset/plan") for c in rc
+                   if c["method"] == "GET"):
+            bad.append(f"reset {tag}: 没有先 GET /api/reset/plan —— 预演那一步不见了。")
+        rposts = [c for c in rc if c["method"] == "POST" and c["url"] == "/api/reset"]
+        if not rposts:
+            bad.append(f"reset {tag}: 预演之后**没有 POST /api/reset** —— "
+                       "确认后执行那一步不见了。")
+            continue
+        for p in rposts:
+            body = json.loads(p["body"]) if p.get("body") else {}
+            if body.get("confirmed") is not True:
+                bad.append(f"reset {tag}: POST /api/reset 的 "
+                           f"confirmed={body.get('confirmed')!r}, 不是 JSON 布尔 true"
+                           " —— 会被 _bb 拒成 400。")
+            # 这一条是本组断言的核心: **必须是用户选的那一档**。
+            # 只查「在三态里」不够, 写死成合法值测不出来(见上)。
+            if body.get("mode") != want_mode:
+                bad.append(f"reset {tag}: 界面这一档选的是 {want_mode}, "
+                           f"POST 发的却是 mode={body.get('mode')!r} —— "
+                           "前端替用户做了决定。默认 hard 就是 reset --hard "
+                           "不经确认。")
+        if tag == "hard":
+            # hard 会连带 git clean -fd, 未跟踪清单要单独问 /api/discard/plan。
+            if not any(c["url"].startswith("/api/discard/plan") for c in rc
+                       if c["method"] == "GET"):
+                bad.append("reset hard: 没有 GET /api/discard/plan —— "
+                           "弹窗里那句「未跟踪文件和目录会被直接删除」"
+                           "还是没有数量的空话(服务端 discard_plan 的 docstring "
+                           "就是为这个存在的)。")
+
+    # ---- mode 没有默认值: 这条比上面几条更靠前, 因为它是「不许替用户做决定」
+    rm = data.get("resetModalHtml") or ""
+    for mode in ("soft", "mixed", "hard"):
+        if f'value="{mode}"' not in rm:
+            bad.append(f"reset 的模式选择框里没有 {mode} 这个选项 —— "
+                       "三态必须**全都**列出来让用户自己挑。")
+    if "checked" in rm:
+        # openModal 之后 checked 只能是某个 radio 上的 —— 也就是前端替用户选了。
+        bad.append("reset 的模式选择框里有 checked —— 前端给 reset **预选**了模式。"
+                   "默认 hard 就是 reset --hard 不经确认。")
+    if data.get("resetModeDefault") != "":
+        bad.append(f"resetModeChecked() 在没人点任何 radio 时读出 "
+                   f"{data.get('resetModeDefault')!r}, 不是空串 —— "
+                   "说明前端给 reset 预选了模式。默认 hard 就是 reset --hard "
+                   "不经确认。")
+
+    for m in bad:
+        rec("FAIL", "L4", "破坏性操作两步协议接线", m)
+    if not bad:
+        rec("PASS", "L4", "破坏性操作两步协议接线",
+            "discard: GET /api/discard/plan -> POST /api/discard{confirmed:true}; "
+            "reset: GET /api/reset/plan?mode=X -> POST /api/reset{mode:X,confirmed:true}"
+            "(hard 档额外 GET /api/discard/plan 取未跟踪清单); "
+            "resetModeChecked() 初值空串 —— 三个 radio 一个都没 checked")
 
 
 if __name__ == "__main__":

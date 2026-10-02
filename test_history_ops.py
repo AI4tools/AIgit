@@ -8,7 +8,7 @@
 硬约束:
     * 纯标准库,不用 pytest(理由同 test_aigit.py:`pip install` 本身就是失败原因)。
     * **完全无头**:不开浏览器、不开任何窗口、不截图。git 走 subprocess。
-    * 所有测试仓建在 %TEMP%\\aigit-history-test\\ 下,
+    * 所有测试仓建在 %TEMP%\\aigit-history-test-<pid>\\ 下,
       **绝不碰 C:\\poject\\ 下任何真实仓库**。
     * 只读 history_ops.py。发现 bug 记录、不在本文件里绕过。
     * 本文件只 import history_ops,不 import server.py —— 后者由 aigit 其它线在改。
@@ -39,7 +39,17 @@ import time
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TESTROOT = os.path.join(tempfile.gettempdir(), "aigit-history-test")
+# 临时仓根**必须带进程号**。这不是洁癖: `main()` 开头会 cleanup() 把整棵目录
+# rmtree 掉, 而这个路径原来是全局固定的 `%TEMP%\aigit-history-test` ——
+# 于是两个 `test_history_ops.py` 同时跑, 后启动的那个会把前一个**正在用**的仓删光。
+# 症状不是「测试失败」, 是**看起来像产品缺陷的假红**(两种都实测复现过):
+#   * `fatal: not a git repository` —— 仓目录整个没了
+#   * `fatal: unable to read tree <sha>` —— 目录还在, .git 内容被抽走
+#   * 顺带把别的用例打成假红(如 tag 白名单那条报 `no_commits`: 仓被删了当然没提交)
+#   * 上一遍还绿的用例这一遍变红(被误伤, 不是回归)
+# 也就是说修好之前, 任何「37 条」都只在别的线静止时才是真的。
+# 写法照 `test_aigit.py:54` 的既有约定: 固定标识 + pid。
+TESTROOT = os.path.join(tempfile.gettempdir(), "aigit-history-test-%d" % os.getpid())
 
 sys.path.insert(0, HERE)
 import history_ops  # noqa: E402
@@ -152,7 +162,7 @@ def expect_error(fn, code, what, *a, **kw):
 # ════════════════════════════════════════════════════════ 测试仓
 
 class TestRepo:
-    """%TEMP%\\aigit-history-test\\ 下的独立 git 仓。"""
+    """%TEMP%\\aigit-history-test-<pid>\\ 下的独立 git 仓。"""
 
     def __init__(self, name):
         self.dir = os.path.join(TESTROOT, name)

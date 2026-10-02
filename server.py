@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-aigit —— 类 VSCode「源代码管理」面板的本地 git 图形工具 + 随机仓库测试数据生成器。
+aigit —— 只跑在本机的 git 前端:一个标准库 HTTP 服务 + 基础 Web 视图,
+附带随机仓库测试数据生成器。
+
+**别把它当成「VSCode 源代码管理面板」的等价物** —— 网页上只有三个标签页
+(改动详情 / 合并 / 提交历史);冲突解决与历史危险操作那一族只有 HTTP 路由,界面上点不到。
 
 设计约束:
   * 零第三方依赖,只用 Python 标准库。理由:这工具要在别人机器上直接跑,
@@ -48,6 +52,7 @@ except (ImportError, OSError, AttributeError):      # pragma: no cover - 非 Win
 # 也可以被别的工具复用。构造方式与「可合并」的保证见 gen-notes.md。
 import gen as _gen
 from gen import ScenarioGen, GenError
+import gitguard
 
 # 分支前缀的基线值, import 时取一次。Repo.generate 会在调用 gen.py 期间把它
 # 临时换成「基线/s<seed>」, 收尾一律还原成**这个常量**(而不是「读到的那个
@@ -66,10 +71,12 @@ _GEN_LOCK = threading.Lock()
 #
 # 懒加载: Repo 实例要等 main() 才建, 而这两个对象都需要 root。
 import conflicts as _conflicts
+import gitops as _gitops
 import history_ops as _hops
 
 _CONFLICTS = None
 _HISTORY = None
+_REMOTE = None
 
 
 def conflict_resolver():
@@ -84,6 +91,27 @@ def history_ops():
     if _HISTORY is None:
         _HISTORY = _hops.HistoryOps(REPO.root)
     return _HISTORY
+
+
+def remote_ops():
+    """远程能力(**默认关**, 详见 gitops.py 的模块 docstring)。
+
+    这里刻意**不给**它传闸: 让 NetGate 自己按 构造参数 > AIGIT_NET > off
+    的顺序自己解析。这样「默认关」这件事的**唯一**决定权在 gitops 手里,
+    接线层没有机会把它悄悄打开 —— 接线层能做的只有转发参数。
+
+    ⚠️ 远程写入(push/pull)在 aigit 里是**不可撤销**操作: 推出去撤不回来。
+    所以它沿用 history_ops 那套 plan/do 两步 + confirmed 协议, 下面
+    两边都挂, 只挂 do_* 等于没有预演。
+    """
+    global _REMOTE
+    if _REMOTE is None:
+        # 注入 gitguard:gitops.py 按自己的规矩不 import aigit 模块
+        # (test_aigit_net c3 用 ast.walk 查,函数内 import 也算),
+        # 所以中和层由这里递进去。不传的话 gitops 会退到 _FallbackGuard,
+        # 那档**枚举不到 filter.*/diff.*/merge.* 的子段名**(见 gitops 里的说明)。
+        _REMOTE = _gitops.GitOps(REPO.root, guard=gitguard)
+    return _REMOTE
 
 
 # -- 查询参数小工具 ----------------------------------------------------------
@@ -123,35 +151,81 @@ def _bb(b, key, default=False):
     raise GitError("%s 必须是 true 或 false,收到 %r" % (key, v))
 
 
+#: `/api/history/plan/<op>` 的全部合法 URL 段。**表在这里, 响应的 `op` 也
+#: 归一到这里的值**(见 `_history_plan` 末尾)。历史上响应的 `op` 是
+#: history_ops 内部方法名, 和 URL 段对不上(`reflog-restore` ->
+#: `restore-from-reflog`), 前端只好自己硬编码一张映射表绕过去。
+PLAN_OPS = ("stash", "stash-drop", "amend", "undo-last-commit", "reflog-restore",
+            "revert", "branch-rename", "branch-delete", "tag-delete")
+
+
 def _history_plan(op, q):
     """GET /api/history/plan/<op> —— 危险操作的只读预演。
 
     刻意做成一张显式的表而不是 getattr 拼接: op 来自 URL, getattr(ch, op)
     能调到**任何**属性名, 拼错一个字母就从「预演」变成别的意思。
+
+    **A3: 返回前把 `op` 归一到 URL 段。** 以前响应的 `op` 直接是
+    history_ops 的方法名, 于是 `GET /api/history/plan/reflog-restore`
+    回 `{"op": "restore-from-reflog"}` —— 拿这个 `op` 回去问「对应的预演
+    URL 是什么」会得到 400。前端因此被迫在前端硬编码一张
+    URL段->op 的映射表, 多一份会过期的东西。
+
+    **兼容**: 旧值不丢, 落在 `legacy_op` 里。于是
+      * 按 URL 调的调用方(= 所有真实调用方): 行为不变, 只是多一个字段;
+      * 按 `op` 字段调的调用方(= 前端那张映射表): `op` 变了, 但
+        `legacy_op` 还在, 映射表改一行即可, 且**不会静默拿错预演**
+        —— 因为 `op` 现在是唯一且可回查的。
     """
     H = history_ops()
     if op == "stash":
-        return H.plan_stash(q.get("message", [None])[0],
-                            _qflag(q, "include_untracked"))
-    if op == "stash-drop":
-        return H.plan_stash_drop(_qi(q, "index", 0))
-    if op == "amend":
-        return H.plan_amend(q.get("message", [None])[0])
-    if op == "undo-last-commit":
-        return H.plan_undo_last_commit(_qflag(q, "drop_changes"))
-    if op == "reflog-restore":
-        return H.plan_restore_from_reflog(_qi(q, "index", 0),
-                                          q.get("mode", ["soft"])[0])
-    if op == "revert":
-        return H.plan_revert(q.get("sha", [None])[0], _qopt(q, "mainline"))
-    if op == "branch-rename":
-        return H.plan_branch_rename(q.get("old", [None])[0],
-                                    q.get("new", [None])[0])
-    if op == "branch-delete":
-        return H.plan_branch_delete(q.get("name", [None])[0],
-                                    _qflag(q, "force"))
-    if op == "tag-delete":
-        return H.plan_tag_delete(q.get("name", [None])[0])
+        d = H.plan_stash(q.get("message", [None])[0],
+                         _qflag(q, "include_untracked"))
+    elif op == "stash-drop":
+        d = H.plan_stash_drop(_qi(q, "index", 0))
+    elif op == "amend":
+        d = H.plan_amend(q.get("message", [None])[0])
+    elif op == "undo-last-commit":
+        d = H.plan_undo_last_commit(_qflag(q, "drop_changes"))
+    elif op == "reflog-restore":
+        d = H.plan_restore_from_reflog(_qi(q, "index", 0),
+                                       q.get("mode", ["soft"])[0])
+    elif op == "revert":
+        d = H.plan_revert(q.get("sha", [None])[0], _qopt(q, "mainline"))
+    elif op == "branch-rename":
+        d = H.plan_branch_rename(q.get("old", [None])[0],
+                                 q.get("new", [None])[0])
+    elif op == "branch-delete":
+        d = H.plan_branch_delete(q.get("name", [None])[0],
+                                 _qflag(q, "force"))
+    elif op == "tag-delete":
+        d = H.plan_tag_delete(q.get("name", [None])[0])
+    else:
+        raise GitError("没有这个预演:%s(合法值:%s)"
+                       % (op, "/".join(PLAN_OPS)))
+    legacy = d.get("op")
+    d["op"] = op                      # 归一到 URL 段
+    if legacy and legacy != op:
+        d["legacy_op"] = legacy       # 旧值留痕, 不静默改语义
+    return d
+
+
+def _remote_plan(op, q):
+    """GET /api/remote/plan/<op> —— 远程操作的只读预演(不联网)。
+
+    和 _history_plan 一样用**显式的表**而不是 getattr 拼接: op 来自 URL,
+    getattr(ch, op) 能调到任何属性名, 而这里拼错一个字母的后果是
+    「预览 push」变成「预览 pull」—— 对一个不可撤销的操作, 这个方向错了
+    是会出人命的。
+    """
+    G = remote_ops()
+    remote = q.get("remote", ["origin"])[0]
+    branch = q.get("branch", [None])[0]
+    if op == "fetch":
+        return G.plan_fetch(remote, branch)
+    if op == "push":
+        return G.plan_push(remote, branch, _qflag(q, "force"),
+                           _qflag(q, "delete"))
     raise GitError("没有这个预演:%s" % op)
 
 # ---------------------------------------------------------------- git 封装
@@ -365,7 +439,10 @@ def as_file_list(files):
 class Repo:
     def __init__(self, root: Path):
         self.root = root.resolve()
-        self._lock = threading.Lock()
+        # RLock 而不是 Lock: 下面的 reset() / commit() 要把「两条 git」
+        # 包进同一把锁(并发语义), 而 _run() 内部又各自要取一次锁。
+        # 普通 Lock 直接自死锁; RLock 同线程可重入, 语义不变。
+        self._lock = threading.RLock()
 
     # -- 底层 ------------------------------------------------------------
     def _run_full(self, args, check=True, stdin=None):
@@ -373,19 +450,32 @@ class Repo:
 
         要看 returncode / stderr 的地方必须用它 —— 之前 _run 只返回 stdout(str),
         于是 merge() 写 p.returncode 直接 AttributeError 500。
+
+        **所有 git 调用都从这儿过**(E 线查过:改之前本文件零配置覆盖),
+        所以配置中和只需要在这里接一次,不存在「漏掉的调用点」。
+        覆盖面与实测证据见 gitguard.py 文件头。
         """
         with self._lock:
             p = subprocess.run(
-                ["git", "-C", str(self.root)] + args,
+                gitguard.for_root(self.root, args, net_enabled=self._net_enabled()),
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", input=stdin,
-                env={**os.environ, "GIT_PAGER": "cat",
-                     "GIT_TERMINAL_PROMPT": "0"},
+                env=gitguard.safe_env(net_enabled=self._net_enabled()),
                 timeout=120,
             )
         if check and p.returncode != 0:
             raise GitError((p.stderr or p.stdout or "git 失败").strip())
         return p
+
+    def _net_enabled(self):
+        """联网能力闸开着吗?开着才保留用户自己的 credential/ssh 配置。
+
+        aigit 的 `/api/*` 本身不碰远程(远程只在 gitops 那边),所以这里恒为 False,
+        也就是**用户级配置整个不可达**。留着这个方法是为了两件事:
+        1. 语义明确 —— 什么时候松绑一眼看得见;
+        2. 将来真接远程时改一个返回值就行,不用改 6 个调用点。
+        """
+        return False
 
     def _run(self, args, check=True, stdin=None):
         """只要 stdout 的场合用它(保持原语义,免得改一堆调用点)。"""
@@ -424,8 +514,13 @@ class Repo:
     def init(self):
         self.root.mkdir(parents=True, exist_ok=True)
         self._run(["init", "-b", "main"])
+        # 这三行现在**比以前更要紧**:gitguard 把用户级配置整个不可达
+        # (GIT_CONFIG_GLOBAL 指到不存在的路径),身份只能来自仓级配置。
+        # 没有它们,history_ops 的 `commit --amend` 会因为「no identity」失败。
         self._run(["config", "user.email", "aigit@localhost"])
         self._run(["config", "user.name", "aigit"])
+        # 仓级也写一份:对**已经存在**的仓同样生效。
+        # (改之前只在这里写,所以「别人给的仓」上 gpgsign=true 依然会 spawn gpg —— E 线实测)
         self._run(["config", "commit.gpgsign", "false"])
         # 避免 CRLF 干扰 diff 展示
         self._run(["config", "core.autocrlf", "false"])
@@ -515,7 +610,7 @@ class Repo:
         return "(no branch)"
 
     def status(self):
-        """返回 VSCode 风格的三段状态。"""
+        """返回三段状态:已暂存 / 未暂存 / 冲突。"""
         out = self._run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         staged, unstaged, conflicted = [], [], []
         for x, y, path in self.porcelain_z_parse(out):
@@ -793,6 +888,73 @@ class Repo:
                 elif abs_p.exists() or abs_p.is_symlink():
                     abs_p.unlink()
 
+    def discard_plan(self, files):
+        """discard 的只读预演: 逐个文件说明**会怎么死**。
+
+        为什么必须和 `discard()` 用同一套判定: 预演说「恢复」而实删是
+        「永久删除」, 比没有预演更危险 —— 用户照着预演点了确认。
+        所以这里的分类逐行照抄 `discard()` 的三分支(已跟踪 -> checkout 恢复 /
+        未跟踪文件 -> unlink / 未跟踪目录 -> 整树 rmtree), 包括它那个
+        「目录内含已跟踪文件就整条拒绝」的规则。
+
+        额外给一个 `untracked_total`: **不传 files 时** discard 会命中
+        工作区里每一个未跟踪文件/目录(`git clean -fd` 的语义)。前端
+        「丢弃全部」按钮必须先把这个数摆出来 —— README 自己写着 discard
+        「会连带删掉所有未跟踪文件和目录」, 而按需传 files 的接口看不出这一点。
+        """
+        tracked = self._tracked_set()
+        entries, blocked = [], []
+        for f in files:
+            abs_p = self.resolve_in_root(f)          # 与 discard() 同一条解析路径
+            rel = abs_p.relative_to(self.root).as_posix()
+            if not abs_p.exists() and not abs_p.is_symlink():
+                # 不存在的东西没有「会怎么死」可言。预演说「永久删除」而
+                # 实删是个 no-op, 和反过来一样是骗人 —— 让人以为要丢东西。
+                entries.append({"path": rel, "action": "missing",
+                                "detail": "路径不存在,discard 什么也不会做"})
+                continue
+            if rel in tracked:
+                entries.append({"path": rel, "action": "restore",
+                                "detail": "已跟踪文件 -> 从 HEAD 恢复,改动丢失"})
+                continue
+            if abs_p.is_dir():
+                inner = sorted(t for t in tracked if t.startswith(rel + "/"))
+                if inner:
+                    blocked.append({
+                        "path": rel, "action": "blocked",
+                        "detail": "目录内含 %d 个已跟踪文件,discard 会整条拒绝"
+                                  % len(inner),
+                        "tracked_inside": inner[:20]})
+                    continue
+                entries.append({"path": rel, "action": "delete-tree",
+                                "detail": "未跟踪目录 -> 整棵树永久删除,"
+                                          "git 里没有它,删了找不回来"})
+            else:
+                entries.append({"path": rel, "action": "delete-file",
+                                "detail": "未跟踪文件 -> 永久删除,"
+                                          "git 里没有它,删了找不回来"})
+        untracked_total = self._untracked_list()
+        return {
+            "ok": True, "op": "discard",
+            "entries": entries, "blocked": blocked,
+            "untracked_total": untracked_total,
+            "untracked_count": len(untracked_total),
+            "note": "action=restore 的丢的是**未提交的改动**; "
+                    "action=delete-* 的是 git 从没记过、删了就找不回的东西。"
+                    + ("另有 %d 个未跟踪文件/目录,「丢弃全部」会一并删掉。"
+                       % len(untracked_total) if untracked_total else ""),
+        }
+
+    def _untracked_list(self):
+        """仓里 git 没跟踪的文件/目录(git ls-files --others 减去被忽略的)。
+
+        `--exclude-standard` 让 .gitignore 生效: 被忽略的构建产物不是
+        `git clean -fd` 的目标(要 `-x` 才是), 把它们算进去等于虚报损失。
+        """
+        out = self._run(["ls-files", "--others", "--exclude-standard",
+                         "--directory", "--no-empty-directory"], check=False)
+        return sorted(p for p in out.splitlines() if p.strip())
+
     def escaping_links(self, limit=16):
         """列出**在仓里、但指向仓外**的 reparse point(目录联接 / 符号链接 / 挂载点)。
 
@@ -902,8 +1064,48 @@ class Repo:
         self._run(["merge", "--abort"], check=False)
 
     def hard_reset(self):
-        self._run(["reset", "--hard", "HEAD"], check=False)
-        self._run(["clean", "-fd"], check=False)
+        # 保持旧入口(只回 HEAD 的 hard 重置), 实现收口到 reset()。
+        self.reset("hard", "HEAD")
+
+    def reset(self, mode, ref="HEAD"):
+        """git reset --<mode> <ref>; hard 额外 clean -fd。mode 是三态显式值。"""
+        if mode not in ("soft", "mixed", "hard"):
+            raise GitError("mode 必须是 'soft' / 'mixed' / 'hard' 之一,收到 %r"
+                           % (mode,))
+        check_ref_name(ref)
+        # 整体拿锁: hard_reset 是两条 git(reset + clean), 每条各自取一次
+        # 锁的话, 两请求会交错(另一请求在 reset 之后、clean 之前进来)。
+        # commit() 同理 —— add 与 commit 之间不能让别人改动工作区。
+        with self._lock:
+            self._run(["reset", "--" + mode, ref])
+            if mode == "hard":
+                self._run(["clean", "-fd"], check=False)
+
+    def reset_plan(self, mode, ref="HEAD"):
+        """reset 预演: 会从当前分支上「拿掉」的提交 + hard 的必毁警告。"""
+        if mode not in ("soft", "mixed", "hard"):
+            raise GitError("mode 必须是 'soft' / 'mixed' / 'hard' 之一,收到 %r"
+                           % (mode,))
+        check_ref_name(ref)
+        out = self._run(
+            ["log", "--format=%H%x1f%h%x1f%s", ref + "..HEAD"], check=False)
+        undone = []
+        for line in out.splitlines()[:50]:
+            parts = line.split("\x1f")
+            if len(parts) == 3:
+                undone.append({"sha": parts[0], "short": parts[1],
+                               "summary": parts[2]})
+        d = {"ok": True, "op": "reset", "mode": mode, "ref": ref,
+             "undone_commits": undone,
+             "note": {
+                 "soft": "soft: 移动 HEAD 到 %s,改动留在暂存区,工作区不动" % ref,
+                 "mixed": "mixed: 移动 HEAD 到 %s,改动留在工作区(默认 git 行为)" % ref,
+                 "hard": "hard: 未提交的改动将永久丢失;git clean -fd"
+                         " 会删掉所有未跟踪文件和目录",
+             }[mode]}
+        if mode == "hard":
+            d["warning"] = "未提交的改动将永久丢失"
+        return d
 
     # -- 测试数据生成 ----------------------------------------------------
     def generate(self, kind, count=3, seed=None):
@@ -983,8 +1185,16 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
                    "application/json; charset=utf-8")
 
-    def _err(self, msg, code=400):
-        self._json({"ok": False, "error": str(msg)}, code)
+    def _err(self, msg, code=400, err_code=None, extra=None):
+        """错误响应统一形状。err_code / extra 是**前端能用的**那部分
+        (HistoryError.code / HistoryError.extra), 只传可读文案和类型,
+        绝对路径与 traceback 进服务端日志, 不进响应体。"""
+        d = {"ok": False, "error": str(msg)}
+        if err_code is not None:
+            d["code"] = err_code
+        if extra:
+            d.update(extra)
+        self._json(d, code)
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -1040,6 +1250,14 @@ class Handler(BaseHTTPRequestHandler):
                                   "text/html; charset=utf-8")
             if path == "/virtuallist.js":
                 return self._send(200, (WEB / "virtuallist.js").read_bytes(),
+                                  "application/javascript; charset=utf-8")
+            # 两个懒加载面板(UI2/UI3)。白名单仍是刻意收紧的: 只放行
+            # index.html 实际会 import()/引用到的文件, 其余一律 404。
+            if path == "/history-panel.js":
+                return self._send(200, (WEB / "history-panel.js").read_bytes(),
+                                  "application/javascript; charset=utf-8")
+            if path == "/conflicts-panel.js":
+                return self._send(200, (WEB / "conflicts-panel.js").read_bytes(),
                                   "application/javascript; charset=utf-8")
             if path == "/api/status":
                 return self._json({"ok": True, **REPO.status()})
@@ -1133,13 +1351,65 @@ class Handler(BaseHTTPRequestHandler):
             # 调用方不必先看预演就能直接执行。所以两边都挂。
             if path.startswith("/api/history/plan/"):
                 return self._json(_history_plan(path.rsplit("/", 1)[-1], q))
+            # -- reset / discard 的只读预演(A2)--------------------------
+            #
+            # 这两条是全项目最不可逆的操作: discard 连带删未跟踪文件,
+            # reset --hard 连带 clean -fd。闸门已经要求 confirmed=true,
+            # 而且闸门的 400 文案明确让用户「先 GET 预演看清要丢什么」——
+            # 但这两个预演路由以前**根本不存在**, 那句指路的话指向 404。
+            # 结果是两步协议对最该有预演的两条恰好是空的: 唯一挡在
+            # 误删前面的东西是一个把人引向 404 的提示。
+            #
+            # 两条都只读, 不取写锁, 也不碰工作区。
+            if path == "/api/reset/plan":
+                mode = q.get("mode", [None])[0]
+                if mode is None:
+                    raise GitError("缺少 mode 参数(soft / mixed / hard)")
+                return self._json(REPO.reset_plan(
+                    mode, q.get("ref", ["HEAD"])[0]))
+            if path == "/api/discard/plan":
+                # files 走 query 而不是 body: 预演是 GET, 必须可粘贴/可收藏。
+                # 缺省 = 空 = 「只报仓里有多少未跟踪的东西」, 因为前端那个
+                # 「丢弃全部」按钮根本不传 files, 它要的是 untracked_total。
+                return self._json(REPO.discard_plan(
+                    as_file_list(q.get("files", None))))
+            # -- 远程(接线自 gitops.py, **能力默认关**)------------------
+            #
+            # 这一组路由挂上**不代表远程是开的**: NetGate 默认 off, 所以
+            # ls-remote / fetch / push / pull 一律 400 + code=net_disabled。
+            # 想开就设环境变量 AIGIT_NET=read 或 write(见 gitops.py)。
+            # /api/remote/capability 与 /api/remote/list 是纯本地的, 任何时候
+            # 都能问 —— 用户要开远程, 得先知道自己有没有远程可开。
+            if path == "/api/remote/capability":
+                return self._json({"ok": True, "op": "capability",
+                                   "gate": remote_ops().capability()})
+            if path == "/api/remote/list":
+                # 纯本地(git remote -v 只读 .git/config), 不需要任何能力级别
+                return self._json(remote_ops().list_remotes())
+            if path == "/api/remote/heads":
+                return self._json(remote_ops().ls_remote(
+                    q.get("remote", ["origin"])[0]))
+            if path == "/api/remote/ahead-behind":
+                return self._json(remote_ops().ahead_behind(
+                    q.get("remote", ["origin"])[0],
+                    q.get("branch", [None])[0]))
+            if path.startswith("/api/remote/plan/"):
+                return self._json(_remote_plan(path.rsplit("/", 1)[-1], q))
             return self._err("没有这个接口", 404)
         except _conflicts.ConflictError as e:
             # 「现在不在合并态」「这个路径没冲突」「三方不一致」都是**用法**
             # 问题, 走 400 —— 前端要能靠状态码区分「操作没做成」和「服务炸了」。
             return self._err(e, 400)
         except _hops.HistoryError as e:
-            return self._err(e, 400)
+            # to_dict() 里的 code / extra 必须透出去, 否则前端只能 match 中文文案。
+            return self._err(e.message, 400, err_code=e.code, extra=e.extra)
+        except _gitops.NetError as e:
+            # 能力没开(net_disabled)、没确认(needs_confirmation)、远程不可达
+            # (unreachable)—— 全是**用法/配置**问题, 不是服务故障, 走 400。
+            # 用 to_dict() 而不是 _err(): _err 只回 {"ok","error"}, 把 code
+            # 丢了; 而这层的规矩正是「让前端靠 code 分支, 不要 match 中文文案」。
+            # 不改 _err —— 它是所有路由共用的, 动它会波及别人的接口形状。
+            return self._json(e.to_dict(), 400)
         except GitError as e:
             return self._err(e, 400)
         except (ValueError, TypeError, KeyError) as e:
@@ -1147,7 +1417,13 @@ class Handler(BaseHTTPRequestHandler):
             # 不回异常类名 —— 那是服务端内部细节。
             return self._err("请求参数不合法:%s" % (str(e) or "类型不对"), 400)
         except Exception as e:
-            return self._err(f"{type(e).__name__}: {e}", 500)
+            # 内部细节(绝对路径 / traceback)只进服务端日志, 不进响应体 ——
+            # 否则一次 500 就把 Windows 绝对路径吐给前端(UI2 实测过)。
+            import traceback
+            sys.stderr.write("[aigit] 500: %s: %s\n" % (type(e).__name__, e))
+            traceback.print_exc()
+            return self._err("服务端内部错误,详情见服务端日志", 500,
+                             err_code="internal_error")
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
@@ -1158,9 +1434,24 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/unstage":
                 REPO.unstage(as_file_list(b.get("files")))
             elif path == "/api/discard":
+                # 破坏性: 必须 confirmed=true(只认 bool, 用 _bb)。
+                # 「真删了哪些」由 GET /api/discard/plan 预演给出, 这里不再猜。
+                if _bb(b, "confirmed") is not True:
+                    return self._json({
+                        "ok": False, "code": "needs_confirmation",
+                        "op": "discard",
+                        "error": "discard 是破坏性操作,需要 confirmed=true;"
+                                 "先 GET /api/discard/plan 看清要丢什么。"}, 400)
                 REPO.discard(as_file_list(b.get("files")))
             elif path == "/api/commit":
-                out = REPO.commit(b.get("message") or "")
+                # message 必须是字符串或缺省: 5/true/对象 这种畸形输入
+                # 以前打成 500(AttributeError: 'int' object has no attribute 'strip'),
+                # 前端会误以为是服务端坏了。
+                msg = b.get("message")
+                if msg is not None and not isinstance(msg, str):
+                    raise GitError("message 必须是字符串,收到 %s"
+                                   % type(msg).__name__)
+                out = REPO.commit(msg or "")
                 return self._json({"ok": True, "output": out, **REPO.status()})
             elif path == "/api/checkout":
                 REPO.checkout(b.get("name", ""))
@@ -1202,9 +1493,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(conflict_resolver().delete_file(
                     rel, b.get("expect_sha256")))
             elif path == "/api/conflict/commit":
-                # commit_merge 自己在 ok 里说成败, 不能被 _ok_with_status 盖掉
-                return self._json(conflict_resolver().commit_merge(
-                    b.get("message")))
+                # commit_merge 自己在 ok 里说成败, 不能被 _ok_with_status 盖掉。
+                # message 类型: None 合法(用 merge 默认信息), 非字符串 -> 400
+                # (以前 {"message": 5} 打成 500: 'int' object has no attribute 'strip')。
+                cmsg = b.get("message")
+                if cmsg is not None and not isinstance(cmsg, str):
+                    raise GitError("message 必须是字符串,收到 %s"
+                                   % type(cmsg).__name__)
+                return self._json(conflict_resolver().commit_merge(cmsg))
             elif path == "/api/conflict/abort":
                 return self._json(conflict_resolver().abort())
             # -- 历史 / 危险操作(接线自 history_ops.py)----------------
@@ -1220,6 +1516,20 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(history_ops().do_stash_apply(
                     b.get("index", 0)))
             elif path == "/api/history/stash/pop":
+                # pop = apply **+ drop**: 成功后 stash 条目没了, 恢复路径
+                # 就断了。旁边的 /api/history/stash/drop 要 confirmed,
+                # pop 却不要求 —— 同一个不可逆后果, 两套规矩。
+                # (do_stash_pop 的签名里没有 confirmed, 护栏只能在接线层加;
+                #  模块本身不许改。)
+                # 预演用 plan/stash-drop: pop 的「删掉那一条」正是它。
+                if _bb(b, "confirmed") is not True:
+                    return self._json({
+                        "ok": False, "code": "needs_confirmation",
+                        "op": "stash-pop",
+                        "error": "stash pop 会把条目删掉(不可撤销),需要 "
+                                 "confirmed=true;先 GET "
+                                 "/api/history/plan/stash-drop?index=%s "
+                                 "看清要丢什么。" % b.get("index", 0)}, 400)
                 return self._json(history_ops().do_stash_pop(b.get("index", 0)))
             elif path == "/api/history/stash/drop":
                 return self._json(history_ops().do_stash_drop(
@@ -1252,8 +1562,47 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/history/tag/delete":
                 return self._json(history_ops().do_tag_delete(
                     b.get("name"), _bb(b, "confirmed")))
+            # -- 远程(接线自 gitops.py, **能力默认关**)------------------
+            #
+            # push / pull 写仓库之外, **不可撤销** —— 所以:
+            #   * confirmed 只认真 bool(用 _bb), "confirmed": "false" 这种
+            #     字符串在 Python 里是真的, 收下就等于放行一次误推。
+            #   * 和 history 一样两边都挂(plan 在 GET 那边), 只挂 do_ 等于
+            #     没有预演。
+            #   * 闸默认 off, 所以默认全部 400 + code=net_disabled。
+            elif path == "/api/remote/fetch":
+                # fetch 只写本地 ref, 不需要 confirmed(撤销 = reset --hard)
+                return self._json(remote_ops().do_fetch(
+                    b.get("remote", "origin"), b.get("branch"),
+                    b.get("refspec")))
+            elif path == "/api/remote/push":
+                return self._json(remote_ops().do_push(
+                    b.get("remote", "origin"), b.get("branch"),
+                    _bb(b, "force"), _bb(b, "delete"), _bb(b, "confirmed")))
+            elif path == "/api/remote/pull":
+                return self._json(remote_ops().do_pull(
+                    b.get("remote", "origin"), b.get("branch"),
+                    _bb(b, "confirmed")))
             elif path == "/api/reset":
-                REPO.hard_reset()
+                # 破坏性: 必须 confirmed=true, 且 mode 必须显式给 ——
+                # soft/mixed/hard 影响「工作区改动活不活」, 默认值就是
+                # 替用户做这个决定, 所以缺省一律 400。
+                mode = b.get("mode")
+                if mode not in ("soft", "mixed", "hard"):
+                    raise GitError(
+                        "mode 必须是 'soft' / 'mixed' / 'hard' 之一(缺省是 400,"
+                        "绝不猜一个默认值),收到 %r" % (mode,))
+                if _bb(b, "confirmed") is not True:
+                    return self._json({
+                        "ok": False, "code": "needs_confirmation",
+                        "op": "reset",
+                        "error": "reset 是破坏性操作,需要 confirmed=true;"
+                                 "先 GET /api/reset/plan?mode=... 看清要丢什么。"}, 400)
+                ref = b.get("ref") or "HEAD"
+                if not isinstance(ref, str):
+                    raise GitError("ref 必须是字符串")
+                check_ref_name(ref)
+                REPO.reset(mode, ref)
             elif path == "/api/gen":
                 # 同上: gen.py 自己在 allVerified=False 时把 ok 置 false,
                 # 这里不能再用 ok:True 盖掉。
@@ -1266,7 +1615,9 @@ class Handler(BaseHTTPRequestHandler):
         except _conflicts.ConflictError as e:
             return self._err(e, 400)
         except _hops.HistoryError as e:
-            return self._err(e, 400)
+            return self._err(e.message, 400, err_code=e.code, extra=e.extra)
+        except _gitops.NetError as e:
+            return self._json(e.to_dict(), 400)
         except GitError as e:
             return self._err(e, 400)
         except GenError as e:
@@ -1279,7 +1630,11 @@ class Handler(BaseHTTPRequestHandler):
             # 不回异常类名: 那是服务端内部实现细节, 对用户没意义。
             return self._err("请求参数不合法:%s" % (str(e) or "类型不对"), 400)
         except Exception as e:
-            return self._err(f"{type(e).__name__}: {e}", 500)
+            import traceback
+            sys.stderr.write("[aigit] 500: %s: %s\n" % (type(e).__name__, e))
+            traceback.print_exc()
+            return self._err("服务端内部错误,详情见服务端日志", 500,
+                             err_code="internal_error")
 
 
 def _bind_error(port, exc):
