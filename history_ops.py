@@ -49,6 +49,10 @@ from pathlib import Path
 
 import gitguard
 
+# 仓库级互斥的唯一实现(2026-03 从 conflicts.py 搬进中立模块)。
+# repolock 自己只 import os / threading, 所以这里没有新环。
+from repolock import repo_git_lock
+
 # ---------------------------------------------------------------- 常量
 
 #: 分支/标签名白名单。与 server.py 的 new_branch() 同严格度。
@@ -140,7 +144,18 @@ class HistoryOps:
         self.root = Path(root).resolve()
         self.git_bin = git_bin
         self.timeout = timeout
-        self._lock = threading.Lock()
+        # 锁从 repolock 取(2026-10-03): 此前是 `threading.Lock()` **每实例新建**,
+        # 与 server.Repo / conflicts.Git 各拿一把 —— 同一个仓上三把互不相干的锁。
+        # 实测跨域临界区重叠 C4=97 对 / C7=533 对(同域 repo=0 history=0 conflicts=0,
+        # 即三把锁各自都有效, 只是不是同一把)。
+        #
+        # 普通 Lock → RLock **不是降级, 是变宽**: repolock 给的是 RLock。
+        # 本模块实测取锁 671 次 / 嵌套 **0** 次 / 最大层数 1(locknest.py 四段负载),
+        # 所以当前代码没有任何地方依赖这把锁的「不可重入」——
+        # 换过去只会**减少**死锁面, 不增加。
+        # ⚠ 更正一条我先前说错的话: 「非重入 Lock 换成 repo_git_lock 会自死锁」
+        #   是反的。repo_git_lock 给 RLock, 方向是不可重入 → 可重入。
+        self._lock = repo_git_lock(self.root)
 
     # ═══════════════════════════════════════════════════ 底层
 

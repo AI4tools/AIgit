@@ -42,6 +42,7 @@ from conflicts import ConflictError, ConflictResolver        # noqa: E402
 SECRET = b"OUTSIDE-SECRET-1234567890\n"
 
 TESTS = []
+BASELINES = []
 
 
 class Skip(Exception):
@@ -61,6 +62,32 @@ class Flaky(Fail):
 def test(name, desc="", *rest):
     def deco(fn):
         TESTS.append((name, fn))
+        return fn
+    return deco
+
+
+def baseline(name, desc="", *rest):
+    """**基线测量标记** —— 会跑、会打印数字, 但**不参与 PASS/FAIL 汇总、
+    不影响退出码**。
+
+    与 `test()` 的差别只有「记到哪个表」: `test` 进 TESTS(计入 npass/nfail,
+    失败即退出码 1); `baseline` 进 BASELINES, runner 单独跑它、单独记账,
+    它内部就算 `ck()` 抛了 `Fail`, 也只会被记成「未完成」, 绝不会变成 FAIL。
+
+    ⚠ 什么时候该用它: **characterization**(特征化测试) —— 把当前的缺陷/现状
+      钉成一个数字, 给将来修它的人一个「要降到几」的目标, 而不是一道门禁。
+      判据与基线的区别是**语义**上的: 判据回答「对不对」, 数字变了就是红;
+      基线回答「现在是几」, 数字变了只说明现状变了, 不说明谁对谁错。
+      拿基线当前向当门禁, 会让「把缺陷修好」这件事本身变成红 —— 那就是
+      把判据和基线搞反了。
+
+    ⚠ 本文件里唯一的 baseline 是 T9(`cross-domain-still-open`)。它的 docstring
+      早就写着自己「不是判据」, 但代码里挂着 `ck(n > 0, ...)`, 实际是当门禁在
+      跑 —— 代码与声明不符。2026-10-03 按裁定改成 baseline: 数字照量照印,
+      门禁摘掉。名字里的 `cross-domain-still-open` **保留** —— 它描述的是事实。
+    """
+    def deco(fn):
+        BASELINES.append((name, fn))
         return fn
     return deco
 
@@ -704,16 +731,63 @@ def safe_resolve(repo, names, t, r):
         pass
 
 
-@test("T9", "cross-domain-still-open", "量化残留: server.Repo 与 conflicts 仍不同锁")
+# ⚠ 这是**基线测量**, 不是判据: 由 @baseline 登记, 不进 PASS/FAIL 汇总, 不影响退出码。
+#   名字里的 `cross-domain-still-open` 保留 —— 它描述的就是事实(两条路还在并发跑 git)。
+@baseline("T9", "cross-domain-still-open", "量化残留: server.Repo 与 conflicts 仍不同锁")
 def t9_cross_domain():
-    """这条**不是**判据, 是给「三锁统一」那条线的**基线数字**。
+    """**基线数字**, 不是判据。给「三锁统一」那条线一个「要降到几」的目标。
 
     我的改动只在 conflicts.py 内部生效; server.Repo._lock 是另一把锁,
     按要求我没有碰 server.py。所以跨域重叠**理应仍然存在** ——
     这里量出来, 让接手的人知道统一之后要降到什么数。
 
-    判据(弱): 跨域重叠必须 > 0。如果这里是 0, 说明两条路已经不并发跑 git 了,
-    那「需要统一」的结论就得重写。
+    2026-10-03 裁定(此前的实现与本段声明不符, 现已对齐):
+      * 原先这里挂着 `ck(n > 0, "跨域重叠 0 —— 「三锁要统一」的前提需要重新核对")`,
+        实际是当门禁在跑。已摘掉。
+      * 数字**照量照印**, 一个阈值都没动 —— 变的只是它算不算 FAIL。
+      * 判据那边一个字没动。
+
+    ⚠⚠ 2026-10-03 12:38 **更正本段下面这段的理由 —— 它是错的**
+    ---------------------------------------------------------------
+    原文写的是「它和 test_aigit_concurrency.py C7 的 `ck(not cross)`
+    判的是同一个量, 方向相反」, 并据此论证「拿这条当前向当门禁, 等于把
+    「把缺陷修好」判成红」。
+
+    **「同一个量」是假的。实测(t9_decomp.py, EXITCODE=0)证明两者口径不同:**
+
+      本条 T9 量的是**方法体 span**:
+        - `t_repo` 包 `server.Repo._run_full`, `t0 = time.perf_counter()`
+          取在**调用之前**; 而取锁 `with self._lock:` 在 `server.py:497`
+          是**函数体内部**的第一句。⇒ **span 把等锁时间算进去了**。
+        - `t_git` 包 `conflicts.Git.run`, 同理。
+
+      C7 量的是**持锁窗口**:
+        - repo / history 走 `install_lock`(套在锁对象上), 只记
+          `__enter__`~`__exit__`, 即**真正持有**的那段。
+        - conflicts 走 `install_span(Git, "run")`, 是方法体 —— 但统一锁之后
+          `Git.run` 的方法体执行在 `resolve()` **已经持有的同一把锁**之内
+          (同线程 RLock 可重入), 所以整段都在持锁。
+
+      实测数字(同一负载、同一把锁):
+        两域**同时持锁**的时间段重叠对数 = **0**
+        方法体口径重叠对数            = **162**, 且按成因拆开:
+            真互斥失效(两域同时持锁) = **0**
+            等锁排队(重叠但不同持锁) = **162**   合计 = 162 ✓ 闭合
+
+      ⇒ **锁统一之后互斥没有缺口; 剩下的重叠 100% 是排队。**
+      而排队正是**一把正确的全局锁本来就该产生的现象** ——
+      所以在这里挂 `n > 0` 的正向门禁, 会把「正确的串行化」判成红。
+      这才是它该留在 `@baseline` 的**真**理由。
+
+    ⚠ 顺带记一个我犯过、后来查清的**量纲错误**, 别再犯:
+      本条打印的 `跨域重叠 288 对 (repo 198 次 / conflicts 83 次)` 里,
+      **288 是「重叠的对数」, 198 / 83 是「两域各跑了多少条 span」**。
+      源码 :826-842 —— `n` 在 :828-834 累加, 打印时 `%d 次` 给的是
+      `len(a)` / `len(b)`, 也就是**条数**。
+      **对数不是条数之和**, 所以 `198 + 83 = 281 ≠ 288` **不是「少了 7 对」**,
+      而是拿条数加对数。那个「7」是不存在的, 不要去凑。
+      能真正加总回 288 的划分是「按 git 子命令分类」或「按成因分类」,
+      见 aigit-lock-probes-20261003/out/t9decomp.out.txt。
     """
     import server
     sb = Sandbox("t9")
@@ -797,12 +871,31 @@ def t9_cross_domain():
                     break
                 if y[0] < x[1] and y[1] > x[0]:
                     n += 1
+        # ⚠ 这两条 ck() **不是**关于重叠数的断言, 留在这里是必要的:
+        #   没有 span 就报不出重叠数, 「0」会和「根本没跑到」长得一样(本文件
+        #   自己 11-13 行的判据纪律)。它们是**数据有效性**前提, 与 n 的方向无关。
         ck(a and b, "一条 span 都没记到 —— 不能报重叠数 (repo=%d conflicts=%d)"
            % (len(a), len(b)))
-        ck(n > 0, "跨域重叠 0 —— 「三锁要统一」的前提需要重新核对")
         print("      跨域 git 临界区重叠 %d 对 (repo %d 次 / conflicts %d 次)"
               " —— 这是**留给 server.py 那条线**的基线, 本线按要求没碰"
               % (n, len(a), len(b)))
+        # ⚠ 这里**没有** `ck(n > 0, ...)`, 而且是**故意没有的**。
+        #   ⚠⚠ 2026-10-03 12:45 更正 —— 下面第一句的依据**已被实测推翻**。
+        #     原文断言它与 C7 的 `ck(not cross)` 量的是同一个东西、方向相反。
+        #     **那个断言是假的**, 详见**本函数 docstring 的
+        #     「更正本段下面这段的理由」段**(约 :756-790)。
+        #     ← 先读到本注释的人请按 docstring 那一段走, 别拿本段第一句当依据。
+        #
+        #   摘掉 `ck(n > 0)` 的**真依据**(结论不变, 依据换了):
+        #     本条量的是**方法体 span**(取锁在 server.py:497 函数体内,
+        #     t0 取在调用之前 ⇒ 含等锁时间), C7 量的是**持锁窗口**
+        #     (install_lock 套在锁对象上) —— 两者量的是**不同的东西**。
+        #     实测(t9_decomp.py, EXITCODE=0): 两域**同时持锁**的重叠 = **0**,
+        #     方法体重叠 162 对**全部**是等锁排队。
+        #     ⇒ 统一锁之后互斥没有缺口; 剩下的重叠 100% 是排队,
+        #     而排队正是一把正确的全局锁**本来就该产生**的现象。
+        #     在这里挂正向门禁 = 把「正确的串行化」判成红 = 把修好判成 FAIL。
+        #   数字照印(上面那行), 阈值没动, 变的只是它算不算 FAIL。
         return
     finally:
         sb.cleanup()
@@ -818,6 +911,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     picked = [(n, f) for n, f in TESTS if not a.k or a.k in n]
+    bases = [(n, f) for n, f in BASELINES if not a.k or a.k in n]
     npass = nfail = nskip = 0
     t_start = time.time()
     for rep in range(1, a.repeat + 1):
@@ -849,6 +943,31 @@ def main(argv=None):
 
     print("\n# 共 %d 条  PASS %d  FAIL %d  SKIP %d  用时 %.1fs"
           % (len(picked) * a.repeat, npass, nfail, nskip, time.time() - t_start))
+
+    # ---- 基线测量 ------------------------------------------------------
+    # 跑, 打印, **记账但不进上面那三个计数器**, `return` 里的退出码也只看 nfail。
+    # 内部抛什么都只是「未完成」。
+    nbase_ok = nbase_miss = 0
+    for rep in range(1, a.repeat + 1):
+        for name, fn in bases:
+            label = name if a.repeat == 1 else "%s(rep%d)" % (name, rep)
+            t0 = time.time()
+            try:
+                fn()
+                nbase_ok += 1
+                print("base %-32s (%.1fs)" % (label, time.time() - t0))
+            except Exception as e:
+                nbase_miss += 1
+                print("base %-32s (未完成: %s: %s)"
+                      % (label, type(e).__name__, e))
+                if a.v:
+                    traceback.print_exc()
+            sys.stdout.flush()
+    if bases:
+        print("# 基线 %d 条, 跑完 %d, 未完成 %d"
+              " —— **不计入上面的 PASS/FAIL/SKIP, 不影响退出码**"
+              % (len(bases) * a.repeat, nbase_ok, nbase_miss))
+
     return 1 if nfail else 0
 
 

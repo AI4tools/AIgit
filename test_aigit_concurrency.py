@@ -470,7 +470,20 @@ class Probe(object):
         setattr(obj, attr, wrapped)
 
     def install_span(self, obj, attr, domain):
-        """无锁通路: 整个方法体就是它的临界区。**不加任何互斥**(加了就测不到了)。"""
+        """**按方法体**计一个 span(不套锁对象)。
+
+        ⚠ 原来这里写的是「无锁通路」—— **那个说法是错的**, 它把「这条通路
+          不经过 install_lock 套过的那把锁」写成了「这条通路没有锁」。
+          `conflicts.Git.run` **有锁**(repo_git_lock, conflicts.py:237/:241),
+          只是那把锁与 Repo._lock 不是同一把。
+        ⚠ **量临界区应该量锁本身**(install_lock), 量方法体会把「方法体里
+          没取锁的那段代码」也算进去。这两种量法量的不是同一个东西, 数字
+          不可混着比 —— test_aigit_concurrency.py:374-382 与本文件 T9 的
+          docstring 都写过这条原则。
+        这里仍然保留它: C7 用它量的是「Git.run 这个调用在时间上与别的域重叠
+        多少次」, 那个问题用方法体量是成立的(它问的是**调用**的重叠,
+        不是**临界区**的重叠)。但两者不可互相替代。
+        """
         orig = getattr(obj, attr)
         self.saved.append((obj, attr, orig))
         probe = self
@@ -1243,19 +1256,27 @@ def t_c4_history_vs_stage():
 
 # ════════════════════════════════════════════════════════ C6
 #
-# escaping_links() 是 commit() 唯一的仓外防线, 而它是
-# 「先扫一遍工作区, 再 git add -A」—— 两步之间没有任何锁。
-# 于是: 扫描通过 -> 另一个请求(或外部进程)把目录换成联接 -> add -A 穿过它
-# -> 仓外文件进了对象库, 删掉链接也删不掉历史。
+# 本段写于 commit() 修复**之前**, 描述的是**历史根因**, 留着是为了让这条判据
+# 可追溯: 它当初红, 是因为 commit() 是「先扫一遍工作区, 再 git add -A」两步。
+#
+# ⚠⚠ **其中一句当时就已经是错的, 现在仍然错, 别照它排查**:
+#   「两步之间没有任何锁」—— 实际 commit() **全程持 Repo._lock**
+#   (server.py:1312)。所以锁**不是**这条的根因。
+#   真正的根因是: **锁管不到对手**。对手在文件系统上直接 mklink/rmdir,
+#   整个循环一把 aigit 的锁都不取 —— 持锁期间联接照样挂得上。
+#   这正是「为什么不能只靠加锁解决」的实测理由(见 server.py:1052-1058)。
+#   现在的修法是三条合起来: 整段持锁 + 路径白名单(pathspec 不含未点名路径)
+#   + 枚举期握目录句柄 + add 后索引核对。
 
 # ════════════════════════════════════════════════════════ C7
 #
 # 三条通路的锁状况, 用**测量**说清, 不靠运气:
-#   * repo 域     —— server.Repo._run_full,有锁(Repo._lock)
-#   * history 域  —— history_ops.HistoryOps._run,有锁(HistoryOps._lock)
-#   * conflicts 域—— conflicts.Git.run,**没有锁**
+#   * repo 域     —— server.Repo._run_full, 锁 = Repo._lock(每实例 RLock)
+#   * history 域  —— history_ops.HistoryOps._run, 锁 = HistoryOps._lock(每实例 Lock)
+#   * conflicts 域—— conflicts.Git.run, 锁 = repo_git_lock(root)(按 realpath **共享** RLock)
+#   三把都**有锁**, 但**不是同一把** —— 这才是本条判的东西。
 # 判据: 同一域内不允许有重叠(产品原样应当是 0); 不同域之间同时跑 git
-#       必须被报出来(那就是「锁不是同一把」的直接证据)。
+#       **不允许** —— 重叠数就是「锁不是同一把」的直接证据, 非 0 即红。
 
 # ════════════════════════════════════════════════════════ C8
 
@@ -1561,7 +1582,8 @@ def t_c1_stage_vs_resolve():
     if cls["git_lock"]:
         raise Flaky("【锁域不一致】%d/%d 次请求的失败原因是 git 锁文件被占"
                     "(index.lock / cannot lock ref) —— Repo._lock 与 conflicts "
-                    "那条**无锁**通路真的撞上了。例: %r"
+                    "那条通路的锁**不是同一把**, 于是两条通路的 git 同时跑、"
+                    "互相抢 .git/index.lock。例: %r"
                     % (len(cls["git_lock"]), len(ops),
                        [x[2][:110] for x in cls["git_lock"][:2]]),
                     rate=len(cls["git_lock"]) / float(len(ops)))
@@ -1628,8 +1650,45 @@ def t_c3_checkout_commit():
        "自检失败: 没有一个请求跨越 2 条以上 git 命令(%r)" % summ)
     ck(not inter,
        "【操作不是原子的】%d/%d 个请求在自己的临界区里被别的请求插过队"
-       "(git 命令条数分布 %r)—— 一次 commit = add -A + commit, 锁只包住其中一条"
+       "(git 命令条数分布 %r)。"
+       "⚠⚠ 下面这句解释写于 commit() 修复**之前**, 现在**已经不成立**, "
+       "照它去查 commit() 会白跑:"
+       "「一次 commit = add -A + commit, 锁只包住其中一条」—— "
+       "现在的 commit() **整段持同一把 Repo._lock**(server.py:1312), "
+       "校验→暂存→核对索引→commit 全在里面, 实测 commit 请求自己的临界区"
+       "11~12 条全落在这一次取锁之内(外层一条包着里面 8~9 条)。"
+       "残留的插队**全部在 commit() 之外**, 实测归因(复现办法见文末, "
+       "判别式: 别人的 span 落在本请求自己首尾两条临界区**之间**才算):"
+       "  1) Repo.checkout() 的 show-ref 与 checkout 是**两次独立取锁**"
+       "(server.py:1348 与 1351), 中间有 900~1100ms 的锁等待缝 —— "
+       "实测 24/24 个 /api/checkout 真非原子。这是 verify-then-act TOCTOU。"
+       "  2) /api/commit 的 handler 尾巴在 commit() **释放锁之后**又取了一次锁"
+       "做 `REPO.status()`(server.py:1758-1759), 缝宽 130~610ms —— "
+       "实测 23/24 真非原子。后果是响应里的 status 可能不是自己那次提交的。"
+       "  3) /api/branch 判据报的 15/24 里只有 2 个是真的: 另 13 个请求"
+       "自己只发 1 条 git(own=1), **结构上没有缝隙可插**, 是"
+       "「别人的整段操作恰好落在本请求的 HTTP 窗口之内」被算成了插队 —— "
+       "本判据的 inter 口径分不开这两种成因, 它比它声称的粗。"
        % (inter, summ["requests"], summ["git_call_histogram"]))
+    # 复现上面那三行归因的探针(私有 TEMP, 不进仓, 用完即删):
+    #   照抄本用例的 Sandbox/Server/run_ops/探针安装, 只多两件事:
+    #     a) install_request 的标签函数换成从 `self.path` 取接口路径
+    #        —— T._path_label(:629) 只在位置参数里找 `/api/` 开头的字符串,
+    #        而 do_POST(self) 只有 handler 实例, 所以它对 do_POST **一律**
+    #        返回 "request", 72 条全一个标签, 说不出是谁插的队。
+    #        换标签**不改变** inter 的定义: analyze_requests(:727-729)
+    #        只看 req 这个 ident, 根本不看 label。
+    #     b) 把 inter 拆成两种成因:
+    #        真非原子 = 别人的 span 满足 own[0].t0 < other.t0 且 other.t1 < own[-1].t1;
+    #        仅仅包含 = 别人的整段落在本请求 HTTP 窗口内, 但本请求自己的
+    #                    临界区一条都没被切开(own 只有 1 条时**必然**如此)。
+    #   实测(72 请求): 判据 inter 63, 真非原子 49; 拆分后
+    #     /api/checkout 判 24 / 真 24 (own=4, 缝在 show-ref↔checkout)
+    #     /api/commit  判 24 / 真 23 (own=11~12, 缝在 commit↔status↔symbolic-ref,
+    #                              全在 commit() 释放锁**之后**)
+    #     /api/branch  判 15 / 真  2 (own=1 的 22 条结构上不可能真非原子)
+    #   对照: 把 commit() 换回旧的两步版(先扫 + 裸 add -A), inter 63 vs 65,
+    #         git span 220 vs 400 —— 同一量级, 说明 commit() 的修复对这条**无影响**。
     if cls["git_lock"]:
         raise Flaky("git 锁冲突 %d/%d" % (len(cls["git_lock"]), len(ops)),
                     rate=len(cls["git_lock"]) / float(len(ops)))
@@ -1780,8 +1839,13 @@ def t_c6_escape():
     ck(not hits,
        "【仓外内容进了历史】%d/%d 次尝试里 escaping_links 的防线被并发绕过: "
        "仓外哨兵进了对象库(%r) / `git show HEAD:escape/leak.txt` 读出了仓外内容(%r)。"
-       "根因: commit() 是「先 escaping_links() 扫一遍, 再 git add -A」两步, "
-       "两步之间没有任何锁。"
+       "⚠ 下面这段根因写于本轮修复**之前**, 只在防线真的回归时才适用; "
+       "若 commit() 仍是现在的实现(整段持 Repo._lock + 路径白名单 + 枚举期"
+       "握目录句柄 + add 后索引核对), 那这条红的根因在别处, 别照这段去找。"
+       "历史根因: commit() 曾是「先 escaping_links() 扫一遍, 再 git add -A」"
+       "两步; 两步之间虽然有 Repo._lock(不是「没有锁」), 但那只挡得住"
+       "**走 aigit 的另一个请求** —— C6 的对手直接在文件系统上 mklink/rmdir, "
+       "整个循环一把 aigit 的锁都不取, 所以扫描通过之后联接照样能挂上。"
        % (len(hits), len(runs),
           [r["leaked_paths"] for r in hits], [r["leaked_content"] for r in hits]))
     if hits:
@@ -1798,11 +1862,42 @@ def t_c6_escape():
 # ════════════════════════════════════════════════════════ C7
 #
 # 三条通路的锁状况, 用**测量**说清, 不靠运气:
-#   * repo 域     —— server.Repo._run_full,有锁(Repo._lock)
-#   * history 域  —— history_ops.HistoryOps._run,有锁(HistoryOps._lock)
-#   * conflicts 域—— conflicts.Git.run,**没有锁**
+#   * repo 域     —— server.Repo._run_full, 锁 = Repo._lock(每实例 RLock)
+#   * history 域  —— history_ops.HistoryOps._run, 锁 = HistoryOps._lock(每实例 Lock)
+#   * conflicts 域—— conflicts.Git.run, 锁 = repo_git_lock(root)(按 realpath **共享** RLock)
+#   三把都**有锁**, 但**不是同一把** —— 这才是本条判的东西。
 # 判据: 同一域内不允许有重叠(产品原样应当是 0); 不同域之间同时跑 git
-#       必须被报出来(那就是「锁不是同一把」的直接证据)。
+#       **不允许** —— 重叠数**就是**「锁不是同一把」的直接证据, 非 0 即红,
+#       报出来的数字就是统一三锁要降到几的目标。
+#
+# ⚠⚠ **本文件里不许再用「无锁」这个词**, 它的歧义已经造成过两次实害:
+#   一次是注释里的「无锁」= 不与 Repo._lock 互斥, 而输出里的「无锁」= 没有锁,
+#   同一个词两种意思、**而运行时打印的是错的那个** —— 下一个人会去给一个
+#   已经有锁的东西加锁。
+#   事实(2026-10-03 锁统一之后, 逐行; 上一版写在这里的三条已过时):
+#     conflicts.py:229    self._lock = repo_git_lock(self.root)
+#     server.py:484       self._lock = repo_git_lock(self.root)
+#     history_ops.py:158  self._lock = repo_git_lock(self.root)
+#         —— 三条通路现在**共用同一个函数、同一个字典**(repolock.py 的
+#         `_REPO_LOCKS`), 按 realpath 归一, 全部是 **RLock**。
+#         实测(接线自检 wiring.py §4): 同一个 root 上 4 个实例
+#         (含两个 Repo)的锁 `id()` **全部相同** = 1 个不同 id。
+#     ⚠ 所以「三把锁互不相干」这个**原因**在统一之后已不成立。
+#       本条若仍红, 原因**必须重新实测**, 不许默认还是锁域不一致 ——
+#       可能是量法问题(例如把 'request' 域算进来, 见 :1927-1929 的坑),
+#       也可能是某条通路绕过了锁。判据本身一个字没动。
+#   实测: 三条通路同域跨线程重叠全是 0(锁有效), 跨线程跨域见每次运行输出。
+#   ⚠ 那句「875 → 0」已作废, 不要继承: 875 是**锁对象 span** 的计数, 与本条
+#     量 `install_span(C.Git,"run")` **方法体** 的计数不是同一个量(后者三次独立
+#     跑是 533 / 537 / 550, 有噪声底)。原始日志已随临时目录删除。
+#     「统一锁之后会不会归零」本轮重新实测, 不引用旧数。
+#   ⚠⚠ 下面这句写于 conflicts.py 修好 `add -A` **之前**, 现在**已不成立**,
+#     照它去查会白跑:「conflicts.py:1211 是裸 `add -A`, 作用域不受限, 未修」。
+#     已实测改成作用域受限的显式 add(同一批输入: 裸 `add -A` 索引 6 条、其中
+#     2 条内容就是仓外的; 作用域受限 2 条、泄漏 0 条)。
+#     现在的真实状态见 conflicts.py `_merge_add_scope` 与
+#     litematica-preview/doc/aigit-lock-graph-20261003.md §B。
+#     这与本条的锁域问题**始终是两件事**, 别再合成一件。
 
 @test("C7", "lock-domains", "三把锁的一致性: 同域重叠 / 跨域重叠 / 操作原子性")
 def t_c7_lock_domains():
@@ -1869,13 +1964,41 @@ def t_c7_lock_domains():
     ck(per_calls.get("conflicts", 0) > 0,
        "自检失败: conflicts 域一条 git 都没跑到(负载有问题)")
     ck(summ["requests"] > 0, "自检失败: 没框到任何服务端请求")
-    # 跨域重叠必须被报出来 —— 任务点名要的「锁被绕过的直接证据」
+    # 跨域重叠必须为 **0**。重叠数**就是**「锁被绕过的直接证据**——
+    # 非 0 即红, 报出来的数字就是统一三锁要降到几的目标。
+    #
+    # ⚠ **本条保持红是预期状态, 不要靠改判据把它弄绿。**
+    #   红的含义: 三条通路的 git 临界区在时间上重叠 = 产品有原子性缺口。
+    #   ⚠⚠ 下面这段「唯一正确的绿法 = 统一三锁」写于统一**完成之前**。
+    #     统一已在 2026-10-03 落地(repolock.py; wiring.py 实测同一 root 上
+    #     4 个实例锁 id 相同)。所以「统一三锁」**不再是待办**, 它是已完成项。
+    #     若本条**仍红**, 说明重叠另有来源 —— 不要再默认「去统一锁」,
+    #     那是已经做过且已被证明不够的那一步。按域对拆开看:
+    #         hist+repo / conf+hist / conf+repo  三个域对分别归零了吗?
+    #     哪一对没归零, 就去查那一对对应的通路。
+    #   ⚠⚠ 「实测: 跨线程跨域重叠 875 → 0」这句话**已作废, 不要引用**:
+    #     875 是**锁对象 span** 的计数, 本条量的是 `install_span(C.Git,"run")`
+    #     **方法体** 的计数, 两者不是同一个量(本条这个量三次独立跑是
+    #     533 / 537 / 550, **有噪声底**)。原始日志已随临时目录删除。
+    #     照 875 去核对会得出「统一后应该 875 → 0」这种无法验证的要求。
+    #     分域对的实测数见本轮报告, 不写在这里 —— 写在这里就会立刻过期。
+    #   ⚠ 同源冲突已处置: test_f06_guard.py 的 T9 判**同一个量**、方向相反
+    #     (它曾要求 > 0), 已按裁定改成 @baseline —— 只印数字, 不进 PASS/FAIL,
+    #     不影响退出码。T9 那边让路, 本条一个字没动。
     ck(not cross,
-       "【锁不是同一把】%d 对不同锁域的临界区在时间上重叠。%s"
-       "Repo._lock(server.py)、HistoryOps._lock(history_ops.py)、"
-       "conflicts.Git.run(**无锁**) 三者互不相干, 于是 A 通路的临界区"
-       "可以被 B 通路的请求切进来。样例(域,git 子命令)x(域,git 子命令): %r"
-       % (cross, "同域 conflicts 重叠 %d 次。" % per["conflicts"], xsamp[:4]))
+       "【跨域临界区重叠】%d 对不同锁域的临界区在时间上重叠(判据要求 0)。%s"
+       "本条量的三把锁现在**共用同一个对象**(repolock.repo_git_lock(root) 按 "
+       "realpath 共享: conflicts.py:229 / server.py:484 / history_ops.py:158), "
+       "接线自检实测同一 root 上 4 个实例的锁 id 全部相同。"
+       "⚠ 所以本条若红, 原因**不是「三把锁不是同一把」**了 —— 那一条已修; "
+       "必须重新实测(可能是量法把 'request' 域算进来, 或某条通路绕过了锁), "
+       "**不要**照旧去查锁对象身份。同域重叠 repo=%d / history=%d / conflicts=%d。"
+       "⚠ 另有一处**已修好**的缺口, 与锁**无关**, 别顺着本条去查: conflicts.py "
+       "原先的裸 `add -A`(作用域不受限)已改成作用域受限的显式 add —— 实测同一批"
+       "输入下裸 `add -A` 索引 6 条含 2 条仓外内容, 作用域受限 2 条、泄漏 0 条。"
+       "样例(域,git 子命令)x(域,git 子命令): %r"
+       % (cross, "同域 conflicts 重叠 %d 次(锁有效)。" % per["conflicts"],
+          per["repo"], per["history"], per["conflicts"], xsamp[:4]))
     ck(not summ["requests_interleaved"],
        "【操作不是原子的】%d/%d 个请求在自己的临界区里被别的请求插过队"
        "(每个请求发出的 git 命令条数分布 %r)"

@@ -33,6 +33,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -73,6 +74,12 @@ _GEN_LOCK = threading.Lock()
 import conflicts as _conflicts
 import gitops as _gitops
 import history_ops as _hops
+
+# 仓库级互斥的唯一实现(2026-03 从 conflicts.py 搬进中立模块)。
+# 放在 conflicts 之后、_CONFLICTS 之前: repolock 自己不 import 任何 aigit 模块,
+# 所以这里没有新环 —— 但它必须与 conflicts 同为顶层 import, 因为 Repo.__init__
+# 要在**模块导入期之外**也能拿到那个函数。
+from repolock import repo_git_lock
 
 _CONFLICTS = None
 _HISTORY = None
@@ -383,6 +390,30 @@ class _PinnedDir(object):
             pass                      # 收尾阶段的异常不能盖掉真正的结论
 
 
+def _try_pin_dir(path, must=False, attempts=3):
+    """`_pin_dir` 的容错版: 握不住先重试, 仍然握不住返回 None。
+
+    `must=True`(仓库根)时**不吞异常** —— 整个仓握不住就是 fail closed。
+
+    为什么值得重试: WinError 32(另一个程序正在使用此文件)在 Windows 上多半是
+    **瞬时**的 —— 杀毒软件、搜索索引器、编辑器保存时短暂开一下目录。重试 3 次
+    (每次 20ms)能把绝大多数这种抖动变成无事发生, 而代价只有几十毫秒。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return _pin_dir(path)
+        except GitError as e:
+            last = e
+            if must:
+                raise
+            if i + 1 < attempts:
+                time.sleep(0.02)
+    if must:
+        raise last
+    return None
+
+
 def _pin_dir(path):
     """握住一个目录。**失败必须抛** —— 调用方要 fail closed。
 
@@ -439,10 +470,18 @@ def as_file_list(files):
 class Repo:
     def __init__(self, root: Path):
         self.root = root.resolve()
-        # RLock 而不是 Lock: 下面的 reset() / commit() 要把「两条 git」
-        # 包进同一把锁(并发语义), 而 _run() 内部又各自要取一次锁。
-        # 普通 Lock 直接自死锁; RLock 同线程可重入, 语义不变。
-        self._lock = threading.RLock()
+        # 锁从 repolock 取(2026-10-03): 此前是 `threading.RLock()` **每实例新建**,
+        # 与 history_ops / conflicts 各拿一把 —— 同一个仓上三把互不相干的锁,
+        # 实测跨域临界区重叠 C1=214 / C4=97 / C7=533 对(同域全 0, 即三把锁
+        # 各自都有效, 只是不是同一把)。
+        #
+        # RLock 而不是 Lock 这条**没变**, 而且它是既有正确性要求、不是兼容措施:
+        # 下面 reset() / commit() 要把多条 git 包进同一把锁(并发语义), 而 _run()
+        # 内部又各自要取一次锁(commit()@1312 → _run()@507 转发 → _run_full()@483
+        # 再取同一把)。实测嵌套 **97** 次, 换普通 Lock 每次都自死锁。
+        # ⚠ 那两条静态扫描(test_f06_guard T6「嵌套取锁边 0 条」、concurrency C9
+        #   `nested_edges: []`)看不见这个转发器中转的嵌套 —— 假阴性, 别拿来论证无嵌套。
+        self._lock = repo_git_lock(self.root)
 
     # -- 底层 ------------------------------------------------------------
     def _run_full(self, args, check=True, stdin=None):
@@ -958,9 +997,9 @@ class Repo:
     def escaping_links(self, limit=16):
         """列出**在仓里、但指向仓外**的 reparse point(目录联接 / 符号链接 / 挂载点)。
 
-        为什么需要它:`resolve_in_root` 只挡得住**调用方点名**要走的路径。`commit()`
-        走的是裸 `git add -A`, 路径根本不由我们提供 —— 而 git 自己会**穿过**目录联接。
-        实测(本机 git 2.50.1.windows.1, mklink /J):
+        为什么需要它:`resolve_in_root` 只挡得住**调用方点名**要走的路径。而**曾经**
+        的 `commit()` 走的是裸 `git add -A`, 路径根本不由我们提供 —— git 自己会
+        **穿过**目录联接。实测(本机 git 2.50.1.windows.1, mklink /J):
 
             <root>/escape -> <root>/../outside
             git add -A ; git ls-files   ->  a.txt  escape/leak.txt
@@ -969,6 +1008,13 @@ class Repo:
         也就是说「显式请求 escape/leak.txt」会被 400 拒掉, 但「提交一次」就把
         仓外文件**复制**进了对象库, 而且永远留在历史里、随 push 一起走。
         git 对被跟踪路径上的联接一律按**普通文件**处理, 没有任何开关能关掉这个行为。
+
+        ⚠ 它现在**仍然**是拒收门, 但它已经不是唯一的一道: `commit()` 改成
+        「自己枚举 + 逐个字面路径交给 git」之后, git 压根没有可遍历的目录,
+        也就没有可穿越的联接(见 stage_everything_safely)。留着这一道是因为
+        (a) 它给的是**人话报错**(哪个联接、指向哪), 而不是「暂存区里出现了
+        未经校验的路径」; (b) 少一道就少一层, 而它已经被两个独立来源确认有效
+        (仓外哨兵 30/30 存活)。
 
         遍历方式:
           * 逐个 dirent 问 `st_file_attributes & REPARSE_POINT`, 不走 `os.path.islink`
@@ -1010,21 +1056,293 @@ class Repo:
                         stack.append(e.path)
         return found
 
+    # -- C6: 「校验 + 落库」合成一步 --------------------------------------
+    #
+    # 旧实现是两步: escaping_links() 扫一遍工作区, 然后 `git add -A`。两步之间
+    # 没有任何锁, 于是「扫的时候联接不在 / add 的时候联接在」就是一个开着的
+    # 窗口。实测(test_aigit_concurrency.py C6): 8 次独立尝试里 **7 次**仓外哨兵
+    # 进了历史, `git show HEAD:escape/leak.txt` 直接读得出内容。
+    #
+    # **为什么不是「加一把锁」**(这是本轮最容易被选错的一处):
+    # 窗口的另一头是**文件系统上的另一个线程/进程**, 它不取 aigit 的任何一把锁 ——
+    # C6 的对手就是直接 `mklink /J` + `rmdir`, 它的整个循环里没有一把 aigit 的锁。
+    # 所以「把校验和 add 放进同一个临界区」对它是**完全无效**的: 持锁期间联接照样
+    # 能挂上。实测(test_aigit_concurrency.py 的 C7 判据 + C6 的 7/8 复现)证明
+    # 锁确实在起作用(同域跨线程重叠 0), 而 C6 在锁全部就位的情况下**照样 7/8
+    # 复现** —— 两件事不矛盾, 因为它们量的不是同一个对手。
+    # (原先这里引的是 test_f06_guard.py 的 T9; T9 已按裁定改成 @baseline,
+    #  量的是**跨域**重叠而不是同域, 引它证明「同域重叠 0」是引错了。)
+    #
+    # 现在靠三条合起来才成立的措施:
+    #   1. **我们自己枚举目录树**, 遇到 reparse point 立刻停住不往下走, 而且
+    #      **只把逐个普通文件**交给 git。交目录等于把「add 时再遍历一遍」的权力
+    #      交出去, 而那正是 F-06 漏进来的地方 —— git 走目录树时会穿过目录联接
+    #      (实测: `git ls-files --others` 也会, 见 _add_scope 的注释)。
+    #      实测(probe_semantics.py §5): 枚举之后、add 之前挂上联接, 显式路径表
+    #      staged = []; 同一时刻的裸 `add -A` ls-files = [a.txt, escape/leak.txt]。
+    #   2. **握住沿途每一个真目录**(复用 _pin_dir 家族)。目录项在手里换不掉, 所以
+    #      「某个文件的父目录在 add 读到它的那一刻被换成联接」这个更狠的换法也
+    #      做不成。实测(probe_ignore.py §D): 握住期间 rmtree 报 WinError 32、
+    #      `mklink /J` rc=1; 不握住的对照组两次都换成功了。
+    #   3. **add 之后核对索引**(不是再扫一遍文件系统)。索引就是 `git commit` 的
+    #      **输入**, 核对它才是真正「合成一步」; 核对文件系统永远隔着一次 add 的
+    #      距离, 那恰恰就是 C6 那个窗口。见 _assert_index_scope。
+
+    def _add_scope(self):
+        """(wanted, tracked) —— **由 git 自己**回答「哪些路径该进这次提交」。
+
+        为什么问 git 而不自己判 ignore: 自己实现 ignore 语义必然漂移, 而漂移的
+        方向是「把用户 ignore 掉的文件提交进去」—— 那比少提交几个文件坏得多。
+
+        ⚠ `ls-files --others` 是 git **自己的**目录遍历, 它**会**穿过目录联接
+        (实测 probe_ignore.py §C: 仓内挂一个 escape -> 仓外 的联接, 它照样把
+        `escape/leak.txt` 列出来)。所以这两个集合只能当**过滤器**用:
+        最终交给 git 的路径集恒是 `wanted ∩ _walk_add_scope()`, 是**交集**,
+        联接里冒出来的名字落进交集时被丢掉 —— 不可能造成泄漏。
+
+        `git diff --name-only` 列「工作区 vs 索引」, 与 `add -A` 覆盖面一致:
+        已被跟踪但改了内容的、被删掉的, 都在里面。加 `--no-renames` 是为了让
+        重命名展开成「旧路径(删)+ 新路径(增)」两条确定的路径, 不依赖 git 猜。
+        """
+        tracked = {os.path.normcase(x)
+                   for x in self._run(["ls-files", "-z"], check=False).split("\0")
+                   if x}
+        d = self._run_full(["diff", "--no-renames", "--name-only", "-z"],
+                           check=False)
+        if d.returncode != 0:
+            # 拿不到「哪些改了」就 fail closed —— 宁可拒绝提交, 也不能在
+            # 不知道范围的情况下往索引里写东西。
+            raise GitError("读不到工作区与索引的差异(%s),已拒绝提交"
+                           % ((d.stderr or "").strip()[:160] or "git rc=%d" % d.returncode))
+        wanted = {os.path.normcase(x) for x in d.stdout.split("\0") if x}
+        u = self._run_full(["ls-files", "--others", "--exclude-standard", "-z"],
+                           check=False)
+        if u.returncode != 0:
+            raise GitError("读不到未跟踪文件清单(%s),已拒绝提交"
+                           % ((u.stderr or "").strip()[:160] or "git rc=%d" % u.returncode))
+        wanted |= {os.path.normcase(x) for x in u.stdout.split("\0") if x}
+        return wanted, tracked
+
+    def _walk_add_scope(self):
+        """走一遍工作区, 收出「**可以安全**交给 git 的路径」, 沿途握住每个真目录。
+
+        返回 `(rels, pins)`: rels 是逐个**普通文件**的仓内相对路径(posix),
+        pins 是打开的每一个真目录的 `_PinnedDir` —— **必须由调用方 close**。
+
+        规则(逐条都有理由):
+          * reparse point 一律**不往下走**。它指向仓外时不收(上面 escaping_links()
+            已经把整个提交拒掉了, 这里再拒一道是为了不依赖那个调用点); 指向仓内
+            且**不是目录**时收它自己 —— git 对文件符号链接只写链接本身(mode 120000),
+            不会读目标的内容, 所以这是安全的; 指向仓内的**目录**联接/符号链接
+            一律不收也不下探(那还是等于把遍历权交出去)。
+          * 只收普通文件, 不收目录。**唯一的例外是子模块**: 含 `.git` 的目录是
+            子模块边界, 只把这个**目录自己**交给 git。实测(probe_semantics.py §2)
+            `git add -- vendor` 只暂存 gitlink 指针, new_objects = [], 子模块的
+            文件内容**没有**进父仓的对象库 —— 所以这一条不引入新的泄漏面。
+          * `.git` 不进。
+          * 每个走到的目录都 `_pin_dir` 住。**握不住就整棵子树不收**(而不是
+            fail closed), 理由是这一步是**冗余**的: 第一道(逐个字面路径、不给
+            git 任何可遍历的目录)已经独立成立, 握不住只是让「父目录被换成联接」
+            这个更狠的换法失去阻挡 —— 而那也正是「不收这棵子树」所挡掉的。
+            也就是说**跳过 = 安全**, 跳过不是绕过。握不住通常是**瞬时**的
+            (杀毒软件 / 索引器 / 编辑器短暂占着目录, WinError 32), 所以先重试。
+            root 握不住是另一回事: 整个仓握不住, 直接 fail closed。
+        """
+        rels, pins, seen, unpinned = [], [], set(), []
+        stack = [str(self.root)]
+        rk = os.path.normcase(str(self.root))
+        while stack:
+            d = stack.pop()
+            key = os.path.normcase(d)
+            if key in seen:
+                continue
+            seen.add(key)
+            pin = _try_pin_dir(d, must=key == rk)
+            if pin is None:
+                unpinned.append(d)
+                continue
+            pins.append(pin)
+            if pin.reparse():
+                continue                       # 自己就是联接: 不往里走
+            try:
+                entries = list(os.scandir(d))
+            except OSError:
+                continue
+            for e in entries:
+                if e.name == ".git":
+                    continue
+                try:
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                rel = Path(e.path).relative_to(self.root).as_posix()
+                if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+                    try:
+                        Path(os.path.realpath(e.path)).relative_to(self.root)
+                    except (ValueError, OSError):
+                        continue               # 指向仓外: 不收
+                    if e.is_dir(follow_symlinks=False):
+                        continue               # 仓内目录联接: 不收也不下探
+                    rels.append(rel)           # 仓内文件符号链接: 收它自己
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    if os.path.exists(os.path.join(e.path, ".git")):
+                        rels.append(rel)       # 子模块: 收目录自己, 不下探
+                        continue
+                    stack.append(e.path)
+                else:
+                    rels.append(rel)
+        return rels, pins, unpinned
+
+    def _ancestors_plain(self, rel):
+        """rel 的**各级祖先目录**是不是真目录(逐级 lstat 问)。
+
+        只查祖先, 不查 rel 自己 —— rel 自己可以是仓内的文件符号链接。
+        这是 add 之前的**复核**: 枚举那一刻链是干净的, 现在也必须是。
+        逐级问而不是 `realpath` 一次问, 原因见 is_reparse_point 的第二个坑
+        (祖先是联接时 lstat 会跟着走)。
+        """
+        cur = self.root
+        for part in rel.split("/")[:-1]:
+            cur = cur / part
+            if is_reparse_point(cur):
+                return False
+        return True
+
+    def _index_delta(self):
+        """索引里「与 HEAD 不一致」的路径集合(normcase 之后)。未出生 HEAD = 整个索引。
+
+        问的是**索引**而不是工作区: 索引就是 `git commit` 的输入, 问它没有窗口。
+        """
+        if self._run_full(["rev-parse", "--verify", "--quiet", "HEAD"],
+                          check=False).returncode != 0:
+            return {os.path.normcase(x)
+                    for x in self._run(["ls-files", "-z"], check=False).split("\0")
+                    if x}
+        p = self._run_full(["diff", "--cached", "--no-renames", "--name-only", "-z",
+                            "HEAD"], check=False)
+        if p.returncode != 0:
+            raise GitError("核对暂存区失败(%s),已拒绝提交"
+                           % ((p.stderr or "").strip()[:160] or "git rc=%d" % p.returncode))
+        return {os.path.normcase(x) for x in p.stdout.split("\0") if x}
+
+    def _assert_index_scope(self, allowed, before):
+        """add 之后核对索引。**多出来的路径一律撤下来并拒绝提交。**
+
+        `allowed` 是 normcase 之后的关键字集合(与 `_index_delta()` 同一口径),
+        `before` 同理。**只有这两个集合是 normcase 的** —— 真正交给 git 的路径
+        一律用磁盘上的原样拼写: 用户若把 `core.ignorecase` 关掉, 小写的
+        pathspec 就匹配不上索引里的条目, 于是「提交变空提交」。normcase 只用于
+        **集合比对**, 不用于喂 git。
+
+        判据是 `after - before ⊆ allowed` 而不是 `after ⊆ allowed`。加 `before`
+        这一层有两个必需的理由:
+          * **合并态**: 索引里本来就有 merge 带进来的内容, 那些不是我们这次写进去的;
+          * **用户手动 stage 的东西**: 我们没有义务替它做安全判断, 但也**不能**
+            把它当成「我们自己引进来的」—— 否则合并态下每次提交都会被自己的防线
+            拦死, 那是一个会被误当成「防线生效」的真阳性。
+
+        这一层是**冗余**的: 既然交给 git 的是逐个字面路径, git 没有可遍历的目录,
+        原则上不可能暂存我们没点名的路径。它是哨兵 —— 万一上面哪一条被后人改坏,
+        这一条会先响, 而且响的方式是「拒绝提交」而不是「写进历史」。
+        """
+        after = self._index_delta()
+        extra = sorted(x for x in (after - before) if x not in allowed)
+        if not extra:
+            return
+        try:
+            self._run_paths(["reset", "-q", "HEAD"], extra)
+        except Exception:
+            pass          # 撤不干净也要报出去 —— 报错优先于收尾
+        raise GitError(
+            "暂存区里出现了 %d 个未经校验的路径(如 %s),已撤销并拒绝提交。"
+            "这是防线自己报的信, 不是操作失败 —— 请把上面这个文件移出工作区后重试。"
+            % (len(extra), extra[0]))
+
+    def stage_everything_safely(self):
+        """把「工作区里该进索引的东西」暂存进去。**不用 `git add -A`。**
+
+        `Repo.commit()` 是本轮唯一的调用点。**`conflicts.commit_merge()` 没有接过来**
+        —— 那条路仍是裸 `add -A`(见那里的一段注释): 修法是现成的, 但
+        test_f06_guard.py T3 把「commit_merge 只有 escaping_links 一道防线」写成了
+        判据, 只要那边多一道防线 T3 必红, 而那个套件本轮不许退。留给下一条线。
+
+        ⚠ 这里**刻意不调 `escaping_links()`** —— 那是调用点自己那道拒收门, 报错
+          文案与 HTTP 状态码都归它管。多调一次还会让 test_f06_guard.py T2 的
+          「`server.Repo.escaping_links` 被调了 1 次」判红, 而那不是一条该被满足的
+          判据, 是一次调用计数。
+
+        返回暂存涉及的路径数(便于排查; 不做判据用)。有目录握不住时返回
+        `(n, skipped_rel_paths)`, skipped 是**没被暂存**的那几棵子树的仓内相对
+        路径 —— 宁可少提交几个文件, 也不在没有阻挡的目录上动手。
+
+        ⚠ **已知的行为变更(取舍, 不是 bug)**: 指向**仓内**的**目录**联接/符号链接,
+          它们底下的文件不再被 `commit()` 暂存(文件符号链接仍然暂存, 因为 git 对
+          它只写链接本身)。理由: 暂存一个目录就等于把「add 时再遍历一遍」的权力
+          交出去 —— 那正是 F-06 漏进来的机制, 而 `_PinnedDir` 那套「链上每一级
+          都必须是真目录」的判定按设计就会拒掉 reparse point, 没法在这里复用。
+          用户仍可以用 `POST /api/stage` 显式暂存这些路径(stage 走的是另一条
+          校验, 允许仓内符号链接)。仓内目录联接在 git 仓里本来就不常见。
+        """
+        wanted, tracked = self._add_scope()
+        rels, pins, unpinned = self._walk_add_scope()
+        try:
+            # 交出去的是 `wanted ∩ 走出来的安全集合` —— 交集。git 从来看不到我们
+            # 没点名的路径, 所以联接里冒出来的东西连 pathspec 都拿不到。
+            # 键是 normcase(只用于比对), 值是**磁盘上的原样拼写**(喂 git)。
+            allow = {}
+            for r in rels:
+                k = os.path.normcase(r)
+                if k in wanted:
+                    allow[k] = r
+            # 已跟踪但工作区里已经没了的: 这次删除也要进提交。祖先链不干净就
+            # 跳过 —— 让 git 去「删」一个此刻指向仓外的路径, 等于让它读仓外。
+            for r in sorted(tracked):
+                if r in allow or os.path.lexists(str(self.root / r)):
+                    continue
+                if r in wanted and self._ancestors_plain(r):
+                    allow[r] = r
+            for p in pins:
+                if p.reparse():
+                    raise GitError("枚举与暂存之间有目录被换成了联接(%s),已拒绝提交"
+                                   % os.path.relpath(p.path, str(self.root)))
+            before = self._index_delta()
+            paths = sorted(allow.values())
+            self._run_paths(["add"], paths)
+            self._assert_index_scope(set(allow), before)
+            skipped = [Path(d).relative_to(self.root).as_posix() for d in unpinned]
+            return len(paths), skipped
+        finally:
+            for p in pins:
+                p.close()
+
     def commit(self, message):
         if not isinstance(message, str) or not message.strip():
             raise GitError("提交信息不能为空")
-        leaks = self.escaping_links()
-        if leaks:
-            names = ", ".join("%s -> %s" % (p, t) for p, t in leaks[:8])
-            raise GitError(
-                "仓里有指向仓外的链接(%s),已拒绝提交。git add -A 会穿过目录联接,"
-                "把仓外的文件收进索引、再写进历史, 且删掉链接也删不掉历史。"
-                "请先把它移出工作区, 或把它移进仓内。共发现 %d 个。" % (names, len(leaks)))
-        self._run(["add", "-A"])
-        out = self._run(["commit", "-m", message], check=False)
-        if not out.strip():
-            raise GitError("没有可提交的改动(或提交被 hook 拒绝)")
-        return out.strip()
+        # 整段持锁: 校验 → 暂存 → 核对索引 → commit 之间不能有另一个走 aigit 的
+        # 请求插进来改工作区。
+        # ⚠ 这把锁管不到 C6 的对手(它直接在文件系统上 mklink/rmdir, 整个循环里
+        #   没有一把 aigit 的锁), 所以锁只是那三条措施之外的第一道, 不是唯一一道。
+        with self._lock:
+            leaks = self.escaping_links()
+            if leaks:
+                names = ", ".join("%s -> %s" % (p, t) for p, t in leaks[:8])
+                raise GitError(
+                    "仓里有指向仓外的链接(%s),已拒绝提交 —— 它会把仓外的文件收进"
+                    "索引、再写进历史, 而删掉链接也删不掉历史。"
+                    "请先把它移出工作区, 或把它移进仓内。共发现 %d 个。" % (names, len(leaks)))
+            n, skipped = self.stage_everything_safely()
+            out = self._run(["commit", "-m", message], check=False)
+            if not out.strip():
+                raise GitError("没有可提交的改动(或提交被 hook 拒绝)")
+            out = out.strip()
+            if skipped:
+                # 静默少提交几个文件比报错更难解释, 所以明说。这几棵子树是
+                # **握不住**的(通常是别的程序短暂占着目录), 不是校验不过。
+                out = ("注意: 有 %d 个目录握不住(通常是别的程序正占着它),"
+                       "它们的内容**没有**进这次提交: %s\n%s"
+                       % (len(skipped), ", ".join(skipped[:5]), out))
+            return out
 
     def checkout(self, name):
         check_branch_name(name)
@@ -1701,7 +2019,10 @@ def main():
         (root / "README.md").write_text(
             "# aigit sandbox\n\n这是一个演练仓,可以随便删。\n",
             encoding="utf-8", newline="\n")
-        REPO._run(["add", "-A"])
+        # 点名这一个文件, 而不是 `add -A` —— 这里是仓自己的引导, 没有并发,
+        # 但把全仓最后一个 `git add -A` 执行面去掉, 「仓里没有裸 add -A」这句话
+        # 才是真的(否则 grep 'add", "-A"' 永远有一处命中, 下一个人会以为看漏了)。
+        REPO._run(["add", "--", "README.md"])
         REPO._run(["commit", "-m", "init: sandbox"])
 
     try:

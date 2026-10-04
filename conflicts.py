@@ -76,7 +76,9 @@ import os
 import re
 import subprocess
 import sys
-import threading
+# ⚠ `import threading` 在 2026-10-03 被移除: 锁工厂搬进 repolock.py 之后,
+#   本模块 `threading.` 出现 0 次(实测), 而全仓也没有任何地方写
+#   `conflicts.threading`(grep 0 命中) —— 留着就是个纯装饰的死 import。
 from pathlib import Path
 
 import gitguard
@@ -133,36 +135,28 @@ class ConflictError(Exception):
 
 # ---------------------------------------------------------------- 仓库级互斥
 #
-# aigit 有三条会跑 git 的通路: server.Repo(有锁)、history_ops.HistoryOps(有锁)、
-# 以及本模块(修复前**一把锁都没有**)。三者在同一个仓库上跑 git ⇒ 同一个
-# .git/index 会被同时写。实测(见 doc/aigit-concurrency-audit.md F-01):
-# `stage` × `conflict/resolve` 每遍 20–23/72 的请求以
-# `Unable to create '.git/index.lock'` 失败。
+# 锁工厂已搬到中立模块 repolock.py(server.Repo / history_ops.HistoryOps 现在
+# 也从那里取锁, 三条通路共用同一个字典与同一把 RLock)。这里是**再导出**,
+# 不是转发封装 —— 目的有三个, 每一个都有实测依据:
 #
-# 这里按 realpath 记忆化: **同一仓库的所有入口拿同一把锁, 不同仓库仍然并行**。
-# 用模块级字典而不是实例属性 —— 实例属性会让每个 ConflictResolver 各拿一把,
-# 而 server.py 的 `conflict_resolver()` 是懒单例、测试又会另建实例, 用实例
-# 属性的话同一个仓上会出现 N 把互不相干的锁, 等于没加。
+#   1. `__all__` 里有 "repo_git_lock", 直接删掉会破 `from conflicts import *`;
+#   2. test_f06_guard.py:403/405 猴补 `conflicts.repo_git_lock`;
+#   3. Git.__init__ 写的是**不带限定**的 `repo_git_lock(self.root)`, 调用时在
+#      本模块 globals 里解析 —— 所以下面这一行 import 让猴补**照样生效**,
+#      test_f06_guard.py 不需要改。
 #
-# ⚠ 必须是 **RLock** 不能是 Lock: 上层要在「读-校验-写」整段持锁, 而段内还会
-#   回调 Git.run —— 段内 Git.run 要再取同一把锁, 普通 Lock 在这里会自死锁。
-_GIT_LOCKS = {}
-_GIT_LOCKS_MU = threading.Lock()
-
-
-def repo_git_lock(root):
-    """返回该仓库唯一的 git 互斥锁。同一 root(按 realpath 归一)永远拿到同一把。
-
-    ⚠ **锁图无环**: `_GIT_LOCKS_MU` 只在这几行里被持有, **绝不会**在持有它的
-    期间去取仓库锁, 所以它与仓库锁之间不存在嵌套边。
-    """
-    key = os.path.normcase(os.path.realpath(str(root)))
-    with _GIT_LOCKS_MU:
-        lk = _GIT_LOCKS.get(key)
-        if lk is None:
-            lk = threading.RLock()
-            _GIT_LOCKS[key] = lk
-        return lk
+# ⚠ 但搬走之后猴补的**作用面变窄了**, 这一点必须说清楚, 不许当没发生:
+#   `conflicts.repo_git_lock = lambda…` 只改 conflicts 这一份 global,
+#   改不到 repolock.repo_git_lock。所以同一个测试里:
+#       server.Repo        拿到**真锁**
+#       history_ops        拿到**真锁**
+#       conflicts.Git      拿到 NoopLock
+#   对 test_f06_guard.py 的语境这是对的(它就是要单独试 conflicts 那条通路),
+#   但代价是**那个测试从此不再覆盖 server / history_ops 的锁行为**。
+#   不要去「统一」这个差异 —— 那等于把 NoopLock 传播到其它通路去。
+from repolock import repo_git_lock          # noqa: F401  (再导出, 见上)
+from repolock import _REPO_LOCKS as _GIT_LOCKS        # noqa: F401  旧名, 别处仍在用
+from repolock import _REPO_LOCKS_MU as _GIT_LOCKS_MU  # noqa: F401  同上
 
 
 # ------------------------------------------------- 仓外联接防线(F-06 的根因)
@@ -1140,6 +1134,34 @@ class ConflictResolver:
                 "mergeHead": merge_head}
 
     # -- 写:完成合并 ---------------------------------------------------
+    def _merge_add_scope(self):
+        """这次合并提交该收进索引的路径(显式清单, 仓库根相对)。
+
+        三条来源, 全部走 git 自己的「已跟踪」视图, **不自己 os.walk**:
+          * ``diff --cached``         —— 已进索引的。冲突解决正是 resolve() /
+            choose() 一路 ``git add -- <路径>`` 把它收进去的, 所以这一条
+            才是合并提交的主体。
+          * ``diff``                 —— 已跟踪且工作区有改动的。
+          * ``diff --diff-filter=D``  —— 已跟踪且被删的。
+
+        **未跟踪的一律不进**, 这就是收紧点: 目录联接下的仓外文件属于未跟踪,
+        裸 ``add -A`` 会顺着联接把它们收进去, 显式清单不会(实测 §B)。
+
+        三条都带 ``-z``, 按 NUL 切分而不是按行 —— 路径里有空格/引号/换行时
+        按行切会切错, 而切错等于路径注入。
+        """
+        paths = set()
+        for args in (["diff", "--cached", "--name-only", "-z"],
+                     ["diff", "--name-only", "-z"],
+                     ["diff", "--diff-filter=D", "--name-only", "-z"]):
+            # check=False: 这三条里, 「没有差异」时 diff 仍返回 0, 但仓库
+            # 若处在异常态返回非 0 —— 那时退化成空清单(少收), 不该抛异常
+            # 把整个合并提交打断。少收路径是保守方向, 宁可让人看见多出来的
+            # 未跟踪文件, 也不要把看不见的东西塞进历史。
+            p = self.git.run(args, check=False)
+            paths.update(x for x in (p.stdout or "").split("\0") if x)
+        return sorted(paths)
+
     def commit_merge(self, message=None):
         """提交合并结果。
 
@@ -1154,10 +1176,18 @@ class ConflictResolver:
         于是「解决冲突 → 完成合并」这条路把仓外文件复制进了对象库且永久留在
         历史里 —— 同一次运行里 `POST /api/commit` 正确拒绝、这条路静默提交,
         **串行即可复现, 不需要任何竞态**(实测见 f06_repro.py)。
+        **现在这里是第五道**: 作用域受限的显式 `add -- <路径>`,
+        只收 git「已跟踪」视图里的路径, 未跟踪的一律不进(见 `_merge_add_scope`
+        与下面 add 那段的实测清单)。第四道挡「已跟踪却指向仓外」, 第五道挡
+        「未跟踪、靠联接被 `add -A` 顺手收进来」—— 两道挡的是不同东西, 不是重复。
 
-        ⚠ 整个方法体在同一把 `self.git._lock` 里。防线扫描是**纯文件系统扫描**,
-        不碰 git, 所以锁**管不到「扫描完到 add 之间」** —— 只有把
-        「扫描 + add -A + commit」放进同一个临界区, 才算把 TOCTOU 窗口关掉。
+        ⚠ 整个方法体在同一把 `self.git._lock` 里。`escaping_links` 是**纯文件
+        系统扫描**, 不碰 git, 所以锁**管不到「扫描完到 add 之间」**。
+        第五道(作用域受限 add)把这条窗口也收窄了: 联接即便在扫描之后才挂上,
+        它下面的路径也是未跟踪的, 不在显式清单里, 收不进去。
+        但这**不是**临界区意义上的关闭 —— 真要彻底关掉, 还得让「扫描 + add」
+        本身原子(与 server.Repo.commit() 走 option (c) 的做法同源:
+        路径白名单快照 + 目录钉住 + 索引复核, 那三样这里都还没有)。
         """
         with self.git._lock:
             return self._commit_merge_locked(message)
@@ -1196,7 +1226,35 @@ class ConflictResolver:
         if message and branches and not any(b in text for b in branches):
             text = "%s\n\nMerged: %s" % (text, ", ".join(branches))
 
-        self.git.run(["add", "-A"])
+        # ── 作用域受限的 add(替代修复前的裸 `add -A`)────────────────────
+        # 裸 `add -A` 的路径**不由我们提供**, 而 git 会**穿过**目录联接, 于是
+        # 「解决冲突 → 完成合并」这条路把仓外文件复制进了对象库、永久留在历史里。
+        #
+        # 实测(litematica-preview/doc/aigit-lock-graph-20261003.md §B, 探针
+        # addscope.py, 同一批输入; 该文件在 litematica-preview/doc/ 下, 而
+        # litematica-preview 本身不是 git 仓, 所以它不进任何被测仓):
+        #   裸 `add -A`     -> 索引 6 条, 其中 escape/leak.txt、escape/sub/deep.txt
+        #                      两条的**内容就是仓外那份**,
+        #                      `git show HEAD:escape/leak.txt` 读出 OUTSIDE-SECRET-v1;
+        #   作用域受限 add   -> 索引 2 条(a.txt / b.txt), 泄漏 **0** 条。
+        # 收紧掉的正是那 4 条**未跟踪**路径(含 2 条仓外内容)。
+        #
+        # 作用域取 git 自己「已跟踪」视图里的三类路径(见 _merge_add_scope)。
+        # 「已跟踪却指向仓外」那种由**上面那道 escaping_links 防线**挡 ——
+        # 它在本行之前跑, 已实测会在有联接时拒绝(同文档 A 段)。这里不复制第二份判定。
+        #
+        # ⚠ **代价, 必须说清楚, 不许粉饰**: 这**改变了 test_f06_guard.py T3 的前提**。
+        #   T3「反向对照: 关掉防线, 必须真的泄漏」把「commit_merge 只有
+        #   escaping_links 一道防线」写成了判据: 它装上 no-op 防线后断言
+        #   **不拒绝**且**真的泄漏**。现在这条路上有第二道(本处的作用域受限 add),
+        #   所以 no-op 防线下不再泄漏, T3 的 `ck(lp and lc, ...)` 会**红**。
+        #   那是 T3 的**前提过时**(它要证明的是「T1 的判据可证伪」, 而 T1 依然可证伪:
+        #   防线在位时 A 段实测确实拒绝), 不是产品行为变坏。
+        #   改 T3 是下一条线的事, 本轮不碰它 —— 但本轮**不能**假装 T3 还绿。
+        scope = self._merge_add_scope()
+        if scope:
+            self.git.run(["add", "--"] + scope)
+
         p = self.git.run(["commit", "-m", text], check=False, binary=True)
         if p.returncode != 0:
             raise ConflictError(
