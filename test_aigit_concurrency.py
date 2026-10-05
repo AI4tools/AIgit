@@ -716,10 +716,28 @@ class Inject(object):
 # ════════════════════════════════════════════════════════ 并发驱动
 
 def _path_label(a, kw):
-    """从一个请求的 (self, ...) 里挖出路径, 让人看得懂报表。"""
-    for x in a:
-        if isinstance(x, str) and x.startswith("/api/"):
-            return x
+    """从一个请求的 (self, ...) 里挖出接口路径, 让人看得懂报表。
+
+⚠⚠ 2026-10-05 **就地改正**。**原来这个函数在 `a` 里找 `/api/` 开头的字符串**
+(`for x in a: if isinstance(x, str) and x.startswith("/api/")`), 而
+`install_request(S.Handler, "do_POST", ...)` 包的是 `do_POST(self)` —— 位置
+参数里**只有 handler 实例**, 所以它对 do_POST **一律**返回 `"request"`,
+72 条请求全一个标签。后果实测过: C7 读到 48/72 时, 报表里**说不出是哪三个
+接口**(C7 的负载是 /api/stage、/api/history/amend、/api/conflict/resolve),
+因为它们的 label 一模一样。
+
+正确的取法是 `self.path` —— `BaseHTTPRequestHandler` 在解析请求行时就填好了。
+
+⚠ **这只改报表可读性, 不改任何判定**(下面两条是实测确认的, 不是推测):
+  * `analyze_requests` 只按 `req` 这个 ident 归因, **根本不读 label**;
+  * 全文**没有任何地方**拿 label 与 `"request"` 比较 —— 只有 `domain` 被断言。
+所以 `count_overlaps` / `analyze_requests` / `summarize_requests` 的取值一个都没变,
+变的是**报表和交叉样本里那几列字**。配套的阳性自检见 `analyze_requests` 末尾。
+"""
+    h = a[0] if a else None
+    p = getattr(h, "path", None)
+    if isinstance(p, str) and p.startswith("/api/"):
+        return p
     return "request"
 
 
@@ -851,6 +869,19 @@ def analyze_requests(recs):
                     "own_ids": [g["ident"] for g in own],
                     "inter_ids": [g["ident"] for g in other],
                     "domains": sorted(set(g["domain"] for g in own))})
+    # ⚠ **阳性自检**(2026-10-05 加): 量具自己要证明会响。
+    #   少了这一条, `_path_label` 静默退化成全 "request" 时**没有任何判据会红** ——
+    #   而那种情况下报表里的接口归属是**假的**(不是「没插队」, 是「说不出是谁」)。
+    #   判据: **至少有一条**请求的 label 不是 "request"。
+    #   先断言两侧非空再比: 断言 out 非空, 否则下面这个量恒 0 是「没测到」。
+    assert out, "自检失败: analyze_requests 收到 0 条服务端请求 —— 探针没框到东西"
+    labeled = [q for q in out if q["label"] != "request"]
+    ck(labeled,
+       "自检失败: %d/%d 条请求的 label 全是 'request' —— 探针取不到接口路径"
+       "(见 :%d _path_label, 它只能从 handler 的 self.path 取)。"
+       "⚠ 这**不是**「没插队」, 是「说不出是哪条请求插的队」: 报表里的接口"
+       "归属是假的。别把这个量读成插队数。"
+       % (len(out) - len(labeled), len(out), 718))
     return out
 
 
@@ -1967,12 +1998,16 @@ def t_c3_checkout_commit():
           summ["requests_interleavable"]))
     # 复现上面那三行归因的探针(私有 TEMP, 不进仓, 用完即删):
     #   照抄本用例的 Sandbox/Server/run_ops/探针安装, 只多两件事:
-    #     a) install_request 的标签函数换成从 `self.path` 取接口路径
-    #        —— T._path_label(:629) 只在位置参数里找 `/api/` 开头的字符串,
-    #        而 do_POST(self) 只有 handler 实例, 所以它对 do_POST **一律**
-    #        返回 "request", 72 条全一个标签, 说不出是谁插的队。
-    #        换标签**不改变** inter 的定义: analyze_requests(:727-729)
-    #        只看 req 这个 ident, 根本不看 label。
+    #     a) ~~install_request 的标签函数换成从 `self.path` 取接口路径~~
+    #        **2026-10-05 已做**(用户授权, 条件是变异与台账一起重跑)。
+    #        原 `_path_label` 只在**位置参数**里找 `/api/` 开头的字符串, 而
+    #        `do_POST(self)` 的位置参数里只有 handler 实例 ⇒ 它对 do_POST
+    #        **一律**返回 "request", 72 条全一个标签, 说不出是谁插的队。
+    #        改成读 handler 的 `self.path` 之后, 报表里每个接口各归各的。
+    #        ⚠ 前提是**实测确认**它不改判定: `analyze_requests` 只按 `req` 这个
+    #        ident 归因、不读 label, 全文也没有拿 label 与 "request" 比较的地方
+    #        (只有 domain 被断言)。配套的阳性自检加在 `analyze_requests` 末尾 ——
+    #        少了它, 这个退化是**静默**的, 没有任何判据会红。
     #     b) 把 inter 拆成两种成因:
     #        真非原子 = 别人的 span 满足 own[0].t0 < other.t0 且 other.t1 < own[-1].t1;
     #        仅仅包含 = 别人的整段落在本请求 HTTP 窗口内, 但本请求自己的
