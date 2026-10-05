@@ -49,7 +49,12 @@ CATALOG = [
     Mutation(
         id="S-discard-pin-plain-off",
         target="server.py",
-        edits=[Edit("if p.reparse():",
+        # 跨行锚点(2026-10-04 修): 48a0c94 起 server.py 里 'if p.reparse():'
+        # 有 2 处 —— 本条的 _assert_pinned_plain, 和 stage_everything_safely 的
+        # 另一道。带上后两行上下文消歧, 把目标钉在 _assert_pinned_plain。
+        edits=[Edit('if p.reparse():\n'
+                    'raise GitError(\n'
+                    '"路径上有目录联接/符号链接,已拒绝动手:%s"',
                     "if p.reparse():",
                     "if False:")],
         probe="assert_pinned_plain",
@@ -64,9 +69,15 @@ CATALOG = [
     Mutation(
         id="S-checkout-branchexists-off",
         target="server.py",
-        edits=[Edit("check=False).returncode != 0:",
+        # 2026-10-04 修: render_new() 做的是**整行替换**, 而目标行是多行
+        # self._run_full([...]) 的第 2 行; 旧 new 只有片段, 会把整行替成
+        # 'check=False).returncode == 0:' -> SyntaxError(MUTANT-UNLOADABLE)。
+        # 同时 48a0c94 起该片段在 server.py 有 2 处(checkout 的分支存在性闸 /
+        # _index_delta 的 HEAD 存在性), 故锚点用整行 + 下一行消歧。
+        edits=[Edit('"refs/heads/" + name], check=False).returncode != 0:\n'
+                    'raise GitError("分支不存在,已拒绝 checkout:%s"',
                     "check=False).returncode != 0:",
-                    "check=False).returncode == 0:")],
+                    '"refs/heads/" + name], check=False).returncode == 0:')],
         probe="checkout_exists",
         guard_class="safety",
         why="checkout 的「必须是已存在的本地分支」闸:短 sha 会把仓切到游离 HEAD",
@@ -94,9 +105,12 @@ CATALOG = [
     Mutation(
         id="S-resolve-gitdir-off",
         target="server.py",
-        edits=[Edit('.lower() == ".git":',
+        # 2026-10-04 修: 旧 new 只有片段, 整行替换后 server.py:594 变成
+        # '        .lower() == ".git-never":' (丢了 if ... parts[0] 前缀)
+        # -> SyntaxError(MUTANT-UNLOADABLE)。补全整行。
+        edits=[Edit('if p.relative_to(self.root).parts[0].lower() == ".git":',
                     '.lower() == ".git":',
-                    '.lower() == ".git-never":')],
+                    'if p.relative_to(self.root).parts[0].lower() == ".git-never":')],
         probe="resolve_git",
         guard_class="safety",
         why=".git 目录保护失效:discard('.git') 直删版本库",

@@ -175,8 +175,17 @@ def sig(k, v):
 
 def mkjunction(link, target):
     """mklink /J 是 cmd 内建, 必须经 cmd /c。路径全 ASCII(沙盒在 TEMP 下)。"""
+    # mklink 是 cmd 内建, 成功/失败信息是**本地化文本**(本机 CP936/GBK)。
+    # text=True 若用 utf-8 严格解码, GBK 字节会在 subprocess 的 _readerthread
+    # 里抛 UnicodeDecodeError —— 那条 traceback 落在本探针的 stderr 上,
+    # 被 classify_probe_stderr 归成 UNCLASSIFIED -> PROBE-BROKEN -> ENGINE-ERROR,
+    # 于是一条**签名完全有效**的变异被误判为「引擎坏了」, 整轮不可归档
+    # (2026-10-04 实测 S-commit-leak-guard-off, EXITCODE=5)。
+    # 这是**测量工具**的 bug, 不是被测程序/变异体的错: 对照(未变异)探针也会触发。
+    # 显式 errors="replace" 让本地化字节降级为 U+FFFD, 不再炸读线程。
     r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     return r.returncode == 0
 
 def mkrepo():
@@ -419,7 +428,12 @@ d, g = mkrepo()
 c = conflicts.ConflictResolver(d)
 raised = 0
 try:
-    c._abs("../evil.txt")
+    # 用**仓内** .. (sub/../a.txt), 不用 ../evil.txt:
+    # 后者会被 _abs 的第 3 道守卫(resolve()+relative_to(root))冗余兜底,
+    # 于是变异体与对照签名都 raised=1 —— 探针无法隔离被变异的那道
+    # ('..' in Path(rel).parts), 会把一次真落地记成假 PROBE-NOOP。
+    # 仓内 .. 只有第 2 道守卫会拦; 关掉它才观测得到 raised 1->0。
+    c._abs("sub/../a.txt")
 except conflicts.ConflictError:
     raised = 1
 sig("raised", raised)
@@ -580,7 +594,8 @@ console.log("less=" + (esc('a<b').indexOf('&lt;') >= 0 ? 1 : 0));
     t = tempfile.mkdtemp()
     f = os.path.join(t, "e.js")
     io.open(f, "w", encoding="utf-8", newline="\n").write(js)
-    p = subprocess.run([node, f], capture_output=True, text=True)
+    p = subprocess.run([node, f], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     for l in p.stdout.splitlines():
         if l.strip():
             print("SIG " + l.strip())
@@ -609,7 +624,8 @@ console.log("sq=" + (esc("a'b").indexOf('&#39;') >= 0 ? 1 : 0));
     t = tempfile.mkdtemp()
     f = os.path.join(t, "e.js")
     io.open(f, "w", encoding="utf-8", newline="\n").write(js)
-    p = subprocess.run([node, f], capture_output=True, text=True)
+    p = subprocess.run([node, f], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     for l in p.stdout.splitlines():
         if l.strip():
             print("SIG " + l.strip())
@@ -739,8 +755,13 @@ SUITE_PARSERS = {
         "no_fail_field": True,
     },
     "test_aigit_web.py": {
+        # 2026-10-04 修: 旧 nm 取 \S+ 只拿到层号(L1..L4), 同一层里多个用例
+        # (如 L3 的 F-04 有两个失败子断言)会被 dedup 合并成一个 -> cases 的
+        # 失败数(1)对不上 summary 声称的(2) -> 假 VOID/SUMMARY-CASE-MISMATCH
+        # (整轮 EXITCODE=3)。实测同一份日志旧口径 PASS 41->4, FAIL 2->1;
+        # 该套件的用例身份 = 状态后**整段描述**, 故 nm 取到行尾。
         "cases": [_case(re.compile(r"^\[(?P<st>PASS|FAIL|WARN|SKIP)\s*\]\s+"
-                                   r"(?P<nm>\S+)\s+(?P<rest>.+?)\s*$"),
+                                   r"(?P<nm>.+?)\s*$"),
                         {"PASS": "pass", "FAIL": "fail", "WARN": "warn",
                          "SKIP": "skip"})],
         "summary": re.compile(r"汇总:(?P<pass>\d+) PASS / (?P<fail>\d+) FAIL / "
@@ -943,7 +964,7 @@ DEFAULT_BASE_REF = "HEAD"
 def resolve_base_ref(ref):
     """把 ref 解析成完整 40 位 sha。解析不出来直接抛,不许静默退回默认值。"""
     p = subprocess.run(["git", "-C", HERE, "rev-parse", "--verify", "%s^{commit}" % ref],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, errors="replace")
     if p.returncode != 0:
         raise RuntimeError("--base-ref %r 不是一个可解析的提交: %s"
                            % (ref, (p.stderr or "").strip()))

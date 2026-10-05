@@ -338,6 +338,89 @@ def _argv_label(a):
     return "?"
 
 
+def same_actor(a, b):
+    """这两条 span 是不是**同一个执行者**(同一个线程)?
+
+    ## 2026-10-04: 这里原来写的是 `a["ident"] == b["ident"]`, 而那是死代码
+
+    `Probe._open` 的 ident 是全局递增号(`_CNT[0] += 1`), 每条 span 独一份,
+    所以两条不同 span 的 ident 永不相等 ⇒ 那条豁免**一次都没执行过**。
+    实测证据(diag_c0_deadguard.py): /api/stage 负载 THR=6 RND=8 下
+    repo 域时间相交 96 对, 其中「ident 相等」的 **0 对**、「thread 相等」96 对、
+    **跨线程 0 对** —— 也就是那 96 对全是**同一个线程自己的嵌套取锁**,
+    而互斥一点没坏。
+
+    ## 为什么豁免本来就该有
+
+    这条判据声称量的是「同一把锁内**并发**的重叠」。一个线程持可重入锁取两次
+    (`status()` 里的 `with self._lock:` → `_run_full()` 里的 `with self._lock:`),
+    两条 span 时间上互相包含, 但**同一个线程不可能与自己并发** —— 那是嵌套。
+    把嵌套算成互斥违反, 判据量的东西就和它声称的不一样了。
+
+    ## 身份为什么是 (tid, 名字) 而不是 req 或光名字
+
+    * `req` 不能单独用: 探针也记不在任何请求里的 span(服务端启动等), 那时 req
+      是 None, 两条都 None 会被错当同一实体;
+    * 名字不够: `ThreadingHTTPServer` 的处理线程名会重复;
+    * 判据的语义是「有没有两个**执行者**同时在临界区」, 执行者就是线程。
+
+    判据是不是被放宽过头了, 由 C0 第 0 步的阳性对照回答(见 `_selfcheck_same_actor`):
+    跨线程重叠必须**仍然**被算成重叠, 线程名相同但 tid 不同也算。
+    """
+    return (a.get("tid"), a["thread"]) == (b.get("tid"), b["thread"])
+
+
+def _selfcheck_same_actor():
+    """`count_overlaps` 的阳性对照/阴性对照, 纯内存, 每次 C0 必跑。
+
+    没有它, 那条豁免可以宽到「一律不算」而 C0 第 1 步照样绿 —— 那就是空壳闸门。
+    四个方向:
+      (a) 同线程嵌套        -> 必须**不**算重叠
+      (b) 跨线程重叠        -> 必须算重叠          <- 区分力
+      (c) 名字相同 tid 不同 -> 必须算重叠          <- 证明没拿名字当身份
+      (d) 漏关检查仍在      -> t1=None 必须仍然被拒
+    """
+    base = time.perf_counter()
+
+    def span(tid, thread, t0, t1, ident, domain="repo"):
+        return {"domain": domain, "ident": ident, "thread": thread, "tid": tid,
+                "label": "git-" + ident, "req": None,
+                "t0": base + t0, "t1": base + t1}
+
+    p, _ = count_overlaps([span(1, "T0", 0.0, 1.0, "1"),
+                           span(1, "T0", 0.2, 0.5, "2")], ("repo",))
+    ck_eq(p, 0, "(a) 同一线程的嵌套必须不算重叠 —— 这正是本次修的那条豁免")
+
+    p, samp = count_overlaps([span(1, "T0", 0.0, 1.0, "1"),
+                              span(2, "T1", 0.2, 0.5, "2")], ("repo",))
+    ck_eq(p, 1, "(b) 不同线程的临界区重叠必须仍被算成 1 对,实际 %d —— "
+                "豁免放宽过头了, 这条判据已经量不出并发" % p)
+    ck_eq(len(samp), 1, "(b) 应当给出 1 个样例")
+
+    p, _ = count_overlaps([span(1, "T0", 0.0, 1.0, "1"),
+                           span(2, "T0", 0.2, 0.5, "2")], ("repo",))
+    ck_eq(p, 1, "(c) 线程名相同但 tid 不同必须仍算重叠 —— 不许拿名字当身份")
+
+    dangling = [span(1, "T0", 0.0, 1.0, "1")]
+    dangling[0]["t1"] = None
+    raised = None
+    try:
+        count_overlaps([dangling[0], span(2, "T1", 0.2, 0.5, "2")], ("repo",))
+    except Fail as e:
+        raised = e
+    # ⚠ 判据消息里那句原文是「探针漏关了 %d 条临界区(从未退出)」——
+    #   **不含 "t1=None" 这个子串**。第一版我拿 "t1=None" 去认, 结果认不出,
+    #   走进 `raise` 又抛出去, C0 于是 0.0s 就 FAIL(实测 t33)。
+    #   教训: 认一条异常靠**它消息里真实存在的字样**, 不靠我记忆里的措辞。
+    ck(raised is not None,
+       "(d) 有 t1=None 的 span 时 count_overlaps 必须报错 —— "
+       "漏关的 span 会被过滤掉, 于是报出「重叠 0」, "
+       "那是「没量到」不是「量到了没有」")
+    ck("漏关" in str(raised) and "从未退出" in str(raised),
+       "(d) 报错消息要能让人看出是「漏关」, 实际拿到 %r" % str(raised))
+    return {"nested": 0, "cross_thread": 1, "same_name_diff_tid": 1}
+
+
 def count_overlaps(recs, domains=None):
     """同域/跨域的临界区重叠对数。扫线法, O(n·并发度)。
 
@@ -358,7 +441,7 @@ def count_overlaps(recs, domains=None):
         while active and active[0][0] <= r["t0"]:
             heapq.heappop(active)
         for _, other in active:
-            if other["ident"] == r["ident"]:
+            if same_actor(other, r):
                 continue
             pairs += 1
             if len(samples) < 6:
@@ -395,6 +478,12 @@ class Probe(object):
             tid = "%d" % _CNT[0]
             self.recs.append({"domain": domain, "ident": tid,
                               "thread": threading.current_thread().name,
+                              # ⚠ 2026-10-04 新增: **线程身份**。count_overlaps 的
+                              # 同一性豁免要靠它区分「同一执行者的嵌套」与
+                              # 「两个执行者真的同时在临界区」。原来只有 thread
+                              # (名字), 而 ThreadingHTTPServer 的处理线程名会重复,
+                              # 光靠名字不唯一。名字保留, 报告里还要给人看。
+                              "tid": threading.get_ident(),
                               "label": getattr(self.tl, "label", domain),
                               "req": getattr(self.tl, "req", None),
                               "t0": time.perf_counter(), "t1": None})
@@ -718,18 +807,49 @@ def run_ops(n_threads, n_rounds, body, name="op", barrier_each_round=True,
 
 
 def analyze_requests(recs):
-    """以**服务端请求**为单位归因: 它自己发了几条 git、期间有没有被别人插队。"""
+    """以**服务端请求**为单位归因: 它自己发了几条 git、期间有没有被别人插队。
+
+    🔴 `interleaved` 的口径 **2026-10-04 就地改正**。旧口径测错了东西:
+
+        other = 别人的 git span 整段落在我这个请求的 **HTTP 窗口** [q.t0, q.t1] 内
+
+    它把「别人的整段操作恰好落在我等锁的这段时间里」也算成插队 —— 那是**锁竞争的
+    正常结果, 不是原子性缺口**。实测后果(2026-10-04): 产品改到「每个请求真非原子 = 0」
+    之后该量**仍 53~56/72**; 而把 HTTP 请求整段串行化能消掉它, 却会打红 C0
+    (注入空锁后同域重叠必须 > 0)。**判据之间自相矛盾, 按旧口径在并发下不可能为真。**
+
+    正确口径是**本文件 `:1661` 早就写明的判别式**:
+
+        「别人的 span 落在本请求自己首尾两条临界区**之间**才算」
+
+    落地: 别人的 git span 与窗口 [我第一条临界区起点, 我最后一条临界区终点] **相交**即算,
+    且本请求必须**自己发过 >= 2 条 git** —— own==1 时窗口退化成零宽、结构上没有缝可插。
+    (旧注释 `:1668-1670` 记的「own=1 的那 13/15 是假插队」就是这条。)
+
+    ⚠ 口径变了, 分母也必须跟着变, 所以 `summarize_requests` 同时给出
+    `requests_interleavable` = **有资格被插队的请求数(own>=2)**。
+    **断言前必须先确认它非空**, 否则这个量恒 0 是「没测到」而不是「没插队」。
+    """
     reqs = [r for r in recs if r["domain"] == "request" and r.get("t1") is not None]
     gits = [r for r in recs if r["domain"] != "request" and r.get("t1") is not None]
     out = []
     for q in reqs:
         rid = q["ident"]
         own = [g for g in gits if g.get("req") == rid]
-        other = [g for g in gits
-                 if g.get("req") != rid and g["t0"] >= q["t0"] and g["t1"] <= q["t1"]]
+        other = []
+        if len(own) >= 2:
+            lo = min(g["t0"] for g in own)
+            hi = max(g["t1"] for g in own)
+            other = [g for g in gits
+                     if g.get("req") != rid and g["t0"] < hi and g["t1"] > lo]
         out.append({"id": rid, "label": q["label"], "thread": q["thread"],
                     "ms": round((q["t1"] - q["t0"]) * 1000, 1),
                     "git_calls": len(own), "interleaved": len(other),
+                    "interleavable": 1 if len(own) >= 2 else 0,
+                    # 带上 span 身份: 只记个数的话, 「反假阳性」那条断言无从下手
+                    # —— 得能指着具体哪条 span 说它同时属于我和别人。
+                    "own_ids": [g["ident"] for g in own],
+                    "inter_ids": [g["ident"] for g in other],
                     "domains": sorted(set(g["domain"] for g in own))})
     return out
 
@@ -744,6 +864,9 @@ def summarize_requests(reqs):
             "requests_with_1_git": hist.get(1, 0),
             "requests_multi_git": sum(v for k, v in hist.items() if k >= 2),
             "requests_interleaved": sum(1 for r in reqs if r["interleaved"]),
+             # 口径改正配套: 有资格被插队的请求数(own>=2)。
+             # **断言前必须先确认它非空**, 否则该量恒 0 是「没测到」不是「没插队」。
+             "requests_interleavable": sum(1 for r in reqs if r.get("interleavable")),
             "domains_seen": sorted(set(d for r in reqs for d in r["domains"]))}
 
 
@@ -980,6 +1103,14 @@ def t_c0_calibrate():
     out = {}
     THR, RND = 6, 8
 
+    # ---- 第 0 步: 判据自检(纯内存, 不过服务器) ----
+    # ⚠ 这一步在 2026-10-04 加的, 因为 count_overlaps 的同一性豁免刚被修过
+    #   (见 same_actor 的注释: 原来那条 ident 判据是死代码)。修完必须先证明
+    #   「豁免只豁免同一执行者」, 否则第 1 步那个 ==0 可以靠「一律不算」骗过去。
+    sc = _selfcheck_same_actor()
+    say("[C0] 判据自检: 同线程嵌套=%d / 跨线程=%d / 同名不同 tid=%d"
+        % (sc["nested"], sc["cross_thread"], sc["same_name_diff_tid"]))
+
     # ---- 第 1 步: 不注入, 同一把锁内不该有重叠 ----
     sb = fx_basic(Sandbox("c0a"))
     with Server(sb, "c0a") as srv:
@@ -1045,6 +1176,144 @@ def t_c0_calibrate():
     RESULTS.append({"test": "C0-calibrate-table", "ops": 0, "verdict": "OK",
                     "detail": table})
     print("\n  ---- C0 探针自检(注入必红 / 不注入必绿)----")
+    for r in table:
+        print("   %s" % (r,))
+# ════════════════════════════════════════════════════════ C0B 插队判据的阳性对照
+#
+# 为什么必须单开一条: 2026-10-04 `analyze_requests` 的 `interleaved` **换了口径**
+# —— 从「别人的整段落在我这个请求的 HTTP 窗口内」改成「别人的 span 与我自己的
+# 首尾两条临界区窗口相交, 且我发过 >=2 条 git」。**换过口径的判据必须重新证明
+# 它有牙**, 否则就是造了一个不会失败的闸门。
+#
+# ## 三行对照, 两行判定
+#
+#   行                     并发度  注入空锁   判什么
+#   ------------------------------------------------------------------
+#   必绿                    1       否        interleaved **必须** 0, 且 eligible > 0
+#   必红                    6       是        interleaved **必须** > 0
+#   (只报数, 不判定)         6       否        产品真实水平, 由 C3/C7 去判
+#
+# ⚠ 为什么不拿第三行跟第二行比大小: 2026-10-04 实测第三行已经是 49/50 ——
+#   **基线本身顶在上限**, 「注入 > 不注入」只剩 50>49 的侥幸, 跑满 50 就必翻。
+#   那是**天生 flaky 的闸门**, 比没有闸门更坏。所以判定只依赖前两行, 它们与
+#   「产品有多坏」**无关**, 只依赖判据能不能区分「没有并发」和「人为并发」。
+#
+# ⚠ 三步都先验分母 requests_interleavable > 0: 分母为空时读数恒 0,
+#   那是「没测到」不是「没插队」。两件事必须分开, 所以先验分母再验读数。
+#
+# ⚠ 另有一条**反假阳性**断言: 被算成插队的那些 span, 一条都不许与「我自己」的
+#   任何 span 相交。同一把互斥锁下这在逻辑上不可能 —— 一旦发生, 要么判据在数
+#   「等锁时间」(本文件 :374-377 记过那个坑: 量方法体会把等锁算成临界区),
+#   要么锁根本不互斥。两种情况下 interleaved 都不可采信。
+#
+# ⚠ 负载是**照抄** C3 的 body, 不抽公共 helper —— 故意不共用:
+#   校准要的是一份**独立测量**; 共用 helper 等于「用被判据自己的代码证明自己」。
+
+
+@test("C0B", "interleaved-criterion",
+      "插队判据换口径后的阳性对照: 并发度1 必为0 / 注入空锁 必非0")
+def t_c0b_interleaved_criterion():
+    RND = 12
+
+    def one(tag, thr, inject):
+        sb = fx_basic(Sandbox(tag))
+        with Server(sb, tag) as srv:
+            pr = Probe()
+            import server as S
+            pr.install_label(S.Repo, "_run_full")
+            if inject:
+                pr.inject_noop_lock(srv.mod.REPO, "_lock", "repo")   # ← 注入点
+            else:
+                pr.install_lock(srv.mod.REPO, "_lock", "repo")
+            pr.install_request(S.Handler, "do_POST", _path_label)
+            pr.install_request(S.Handler, "do_GET", _path_label)
+            try:
+                def body(t, r):
+                    if t % 3 == 0:
+                        return srv.post("/api/checkout", {"name": "feature"})
+                    if t % 3 == 1:
+                        return srv.post("/api/branch", {"name": "side%d" % t})
+                    for i in range(N_W):
+                        sb.write("w/f%02d.txt" % i, "by T%d r%d\n" % (t, r))
+                    return srv.post("/api/commit",
+                                    {"message": "commit T%d r%d" % (t, r)})
+                ops, el, _ = run_ops(thr, RND, body, "checkout|branch|commit")
+                reqs = analyze_requests(pr.recs)
+                summ = summarize_requests(reqs)
+            finally:
+                pr.remove()
+            # 撤干净 = 属性换回真锁(不是 recs 清空 —— recs 后面还要用来打报表)
+            ck(not isinstance(srv.mod.REPO._lock, (TracingLock, NoopLock)),
+               "探针/injection 没撤干净: REPO._lock 还是 %s"
+               % type(srv.mod.REPO._lock).__name__)
+        summ["_thr"] = thr
+        summ["_inject"] = 1 if inject else 0
+        summ["_ops"] = len(ops)
+        summ["_elapsed_s"] = round(el, 1)
+        return summ, reqs
+
+    def row(name, s):
+        return [name, s["_thr"], "是" if s["_inject"] else "否",
+                s["requests_interleavable"], s["requests_interleaved"],
+                s["requests"], s["git_call_histogram"], s["_elapsed_s"]]
+
+    solo, solo_recs = one("c0b_solo", 1, False)     # 必绿那一步
+    inj, inj_recs = one("c0b_inj", 6, True)        # 必红那一步
+    real, real_recs = one("c0b_real", 6, False)     # 只报数
+
+    table = [["场景", "并发度", "注入空锁", "有资格(own>=2)", "被插队",
+              "全部请求", "git 条数分布", "耗时s"],
+             row("必绿: 只有一个请求在跑", solo),
+             row("必红: 注入空锁内核", inj),
+             row("实测: 产品原样(只报数)", real)]
+    out = {"table": table,
+           "solo_eligible": solo["requests_interleavable"],
+           "solo_interleaved": solo["requests_interleaved"],
+           "injected_eligible": inj["requests_interleavable"],
+           "injected_interleaved": inj["requests_interleaved"],
+           "real_eligible": real["requests_interleavable"],
+           "real_interleaved": real["requests_interleaved"]}
+    say("[C0B] 校准表:")
+    for r in table:
+        say("      %s" % (r,))
+    RESULTS.append({"test": "C0B-interleaved-criterion", "ops": 0,
+                    "verdict": "OK", "detail": out})
+
+    # ---- 三步都先验分母: 分母为空时读数恒 0, 是「没测到」而不是「没插队」 ----
+    for tag, s in (("并发度1", solo), ("注入空锁", inj), ("产品原样", real)):
+        ck(s["requests_interleavable"] > 0,
+           "【自检失败】%s 那一行 requests_interleavable=0 —— 没有任何请求发过 "
+           "2 条以上 git, 换过口径的插队判据在这次运行里**根本没测到东西**, "
+           "对照无意义。git 条数分布 %r" % (tag, s["git_call_histogram"]))
+    # ---- 反假阳性: 被算成插队的 span 一条都不许与「我自己」的 span 相交 ----
+    # 同一把互斥锁下这在逻辑上不可能。真发生了只有两种可能, 两种都让
+    # interleaved 不可采信: (a) 判据在数「等锁时间」而不是临界区
+    #     (本文件 :374-377 记过那个坑: 量方法体会把等锁算成临界区);
+    #     (b) 那把锁根本不互斥。
+    # 注入空锁那一步**不在此列** —— 那把锁本来就被换成不互斥的了, 有交集是应当的。
+    for tag, rs in (("并发度1", solo_recs), ("产品原样", real_recs)):
+        bp = [(r["id"], i) for r in rs
+              for i in r.get("inter_ids", []) if i in r.get("own_ids", [])]
+        ck(not bp,
+           "【自检失败】%s 那一行: 有 %d 条被算成插队的 span 同时也属于它自己那个"
+           "请求, 例 %r —— 同一把 Repo._lock 下这在逻辑上不可能。说明判据把"
+           "「等锁时间」当成了临界区, 或者那把锁根本不互斥; 两种情况下 "
+           "requests_interleaved 都不可采信。" % (tag, len(bp), bp[:4]))
+
+    # ---- 必绿: 并发度 1 时不可能有别的请求插队 ----
+    ck_eq(solo["requests_interleaved"], 0,
+          "并发度=1 时 requests_interleaved 必须是 0"
+          "(只有一个请求在跑, 没有「别人」可插; 实测 %d/%d)"
+          % (solo["requests_interleaved"], solo["requests_interleavable"]))
+
+    # ---- 必红: 注入空锁内核之后必须非 0 ----
+    ck(inj["requests_interleaved"] > 0,
+       "【自检失败】把 Repo._lock 的内核换成空锁、并发度=6 之后, "
+       "requests_interleaved 仍然是 0(分母 %d)—— 换过口径的插队判据"
+       "**抓不住人为造出来的竞争**, 它是空转的, C3/C7 里那条判据也就跟着空转。"
+       % inj["requests_interleavable"])
+
+    print("\n  ---- C0B 插队判据阳性对照(并发度1 必为0 / 注入空锁 必非0)----")
     for r in table:
         print("   %s" % (r,))
     return out
@@ -1648,28 +1917,54 @@ def t_c3_checkout_commit():
     # 判据 2: 非原子 —— 一次请求被另一个请求插过队
     ck(summ["requests_multi_git"] > 0,
        "自检失败: 没有一个请求跨越 2 条以上 git 命令(%r)" % summ)
+    ck(summ["requests_interleavable"] > 0,
+       "自检失败: requests_interleavable=0 —— 没有任何请求发过 2 条以上 git, "
+       "此时 requests_interleaved 恒为 0 是**没测到**, 不是**没插队**。%r" % summ)
     ck(not inter,
-       "【操作不是原子的】%d/%d 个请求在自己的临界区里被别的请求插过队"
-       "(git 命令条数分布 %r)。"
-       "⚠⚠ 下面这句解释写于 commit() 修复**之前**, 现在**已经不成立**, "
-       "照它去查 commit() 会白跑:"
-       "「一次 commit = add -A + commit, 锁只包住其中一条」—— "
-       "现在的 commit() **整段持同一把 Repo._lock**(server.py:1312), "
-       "校验→暂存→核对索引→commit 全在里面, 实测 commit 请求自己的临界区"
-       "11~12 条全落在这一次取锁之内(外层一条包着里面 8~9 条)。"
-       "残留的插队**全部在 commit() 之外**, 实测归因(复现办法见文末, "
-       "判别式: 别人的 span 落在本请求自己首尾两条临界区**之间**才算):"
-       "  1) Repo.checkout() 的 show-ref 与 checkout 是**两次独立取锁**"
-       "(server.py:1348 与 1351), 中间有 900~1100ms 的锁等待缝 —— "
-       "实测 24/24 个 /api/checkout 真非原子。这是 verify-then-act TOCTOU。"
-       "  2) /api/commit 的 handler 尾巴在 commit() **释放锁之后**又取了一次锁"
-       "做 `REPO.status()`(server.py:1758-1759), 缝宽 130~610ms —— "
-       "实测 23/24 真非原子。后果是响应里的 status 可能不是自己那次提交的。"
-       "  3) /api/branch 判据报的 15/24 里只有 2 个是真的: 另 13 个请求"
-       "自己只发 1 条 git(own=1), **结构上没有缝隙可插**, 是"
-       "「别人的整段操作恰好落在本请求的 HTTP 窗口之内」被算成了插队 —— "
-       "本判据的 inter 口径分不开这两种成因, 它比它声称的粗。"
-       % (inter, summ["requests"], summ["git_call_histogram"]))
+       "【操作不是原子的】%d/%d 个**有资格**的请求(own>=2, 口径见 analyze_requests)"
+       "在自己的首尾两条临界区之间被别的请求插过队"
+       "(全部请求 %d 个, git 命令条数分布 %r)。"
+       "⚠ 本消息里凡是标「已修复」的, 都是 2026-10-04 修掉的**产品缺陷**。"
+       "四处都修完了。修之前 C3 读 48~49/50, **每修一处单独量一次**(逐处读数见本"
+       "函数末尾的注释), 最后读到上面这个数。**别把下面当现状读。**"
+       "  1) ✅已修复 Repo.checkout() 的 show-ref 与 checkout 原是**两次独立取锁**,"
+       "中间有 900~1100ms 的缝 —— 那是 verify-then-act TOCTOU(别的请求可以在"
+       "缝里把分支删掉)。修法: 两条 git 包进**同一次**持锁, 现在在 server.py:1472,"
+       "show-ref 在 :1473-1474、checkout 在 :1476。修后实测 checkout 的外层"
+       "持锁 span 把两条 git **包在一起**, 中间无缝。"
+       "  2) ✅已修复 status() **自身**的两次独立取锁: `git status`(修前 :653)与"
+       "`_head_branch()`(修前 :668) 各取一次锁、中间没有外层持锁包着。打点实测"
+       "那道缝最宽 **1578 ms**, 内容是 status() 在**等锁**(那时别的请求正持锁"
+       "跑 commit)。修法: 两条 git 包进同一次持锁, 现在在 :668 —— `git status` "
+       "在 :669-670、`_head_branch()` 在 :671。修完 1) 读 26/50, 修完这条读 5/50。"
+       "⚠ 这一条修之前在本消息里被写成「**已知例外, 不是缺陷**, 待裁定要不要为它"
+       "也合并持锁」(理由是 status() 只读、拆成两次取锁不造成危害)。裁定下来要"
+       "合并, 于是它现在也是缺陷, 已修 —— 那句「已知例外」已作废, 别再引用。"
+       "  3) ✅已修复 /api/commit 的 handler 尾巴原在 commit() **释放锁之后**"
+       "又取一次锁做 `REPO.status()`(修前 server.py:1758-1759), 后果是响应里的"
+       "status 可能不是自己那次提交。修法: 新增 `Repo.commit_and_status()`"
+       "(server.py:1387), commit+status 在同一次持锁里做完, handler 改走它"
+       "(server.py:1907)。修后 commit 请求的插队数**归零**。"
+       "  4) ✅已修复 /api/checkout 与 /api/branch 的**同一道尾巴缝**。checkout()"
+       "原子之后, handler 仍在它释放锁之后才去取 status 的锁。打点实测"
+       "(diag_residual.py, THR=6 RND=12): 修完 1)+2) 之后 C3 剩下的 26 条里"
+       "**24 条是 /api/checkout、2 条是 /api/branch**, 缝宽 1.2~1.4s, 位置在"
+       "操作自己干完(+57~114ms)之后、自己的 status() 开始之前。修法: 新增"
+       "`Repo.checkout_and_status()`(:1413)与 `Repo.new_branch_and_status()`"
+       "(:1433), handler 改走它们(:1914 / :1917)。"
+       "⚠ 这三个(加上 :1387 那个)都走 `Repo._status_quiet()`(:1364), 别拆掉 —— 拆了"
+       "等于把 E3 兜底(已做完的操作不许报成失败、否则客户端会重试做两遍)拆掉,"
+       "而那条防线在 2026-10-04 之前**零测试覆盖**(test_aigit.py 的 E3 用例是"
+       "这轮才加的)。"
+       "  5) ⚠ 旧口径(按 HTTP 窗口算插队)多报过一批**假的**: /api/branch 里"
+       "另 13 个请求自己只发 1 条 git(own=1), **结构上没有缝隙可插**, 是"
+       "「别人的整段操作恰好落在本请求的 HTTP 窗口之内」被算成了插队。"
+       "**那个口径 2026-10-04 已就地改正**(见 analyze_requests), own=1 的请求"
+       "不再有插队资格。本次运行 own=1 的有 %d 个(一个都没被算进来); 分母 %d "
+       "是 own>=2 的请求数。"
+       % (inter, summ["requests_interleavable"], summ["requests"],
+          summ["git_call_histogram"], summ["requests_with_1_git"],
+          summ["requests_interleavable"]))
     # 复现上面那三行归因的探针(私有 TEMP, 不进仓, 用完即删):
     #   照抄本用例的 Sandbox/Server/run_ops/探针安装, 只多两件事:
     #     a) install_request 的标签函数换成从 `self.path` 取接口路径
@@ -1682,13 +1977,28 @@ def t_c3_checkout_commit():
     #        真非原子 = 别人的 span 满足 own[0].t0 < other.t0 且 other.t1 < own[-1].t1;
     #        仅仅包含 = 别人的整段落在本请求 HTTP 窗口内, 但本请求自己的
     #                    临界区一条都没被切开(own 只有 1 条时**必然**如此)。
-    #   实测(72 请求): 判据 inter 63, 真非原子 49; 拆分后
-    #     /api/checkout 判 24 / 真 24 (own=4, 缝在 show-ref↔checkout)
+    #   ⚠ 下面这组数是 **2026-10-04 修 server.py 之前**的归因结果, 留作对照。
+    #      **修之后**的数字见上面消息里的 1)~4), 别把这里当现状。
+    #   修前实测(72 请求, 旧口径 inter 63): 真非原子 49; 拆分后
+    #     /api/checkout 判 24 / 真 24 (own=4, 缝在 show-ref↔checkout)  ✅已修
     #     /api/commit  判 24 / 真 23 (own=11~12, 缝在 commit↔status↔symbolic-ref,
-    #                              全在 commit() 释放锁**之后**)
+    #                              全在 commit() 释放锁**之后**)          ✅已修
     #     /api/branch  判 15 / 真  2 (own=1 的 22 条结构上不可能真非原子)
-    #   对照: 把 commit() 换回旧的两步版(先扫 + 裸 add -A), inter 63 vs 65,
-    #         git span 220 vs 400 —— 同一量级, 说明 commit() 的修复对这条**无影响**。
+    #   修后**逐处**单独量(每次只改一处就跑 `-k C3`, 不是四处改完才量):
+    #     修 1) checkout 的两条 git 合并持锁 → C3 48~49/50 → **26/50**
+    #     修 2) status 的两条 git 合并持锁   → 26/50 → **5/50**
+    #     修 3) commit_and_status            → commit 那 24 条**归零**
+    #     修 4) checkout_and_status + new_branch_and_status → **0/72**
+    #   hist 每档 +1 = 每处新加的那次外层持锁(TracingLock 每次 __enter__ 记一条)。
+    #   分母 50 → **72**: own=1 的请求从 22 个变成 0 个(实测)。也就是说**判据变严
+    #   了 22 条**, 结果仍然读 0 —— 分母变大不是放水。
+    #   ⚠ 是**哪几个接口**从 own=1 变过来的 —— **未查清**: 探针的 label 全是
+    #     "request"(已知限制), 而 diag_fingerprint.py 用的「own 窗口里第一个 POST
+    #     标记」这个启发式不可信(排队请求的窗口互相重叠, 它把 /api/checkout 标成
+    #     own=13/14, 那是 commit 的指纹)。不编解释。
+    #   ⚠ 另有一处**未查清**: 修 2) 之后, diag_residual.py 在**同一份代码**上读到
+    #     interleaved **26**, 而 `-k C3` 读到 **5**, 而两者的 own 直方图**逐字
+    #     相同**。这与台账 §20.5 记的 26-vs-3 同类, 根因仍未查明(见 §21.6)。
     if cls["git_lock"]:
         raise Flaky("git 锁冲突 %d/%d" % (len(cls["git_lock"]), len(ops)),
                     rate=len(cls["git_lock"]) / float(len(ops)))
@@ -1999,10 +2309,14 @@ def t_c7_lock_domains():
        "样例(域,git 子命令)x(域,git 子命令): %r"
        % (cross, "同域 conflicts 重叠 %d 次(锁有效)。" % per["conflicts"],
           per["repo"], per["history"], per["conflicts"], xsamp[:4]))
+    ck(summ["requests_interleavable"] > 0,
+       "自检失败: requests_interleavable=0 —— 没有请求发过 2 条以上 git, "
+       "该量恒 0 是**没测到**。%r" % summ)
     ck(not summ["requests_interleaved"],
-       "【操作不是原子的】%d/%d 个请求在自己的临界区里被别的请求插过队"
-       "(每个请求发出的 git 命令条数分布 %r)"
-       % (summ["requests_interleaved"], summ["requests"], summ["git_call_histogram"]))
+       "【操作不是原子的】%d/%d 个**有资格**的请求(own>=2)在自己的首尾两条临界区"
+       "之间被别的请求插过队(全部请求 %d 个, git 条数分布 %r)"
+       % (summ["requests_interleaved"], summ["requests_interleavable"],
+          summ["requests"], summ["git_call_histogram"]))
     return None
 
 

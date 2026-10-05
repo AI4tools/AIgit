@@ -649,8 +649,26 @@ class Repo:
         return "(no branch)"
 
     def status(self):
-        """返回三段状态:已暂存 / 未暂存 / 冲突。"""
-        out = self._run(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        """返回三段状态:已暂存 / 未暂存 / 冲突。
+
+        两条 git(`status` 与 `_head_branch()`)**包进同一次持锁**(2026-10-04 修)。
+        修前它们各取一次锁、中间没有外层持锁包着, 别的请求能在那道缝里插队 ——
+        打点实测那道缝最宽 **1578 ms**(是 status() 在**等锁**, 那期间别的请求
+        正持锁跑 commit), 并发判据 C3 因此读 26/50。修完 commit/checkout 已原子,
+        这道缝是 C3 剩下的**唯一**来源(见 doc 台账 §20.3)。
+
+        `self._lock` 是 RLock(repolock.py:97 `threading.RLock()`), 同线程嵌套取锁
+        安全 —— `_run_full():497` 内部还会各自再取一次(实测同线程二次 acquire
+        **0.0000 s**), 而锁被本线程持有时别的线程仍然拿不到(实测正确互斥)。
+        形状与 `commit()` / `checkout()` / `commit_and_status()` 一致, 不是新花样。
+
+        ⚠ 持锁范围只包这两条 git, 不包下面的解析 —— 解析是纯计算, 别把 CPU 时间
+          算进锁里。
+        """
+        with self._lock:
+            out = self._run(["status", "--porcelain=v1", "-z",
+                             "--untracked-files=all"])
+            branch = self._head_branch()
         staged, unstaged, conflicted = [], [], []
         for x, y, path in self.porcelain_z_parse(out):
             if x == "?" and y == "?":
@@ -665,7 +683,6 @@ class Repo:
             if x == "U" or y == "U" or (x == "A" and y == "A") or (x == "D" and y == "D"):
                 conflicted.append({"path": path, "status": "U"})
 
-        branch = self._head_branch()
         staged_paths = [i["path"] for i in staged]
         return {
             "branch": branch,
@@ -1344,6 +1361,88 @@ class Repo:
                        % (len(skipped), ", ".join(skipped[:5]), out))
             return out
 
+    def _status_quiet(self):
+        """在**当前这次持锁里**取 status; **取不到就返回 (None, 异常) 而不是抛**。
+
+        ## 为什么 status 取不到不能抛(E3, `_ok_with_status` 的注释是原始记录)
+
+        每个 POST 结尾都要报 status, 所以只要 status() 抛错, 一个**已经做完**的
+        操作就会被报成 400; 客户端拿到 400 的标准反应就是重试 —— 于是同一个破坏性
+        操作被执行两次(stage 两次、commit 两次)。这是 E3 里最严重的一面。
+
+        ⚠ 2026-10-04 修: 上一版的 `commit_and_status` 直接 `return self.commit(m),
+          self.status()`, status() 一抛就**穿过**了 `_ok_with_status()` 的
+          try/except —— 等于把这条防线对 /api/commit 拆掉了。**那是我引入的回归。**
+          现在兜底下沉到这里, 三个 `*_and_status` 都走它。
+
+        返回 (st, None) 成功 / (None, 异常) 失败, 由调用方决定怎么报。
+        `self._lock` 是 RLock, 同线程嵌套取锁安全(repolock.py:97,
+        实测同线程二次 acquire 0.0000 s)。
+        """
+        try:
+            return self.status(), None
+        except Exception as e:
+            return None, e
+
+    def commit_and_status(self, message):
+        """commit + status 在**同一次持锁**里做完(2026-10-04 新增)。
+
+        ## 为什么需要它
+
+        handler 原来是这么写的:
+
+            out = REPO.commit(msg or "")
+            return self._json({"ok": True, "output": out, **REPO.status()})
+
+        `commit()` 释放锁之后又调 `REPO.status()`, 而 `status()` 自己还要**再取
+        一次**锁(status() 里 `git status` 与 `_head_branch()` 各一次)。
+        中间那道缝的后果是具体的: **响应里的 status 可能不是自己那次提交的** ——
+        别的请求可以在缝里提交或改工作区。C3 实测 23/24 个 /api/commit 真非原子。
+
+        ## 为什么是新增方法而不是在 handler 里 `with REPO._lock:`
+
+        handler 里碰 `REPO._lock` 的先例是 **0 处**。锁住在 `Repo` 内部, 是这个
+        文件一贯的形状; 破一次封装就留一个「后来的人照抄」的口子。新增方法是
+        加法, `commit()` 本身的签名与语义一个字没动。
+        """
+        with self._lock:
+            out = self.commit(message)
+            st, err = self._status_quiet()
+        return out, st, err
+
+    def checkout_and_status(self, name):
+        """checkout + status 在**同一次持锁**里做完(2026-10-04 新增)。
+
+        与 `commit_and_status` 同构。修的是同一类缝的另一处:
+        `checkout()` 释放锁之后 handler 再调 `REPO.status()` 取一次锁,
+        而 checkout 的响应里那份 status 会因此**不是自己这次 checkout 之后的**
+        状态 —— 别的请求可以在缝里提交或改工作区。
+
+        打点实测(diag_residual.py, THR=6 RND=12): 修之前 C3 剩下的插队
+        **24/26 条是这个接口**, 缝宽 1.2~1.4 s, 位置在 checkout 自己的活干完
+        (+57~114 ms)之后、status() 开始之前。
+
+        `checkout()` 本身在 2026-10-04 已经是原子的(show-ref 与 checkout 已包进
+        同一次持锁); 这里补的是它**之后**的那道缝。
+        """
+        with self._lock:
+            out = self.checkout(name)
+            st, err = self._status_quiet()
+        return out, st, err
+
+    def new_branch_and_status(self, name):
+        """new_branch + status 在**同一次持锁**里做完(2026-10-04 新增)。
+
+        与上面两个同构。`new_branch()` 只有一条 git(checkout -b), 它自己本来就
+        原子; 缝在它释放锁之后 handler 再取一次锁做 status() 那一步。
+        打点实测里它只占 2/26 条(大部分 /api/branch 请求因为分支已存在而失败,
+        own=1 被判据正确排除), 但结构一样就一起修 —— 留着就是「已知还有一处」。
+        """
+        with self._lock:
+            out = self.new_branch(name)
+            st, err = self._status_quiet()
+        return out, st, err
+
     def checkout(self, name):
         check_branch_name(name)
         # 白名单只挡住了**选项**那一半。哈希前缀那一半它挡不住:
@@ -1359,10 +1458,22 @@ class Repo:
         # /api/checkout 的语义是**切分支**, 那就只接受已存在的本地分支。
         # show-ref --verify 只认 refs/heads/<name> 真的存在, 不做任何 rev 解析,
         # 所以短 sha / 标签 / HEAD@{1} 都不会被它认成分支。
-        if self._run_full(["show-ref", "--verify", "--quiet",
-                           "refs/heads/" + name], check=False).returncode != 0:
-            raise GitError("分支不存在,已拒绝 checkout:%s" % name)
-        self._run(["checkout", name])
+        # ⚠ 2026-10-04 修(判据 C3 实测 24/24 个 /api/checkout 真非原子):
+        # 下面这两条 git **原来各取一次锁** —— `show-ref` 释放之后、`checkout`
+        # 之前有一道 900~1100ms 的缝, 别的请求可以在缝里把那个分支删掉或改名。
+        # 于是「我刚确认过它存在」这个前提在真正 checkout 时已经不成立,
+        # 这是标准的 verify-then-act TOCTOU。
+        # 合成**同一次持锁**之后, 中间不再有缝, 判据量到的正是这个。
+        #
+        # `self._lock` 是 RLock(repolock.py:97 `threading.RLock()`), 同线程嵌套
+        # 取锁安全 —— 这与 `commit()` / `reset()` 已有的用法是同一个模式,
+        # 不是新引入的用法。server.py:478-483 记着「实测嵌套 97 次,
+        # 换普通 Lock 每次都自死锁」。
+        with self._lock:
+            if self._run_full(["show-ref", "--verify", "--quiet",
+                               "refs/heads/" + name], check=False).returncode != 0:
+                raise GitError("分支不存在,已拒绝 checkout:%s" % name)
+            self._run(["checkout", name])
 
     def new_branch(self, name):
         check_branch_name(name)
@@ -1484,6 +1595,11 @@ REPO: Repo = None
 WEB: Path = None
 
 
+# 「没传 status」与「传了 None(= 取过但取不到)」的区分标记。
+# 用 None 当缺省会撞车, 撞了就等于把 E3 兜底又拆一次(见 `_ok_with_status` 的注释)。
+_STATUS_UNSET = object()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1527,7 +1643,7 @@ class Handler(BaseHTTPRequestHandler):
     def _q(self):
         return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
 
-    def _ok_with_status(self):
+    def _ok_with_status(self, st=_STATUS_UNSET, err=None):
         """操作成功之后的响应。**取不到 status 时不能报失败**(E3)。
 
         这是 E3 的一般形态, 不只是「未出生 HEAD」那一种: 每个 POST 结尾都要
@@ -1538,16 +1654,32 @@ class Handler(BaseHTTPRequestHandler):
         根因(E3 本身)已经修在 `Repo._head_branch`: 三种 HEAD 状态都报得出来。
         这一层是防线: 万一将来 status() 又因为别的原因失败, 宁可回一个
         明确标注「状态取不到」的 200, 也不要把已完成的动作报成失败。
+
+        ## `st` 参数(2026-10-04)
+
+        传进来的是「**已经取好的** status」—— `/api/commit` / `/api/checkout` /
+        `/api/branch` 现在走 `Repo.*_and_status()`, 那里 status 是在操作的同一次
+        持锁里取的, 所以这里不能再取第二次(那会把刚消掉的缝又打开)。
+
+        ⚠ 三态必须区分, 不能拿 `None` 当缺省:
+          * `st` 省略(`_STATUS_UNSET`)→ 本方法自己去取(原有调用点只有一处);
+          * `st is None` 且 `err` 有值 → **取过, 取不到** → 走 E3 兜底回 200;
+          * `st` 是 dict → 正常报。
+          用 None 当缺省会撞车: `_status_quiet()` 取不到时返回的正是 None,
+          而 `st=None` 必须走兜底、不能被当成「没传」而再去取一次。
         """
-        try:
-            st = REPO.status()
-        except Exception as e:
+        if st is _STATUS_UNSET:
+            try:
+                st, err = REPO.status(), None
+            except Exception as e:
+                st, err = None, e
+        if err is not None:
             return self._json({"ok": True,
                                "branch": None,
                                "staged": [], "unstaged": [], "conflicted": [],
                                "hasStaged": False,
                                "root": str(REPO.root),
-                               "statusError": "%s: %s" % (type(e).__name__, e)},
+                               "statusError": "%s: %s" % (type(err).__name__, err)},
                               200)
         return self._json({"ok": True, **st}, 200)
 
@@ -1769,12 +1901,21 @@ class Handler(BaseHTTPRequestHandler):
                 if msg is not None and not isinstance(msg, str):
                     raise GitError("message 必须是字符串,收到 %s"
                                    % type(msg).__name__)
-                out = REPO.commit(msg or "")
-                return self._json({"ok": True, "output": out, **REPO.status()})
+                # ⚠ 2026-10-04 修(判据 C3 实测 23/24 真非原子): 原来 commit()
+                # 释放锁之后又调 REPO.status() 取一次锁, 中间那道缝会让**响应里的
+                # status 可能不是自己那次提交的**。合成一次持锁, 缝就没了。
+                out, st, err = REPO.commit_and_status(msg or "")
+                return self._ok_with_status(st, err)   # **必须**走这条, E3 兜底在里头
             elif path == "/api/checkout":
-                REPO.checkout(b.get("name", ""))
+                # ⚠ 2026-10-04 修(与上面 commit 同构): 原来先 checkout(释放锁)
+                # 再由下面的 `return self._ok_with_status()` 取一次锁做 status,
+                # 中间那道缝让**响应里的 status 可能不是自己这次 checkout 之后的**。
+                # 打点实测那 1.2~1.4s 的缝就在这里(§20.3)。
+                _, st, err = REPO.checkout_and_status(b.get("name", ""))
+                return self._ok_with_status(st, err)
             elif path == "/api/branch":
-                REPO.new_branch(b.get("name", ""))
+                _, st, err = REPO.new_branch_and_status(b.get("name", ""))
+                return self._ok_with_status(st, err)
             elif path == "/api/merge":
                 # ok 必须来自 merge 自己: 外层硬编码 ok:True 会把「合并出冲突」
                 # 这类结果盖成成功, 前端就没法靠 ok 判断成败了。

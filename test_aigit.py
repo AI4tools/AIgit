@@ -887,6 +887,257 @@ def t_c4(ctx):
     ck_eq(code, 400, "discard 含已跟踪文件的目录期望 400(或至少不删已跟踪文件)")
 
 
+@test("C", "commit-escape-link-rejected", bug="B6-crit-commitpath")
+def t_commit_escape_rejected(ctx):
+    """仓内存在指向仓外的目录联接时, commit **必须被拒**, 且错误要点名那个联接。
+
+    ## 为什么单开一条(这是本轮实测出来的缺口, 不是推测)
+
+    `server.py:997 escaping_links()` 这道闸**就是为提交路径写的** ——
+    `server.py:1000-1010` 记着它的来由: 仓内放一个指向仓外的目录联接后,
+    裸 `git add -A` 会被 git **穿过**它, 把仓外文件**复制**进对象库,
+    `git show HEAD:escape/leak.txt` 直接读得出内容, 而且永远留在历史里、随 push 走。
+
+    既有覆盖只到一半: `t_b6`(:566) 测的是「**显式请求** escape/leak.txt 被 400 拒掉」,
+    `t_c4b`(:890) 测的是 discard。**提交路径一条断言都没有。**
+
+    实测确认(2026-10-04, 探针脚本先量后写断言, 不猜):
+        HTTP code = 400 ; ok = False ;
+        error 含完整逃逸路径 `...\\repo\\escape -> ...\\outside`;
+        `ls-tree HEAD` 里没有 escape/leak.txt ; HEAD 未动 ; a.txt 的改动仍在。
+
+    ## 这条为什么能杀掉 `S-commit-leak-guard-off`
+
+    该变异把 `leaks = self.escaping_links()` 换成 `leaks = []`(server.py:1327),
+    于是 commit 不再拒收 —— 改由 `stage_everything_safely` 静默跳过联接
+    (server.py:1012-1014 说这是**另一道**独立防线, 所以仓外内容仍不会进历史)。
+    变异下: 断言 1 / 2 / 4 **都会红**。而变异探针 `commit_leak`
+    (mutation_runner.py:296-319) 本来就观察到 `raised` 从 1 变 0,
+    说明这个变异**是可观测的、不是等价变异体** —— 缺的只是一条断言。
+
+    ⚠ 造不出联接就 SKIP 并写清原因, **不许假装测过**(本机 os.symlink 无
+    SeCreateSymbolicLinkPrivilege, 退化用 `mklink /J`; 两条都造不出才 SKIP)。
+    """
+    outside = os.path.join(TESTROOT, "_outside_commit_escape")
+    shutil.rmtree(outside, ignore_errors=True)
+    os.makedirs(outside, exist_ok=True)
+    with io.open(os.path.join(outside, "leak.txt"), "w", encoding="utf-8") as f:
+        f.write("TOP SECRET\n")
+    canary = os.path.join(outside, "canary.txt")
+    with io.open(canary, "w", encoding="utf-8") as f:
+        f.write("KEEP")
+    r = ctx.repo
+    r.write("a.txt", "base\n")
+    r.commit("c1")
+    head_before = r.out("rev-parse", "HEAD").strip()
+
+    link = os.path.join(r.dir, "escape")
+    made = None
+    try:
+        os.symlink(outside, link)
+        made = "symlink"
+    except OSError:
+        subprocess.run(["cmd", "/c", "mklink", "/J", link, outside],
+                       capture_output=True, timeout=30)
+        if os.path.exists(link):
+            made = "junction"
+    if not made:
+        raise Skip("本机造不出符号链接/目录联接, commit 逃逸这条未能实测")
+    ctx.note("联接类型=%s  %s -> %s" % (made, link, outside))
+    try:
+        r.write("a.txt", "changed-by-escape\n")
+        code, j = ctx.srv.jpost("/api/commit", {"message": "must be rejected"})
+        err = str(j.get("error") or "")
+        ctx.note("commit(仓内有逃逸联接) -> %s  ok=%r  error=%r" % (code, j.get("ok"), err[:140]))
+
+        # 断言 1: 必须拒收
+        ck_eq(code, 400, "仓内有指向仓外的联接时 commit 应 400 拒收")
+        ck(j.get("ok") is False, "ok 应为 false, 实际 %r" % (j.get("ok"),))
+        # 断言 2: 错误必须点名那个联接 —— 只有 escaping_links 给得出这种人话。
+        #         少了这一条, 变异体 S-commit-leak-guard-off 就能活下来。
+        ck("仓外" in err, "错误没说明是仓外链接: %r" % err[:140])
+        ck("escape" in err, "错误没点名那个逃逸联接(只见 %r) —— 这条正是为了杀 "
+                            "S-commit-leak-guard-off 而写的" % err[:140])
+        # 断言 3: 本体危害 —— 仓外内容绝不能进历史(由 stage_everything_safely 兜底)
+        ls = r.out("ls-tree", "-r", "--name-only", "HEAD")
+        ck("escape/leak.txt" not in ls,
+           "仓外文件进了历史: %r" % [x for x in ls.splitlines() if "escape" in x][:4])
+        # 断言 4: 拒收必须是干净的拒收 —— HEAD 不动、合法改动不丢
+        ck_eq(r.out("rev-parse", "HEAD").strip(), head_before,
+              "提交被拒了 HEAD 却动了 —— 出现了部分提交")
+        ck_eq(r.read("a.txt"), "changed-by-escape\n", "工作区的合法改动被吞了")
+        ck(os.path.exists(canary), "仓库外的 canary 没了 —— 清理穿透了联接")
+    finally:
+        # 显式拆联接: os.rmdir 删的是**联接本身**, 不会碰目标目录。
+        # 兜底用的 —— TestRepo 的 rmtree 在 Python 3.11 上本来就能穿透联接,
+        # 但这条测试主动去造联接, 自己收尾才算有交代。
+        try:
+            os.rmdir(link)
+        except OSError:
+            pass
+
+
+@test("E3", "status-fail-still-200", bug="E3-retry-x2")
+def t_e3_status_fail_still_200(ctx):
+    """status 取不到时, **已经做完的操作必须回 200**, 且操作确实生效了。
+
+    ## 这条为什么存在(2026-10-04 实测出来的缺口, 不是推测)
+
+    grep 全部 `test_*.py`: `statusError` 命中 **0 处**、`E3` 命中 **0 处** ——
+    E3 兜底此前**零覆盖**。而我这一轮给 /api/commit 加 `commit_and_status()` 时
+    写成 `return self.commit(m), self.status()`, status() 一抛就穿过了
+    `_ok_with_status()` 的 try/except。**那个回归 59/59 全绿一次都没抓到。**
+
+    E3 的语义不是「回 200」, 是「**操作已经做完了, 不许把它报成失败**」——
+    因为客户端拿到 400 的标准反应就是重试(stage 两次、commit 两次)。
+    所以本条断言的重点是第 2 组: status 失败时**提交照样进历史**。
+
+    ## 覆盖不到的地方(如实标出, 不假装测过)
+
+    `HeadlessServer` 起的是 **server.py 子进程**, 测试进程猴补不到它的
+    `Repo.status`。所以本条走**进程内**(`import server as S` + 直接构造
+    `Repo`/`Handler`), 验的是 `_status_quiet` / 三个 `*_and_status` /
+    `_ok_with_status` 这三层逻辑; **handler 那三行分支的 HTTP 端到端没被本条覆盖**
+    (那是子进程里的事)。别把本条 PASS 读成「HTTP 路径也验过了」。
+    """
+    sys.path.insert(0, AIGIT)
+    sys.modules.pop("server", None)
+    import server as S
+    import pathlib
+
+    r = ctx.repo
+    r.write("e3.txt", "one\n")
+    r.commit("e3 base")
+    r.git("branch", "e3target")
+
+    saved_status = S.Repo.status
+    saved_repo_global = getattr(S, "REPO", None)
+    had_repo_global = hasattr(S, "REPO")
+
+    def boom(self):
+        raise RuntimeError("注入: status 挂了(E3 兜底要接住的正是这个)")
+
+    def mk_handler():
+        h = S.Handler.__new__(S.Handler)      # 不走 __init__: 不起 socket
+        h._json = lambda payload, code=200: (code, payload)
+        return h
+
+    try:
+        # ── 1) _status_quiet 不抛, 且把异常带出来 ──────────────────
+        repo = S.Repo(pathlib.Path(r.dir))
+        S.Repo.status = boom
+        st, err = repo._status_quiet()
+        ck_eq(st, None, "status 失败时 _status_quiet 的第一个返回值")
+        ck(err is not None, "_status_quiet 没把异常带出来")
+        ck("status 挂了" in str(err), "_status_quiet 带出来的不是注入的那个异常")
+        ctx.note("_status_quiet: status 失败 -> 返回 (None, %s), 没有抛" % type(err).__name__)
+
+        # ── 2) 三个 *_and_status: status 失败时**操作照样生效**(E3 的核心) ──
+        n_before = len(r.out("log", "--format=%H").split())
+        r.write("e3.txt", "two\n")
+        out, st, err = repo.commit_and_status("e3 status broken")
+        n_after = len(r.out("log", "--format=%H").split())
+        ck_eq(n_after, n_before + 1,
+              "status 失败时 commit 竟然没生效 —— 这不是 E3 要的兜底, 是操作失败了")
+        ck(st is None and err is not None,
+           "commit_and_status 在 status 失败时该返回 (…, None, 异常)")
+        ctx.note("commit_and_status: status 挂了, 提交仍进历史 %d -> %d"
+                 % (n_before, n_after))
+
+        r.git("checkout", "e3target")
+        _, st, err = repo.checkout_and_status("main")
+        ck_eq(r.out("rev-parse", "--abbrev-ref", "HEAD").strip(), "main",
+              "status 失败时 checkout 竟然没生效")
+        ck(st is None and err is not None, "checkout_and_status 的兜底形状不对")
+        ctx.note("checkout_and_status: status 挂了, 分支仍切到 main")
+
+        _, st, err = repo.new_branch_and_status("e3made")
+        ck_eq(r.out("rev-parse", "--abbrev-ref", "HEAD").strip(), "e3made",
+              "status 失败时 new_branch 竟然没生效")
+        ck(st is None and err is not None, "new_branch_and_status 的兜底形状不对")
+        ctx.note("new_branch_and_status: status 挂了, 分支仍建成 e3made")
+
+        # ── 3) _ok_with_status 三态 ─────────────────────────────────
+        S.REPO = repo
+        h = mk_handler()
+
+        code, body = h._ok_with_status(None, RuntimeError("注入的失败"))
+        ck_eq(code, 200, "status 取不到时 HTTP 码必须是 200(E3)")
+        ck_eq(body.get("ok"), True, "E3 兜底的 ok 必须是 True")
+        ck("statusError" in body, "E3 兜底必须标出 statusError")
+        ck("注入的失败" in body["statusError"], "statusError 里没有真正的失败原因")
+        ctx.note("_ok_with_status(None, err) -> 200 + statusError=%r"
+                 % body["statusError"][:60])
+
+        code, body = h._ok_with_status()
+        ck_eq(code, 200, "省略 st 时 status 失败也必须 200")
+        ck("statusError" in body, "省略 st 的路径丢了 E3 兜底")
+        ctx.note("_ok_with_status() 省略 st -> 200 + statusError(兜底在)")
+
+        # ── 4) 反假阳性: status 正常时**不许**出现 statusError ────────
+        S.Repo.status = saved_status
+        code, body = h._ok_with_status()
+        ck_eq(code, 200, "status 正常时也要 200")
+        ck("statusError" not in body,
+           "status 正常却带 statusError —— 这条闸门恒绿了(它可能在无脑注入)")
+        ck("branch" in body, "status 正常时响应里必须有 branch")
+
+        good = {"branch": "main", "staged": [], "unstaged": [],
+                "conflicted": [], "hasStaged": False, "root": r.dir}
+        code, body = h._ok_with_status(good)
+        ck_eq(code, 200, "传 dict 的那态也要 200")
+        ck_eq(body.get("branch"), "main", "传 dict 时 branch 必须原样带出去")
+        ck("statusError" not in body, "传 dict 时不该有 statusError")
+        ctx.note("_ok_with_status 三态全对; status 正常时无 statusError")
+
+        # ── 5) 阳性对照: 把兜底猴补回坏形状, E3 性质必须**不成立** ──
+        # ⚠ 猴补的对象是 **`_status_quiet`**, 不是 `status`。
+        #   第一版猴补了 `status`, 结果断言 1~4 照样全过、只有第 5 段红了 ——
+        #   因为坏形状是「`_status_quiet` 不再兜底、直接调 status()」, 而
+        #   monkeypatch 掉 status 只是换了一个被兜底捕获的异常源。
+        #   这条对照自己把第一版拦下来了, 说明它不是装饰。
+        saved_quiet = S.Repo._status_quiet
+
+        def quiet_bad(self):
+            # 我上一轮那个坏形状: 直接调 status(), 异常直接穿出去
+            return self.status(), None
+
+        S.Repo._status_quiet = quiet_bad
+        S.Repo.status = boom          # ⚠ 第 4 段把 status 恢复成了真身, 这里必须重新注入
+        r.write("e3.txt", "three\n")
+        raised = None
+        try:
+            repo.commit_and_status("injected control")
+        except Exception as e:
+            raised = e
+        finally:
+            S.Repo._status_quiet = saved_quiet
+        ck(raised is not None,
+           "阳性对照失效: 猴补回『直接调 status()』之后居然没抛 —— "
+           "说明本条断言测不到 E3 那条路, 是空壳闸门")
+        ck("status 挂了" in str(raised),
+           "阳性对照抛出来的不是注入的那个异常(测试自己有问题)")
+        n_ctl = len(r.out("log", "--format=%H").split())
+        ck_eq(n_ctl, n_after + 1,
+              "阳性对照里提交不该生效(操作会先失败)")
+        # 对照跑完必须把好形状放回去, 并证明它真的能用 —— 否则后面的读者
+        # 会以为这个进程里的 _status_quiet 一直是坏的
+        S.Repo.status = boom
+        st2, err2 = repo._status_quiet()
+        ck(st2 is None and err2 is not None, "恢复后的 _status_quiet 形状不对")
+        ctx.note("阳性对照: 猴补 _status_quiet 回坏形状 -> 异常确实穿出去(%s), "
+                 "提交未生效; 恢复后兜底重新生效" % type(raised).__name__)
+    finally:
+        S.Repo.status = saved_status
+        if had_repo_global:
+            S.REPO = saved_repo_global
+        else:
+            try:
+                del S.REPO
+            except Exception:
+                pass
+
+
 @test("C", "discard-dir-outside-untouched", bug="C12")
 def t_c4b(ctx):
     """C4b discard 目录时, 仓库外的东西一个都不能少。"""
