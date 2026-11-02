@@ -1,0 +1,705 @@
+{
+ "on": [
+  {
+   "path": "/api/health",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 0.9308000007877126,
+   "body": "{\"ok\": true, \"root\": \"C:\\\\Users\\\\Public\\\\tmp\\\\aigit_spawns_xufp7_b0\\\\root\", \"isRepo\": true}"
+  },
+  {
+   "path": "/api/status",
+   "code": 200,
+   "spawns": 2,
+   "cmds": [
+    "status",
+    "symbolic-ref"
+   ],
+   "ms": 90.72799999557901,
+   "body": "{\"ok\": true, \"branch\": \"main\", \"root\": \"C:\\\\Users\\\\Public\\\\tmp\\\\aigit_spawns_xufp7_b0\\\\root\", \"staged\": [], \"unstaged\": [], \"conflicted\": [], \"hasStaged\": false}"
+  },
+  {
+   "path": "/api/log?limit=30",
+   "code": 200,
+   "spawns": 1,
+   "cmds": [
+    "log"
+   ],
+   "ms": 47.263300002668984,
+   "body": "{\"ok\": true, \"log\": [{\"sha\": \"247114b8\", \"author\": \"aigit\", \"date\": \"2026-10-21\", \"subject\": \"init: sandbox\"}]}"
+  },
+  {
+   "path": "/api/log?limit=5",
+   "code": 200,
+   "spawns": 1,
+   "cmds": [
+    "log"
+   ],
+   "ms": 53.78319999726955,
+   "body": "{\"ok\": true, \"log\": [{\"sha\": \"247114b8\", \"author\": \"aigit\", \"date\": \"2026-10-21\", \"subject\": \"init: sandbox\"}]}"
+  },
+  {
+   "path": "/api/branches",
+   "code": 200,
+   "spawns": 1,
+   "cmds": [
+    "for-each-ref"
+   ],
+   "ms": 41.181099993991666,
+   "body": "{\"ok\": true, \"branches\": [{\"name\": \"main\", \"current\": true}]}"
+  },
+  {
+   "path": "/api/diff?file=README.md",
+   "code": 200,
+   "spawns": 1,
+   "cmds": [
+    "diff"
+   ],
+   "ms": 58.76820000412408,
+   "body": "{\"ok\": true, \"path\": \"README.md\", \"staged\": false, \"diff\": \"\"}"
+  },
+  {
+   "path": "/api/diff?file=README.md&staged=1",
+   "code": 200,
+   "spawns": 1,
+   "cmds": [
+    "diff"
+   ],
+   "ms": 54.21270000078948,
+   "body": "{\"ok\": true, \"path\": \"README.md\", \"staged\": true, \"diff\": \"\"}"
+  },
+  {
+   "path": "/api/file?file=README.md",
+   "code": 200,
+   "spawns": 1,
+   "cmds": [
+    "show"
+   ],
+   "ms": 46.7486000052304,
+   "body": "{\"ok\": true, \"path\": \"README.md\", \"old\": \"# aigit sandbox\\n\\n这是一个演练仓,可以随便删。\\n\", \"new\": \"# aigit sandbox\\n\\n这是一个演练仓,可以随便删。\\n\"}"
+  },
+  {
+   "path": "/api/conflict/state",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 270.6504000016139,
+   "body": "{\"ok\": true, \"inMerge\": false, \"mergeHead\": null, \"origHead\": null, \"head\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"currentBranch\": \"main\", \"branches\": [], \"defaultMessage\": \"\", \"mergeMsgPath\": \"C:\\\\Users\\\\Public\\\\tmp\\\\aigit_spawns_xufp7_b0\\\\root\\\\.git\\\\MERGE_MSG\", \"remaining\": 0, \"files\": []}"
+  },
+  {
+   "path": "/api/conflict/list",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 105.23620000458322,
+   "body": "{\"ok\": true, \"inMerge\": false, \"count\": 0, \"files\": []}"
+  },
+  {
+   "path": "/api/conflict/inspect?file=README.md",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 58.56159999530064,
+   "body": "{\"ok\": false, \"error\": \"该路径没有未合并的索引条目,不是冲突文件:README.md\"}"
+  },
+  {
+   "path": "/api/history/stashes",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 54.059599999163765,
+   "body": "[]"
+  },
+  {
+   "path": "/api/history/stash?index=0",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 62.67389999993611,
+   "body": "{\"ok\": false, \"error\": \"没有第 0 个 stash(共 0 个)\", \"code\": \"no_such_stash\"}"
+  },
+  {
+   "path": "/api/history/stash?index=0&stat=1",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 73.81809999787947,
+   "body": "{\"ok\": false, \"error\": \"没有第 0 个 stash(共 0 个)\", \"code\": \"no_such_stash\"}"
+  },
+  {
+   "path": "/api/history/reflog?limit=30",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 91.3250999947195,
+   "body": "[{\"index\": 0, \"sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"short\": \"247114b\", \"selector\": \"HEAD@{0}\", \"author\": \"aigit\", \"date\": \"2026-10-21 13:54:45 +0800\", \"action\": \"commit (initial): init: sandbox\"}]"
+  },
+  {
+   "path": "/api/history/reflog?limit=5",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 95.18360000220127,
+   "body": "[{\"index\": 0, \"sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"short\": \"247114b\", \"selector\": \"HEAD@{0}\", \"author\": \"aigit\", \"date\": \"2026-10-21 13:54:45 +0800\", \"action\": \"commit (initial): init: sandbox\"}]"
+  },
+  {
+   "path": "/api/history/tags",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 56.91320000187261,
+   "body": "[]"
+  },
+  {
+   "path": "/api/history/blame?file=README.md",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 95.69740000006277,
+   "body": "{\"ok\": true, \"path\": \"README.md\", \"count\": 3, \"requested_first\": 1, \"requested_end\": 3, \"first_line\": 1, \"last_line\": 3, \"total_lines\": 3, \"truncated\": false, \"next_line\": null, \"limit\": 500, \"lines\": [{\"line\": 1, \"sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"short\": \"247114b8\", \"author\": \"aigit\", \"author_email\": \"<aigit@localhost>\", \"time\": \"2026-10-21 13:54:45+0800\", \"summary\": \"init: sandbox\", \"filename\": \"README.md\", \"previous\": \"\", \"content\": \"# aigit sandbox\"}, {\"line\": 2, \"sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"short\": \"247114b8\", \"author\": \"aigit\", \"author_email\": \"<aigit@localhost>\", \"time\": \"2026-10-21 13:54:45+0800\", \"summary\": \"init: sandbox\", \"filename\": \"README.md\", \"previous\": \"\", \"content\": \"\"}, {\"line\": 3, \"sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"short\": \"247114b8\", \"author\": \"aigit\", \"author_email\": \"<aigit@localhost>\", \"time\": \"2026-10-21 13:54:45+0800\", \"summary\": \"init: sandbox\", \"filename\": \"README.md\", \"previous\": \"\", \"content\": \"这是一个演练仓,可以随便删。\"}]}"
+  },
+  {
+   "path": "/api/history/file?file=README.md",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 150.30700000352226,
+   "body": "{\"ok\": true, \"path\": \"README.md\", \"follow\": true, \"count\": 1, \"truncated\": false, \"commits\": [{\"sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"short\": \"247114b\", \"author\": \"aigit\", \"email\": \"aigit@localhost\", \"date\": \"2026-10-21 13:54:45 +0800\", \"subject\": \"init: sandbox\", \"parents\": [], \"files\": [{\"status\": \"A\", \"path\": \"README.md\", \"rename\": false}]}], \"exists_in_worktree\": true, \"tracked\": true}"
+  },
+  {
+   "path": "/api/history/plan/stash?message=p",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 45.77949999656994,
+   "body": "{\"ok\": false, \"error\": \"工作区是干净的,没有东西可以暂存。git stash 在这种情况下会直接报错(而不是塞一个空条目进 stash 列表),所以这里提前拦下。\", \"code\": \"nothing_to_stash\", \"dirty\": {\"staged\": [], \"unstaged\": [], \"untracked\": [], \"conflicted\": []}}"
+  },
+  {
+   "path": "/api/history/plan/stash-drop?index=0",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 57.403499995416496,
+   "body": "{\"ok\": false, \"error\": \"没有第 0 个 stash(共 0 个)\", \"code\": \"no_such_stash\"}"
+  },
+  {
+   "path": "/api/history/plan/amend?message=p",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 327.3597000006703,
+   "body": "{\"op\": \"amend\", \"safe\": false, \"warning\": \"没有已暂存的改动 —— 这次 amend 只能改提交信息,提交内容不会变。 本地看不到它被推送过(只查了本地远端跟踪分支,没有联网)。如果你已经推过,请先确认远端。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"old_sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"old_short\": \"247114b8\", \"old_subject\": \"init: sandbox\", \"new_message\": \"p\", \"message_changes\": true, \"dirty\": {\"staged\": [], \"unstaged\": [], \"untracked\": [], \"conflicted\": []}, \"published\": {\"published\": false, \"remotes\": [], \"note\": \"只检查本地已有的远端跟踪分支,没有联网查询。查不到不等于没推送过。\"}}"
+  },
+  {
+   "path": "/api/history/plan/undo-last-commit",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 426.8415999977151,
+   "body": "{\"op\": \"undo-last-commit\", \"safe\": false, \"warning\": \"保留改动:所有改动回到暂存区(index),工作区文件不动。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"target_sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"target_short\": \"247114b8\", \"target_subject\": \"init: sandbox\", \"mode\": \"soft\", \"parents\": 0, \"dirty\": {\"staged\": [], \"unstaged\": [], \"untracked\": [], \"conflicted\": []}, \"published\": {\"published\": false, \"remotes\": [], \"note\": \"只检查本地已有的远端跟踪分支,没有联网查询。查不到不等于没推送过。\"}, \"recoverable_via\": \"git reset --soft HEAD@{0}\"}"
+  },
+  {
+   "path": "/api/history/plan/undo-last-commit?drop_changes=1",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 379.68430000182707,
+   "body": "{\"op\": \"undo-last-commit\", \"safe\": false, \"warning\": \"**丢弃**这个提交的改动:reset --hard 之后工作区与该提交完全一致,提交里的内容就没了。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"target_sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"target_short\": \"247114b8\", \"target_subject\": \"init: sandbox\", \"mode\": \"hard\", \"parents\": 0, \"dirty\": {\"staged\": [], \"unstaged\": [], \"untracked\": [], \"conflicted\": []}, \"published\": {\"published\": false, \"remotes\": [], \"note\": \"只检查本地已有的远端跟踪分支,没有联网查询。查不到不等于没推送过。\"}, \"recoverable_via\": \"git reset --hard HEAD@{0}\", \"legacy_op\": \"undo-dropped\"}"
+  },
+  {
+   "path": "/api/history/plan/reflog-restore?index=0",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 195.47189999866532,
+   "body": "{\"op\": \"reflog-restore\", \"safe\": true, \"warning\": \"把 HEAD 移到 247114b(commit (initial): init: sandbox)。本次操作本身也会进 reflog,所以还能退回来,但别把 reflog 当保险箱 —— gc 之后就没了。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"target\": {\"index\": 0, \"sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"short\": \"247114b\", \"selector\": \"HEAD@{0}\", \"action\": \"commit (initial): init: sandbox\"}, \"mode\": \"soft\", \"head_now\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"legacy_op\": \"restore-from-reflog\"}"
+  },
+  {
+   "path": "/api/history/plan/reflog-restore?index=0&mode=hard",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 258.2698000042001,
+   "body": "{\"op\": \"reflog-restore\", \"safe\": false, \"warning\": \"把 HEAD 移到 247114b(commit (initial): init: sandbox)。mode=hard 会同时丢弃工作区未提交的改动。本次操作本身也会进 reflog,所以还能退回来,但别把 reflog 当保险箱 —— gc 之后就没了。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"target\": {\"index\": 0, \"sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"short\": \"247114b\", \"selector\": \"HEAD@{0}\", \"action\": \"commit (initial): init: sandbox\"}, \"mode\": \"hard\", \"head_now\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"legacy_op\": \"restore-from-reflog\"}"
+  },
+  {
+   "path": "/api/history/plan/revert?sha=HEAD",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 253.8289000003715,
+   "body": "{\"op\": \"revert\", \"safe\": true, \"warning\": \"revert 会新建一个反向提交,不改写任何历史 —— 撤销错了再 revert 一次就行。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"short\": \"247114b8\", \"subject\": \"init: sandbox\", \"parents\": [], \"is_merge\": false, \"mainline\": null}"
+  },
+  {
+   "path": "/api/history/plan/branch-rename?old=main&new=main2",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 249.52740000298945,
+   "body": "{\"op\": \"branch-rename\", \"safe\": false, \"warning\": \"main 是当前分支,改名会同时更新 HEAD 和上游配置。 main 还被别的 worktree 检出着,git 会拒绝改名;先在那个 worktree 里切走。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"old\": \"main\", \"new\": \"main2\", \"old_sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"legacy_op\": \"rename-branch\"}"
+  },
+  {
+   "path": "/api/history/plan/branch-delete?name=hotfix",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 50.681799999438226,
+   "body": "{\"ok\": false, \"error\": \"没有这个分支:hotfix\", \"code\": \"no_such_branch\"}"
+  },
+  {
+   "path": "/api/history/plan/tag-delete?name=v1",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 67.13180000224384,
+   "body": "{\"ok\": false, \"error\": \"没有这个标签:v1\", \"code\": \"no_such_tag\"}"
+  },
+  {
+   "path": "/api/reset/plan?mode=soft",
+   "code": 200,
+   "spawns": 1,
+   "cmds": [
+    "log"
+   ],
+   "ms": 51.4887000026647,
+   "body": "{\"ok\": true, \"op\": \"reset\", \"mode\": \"soft\", \"ref\": \"HEAD\", \"undone_commits\": [], \"note\": \"soft: 移动 HEAD 到 HEAD,改动留在暂存区,工作区不动\"}"
+  },
+  {
+   "path": "/api/reset/plan?mode=mixed",
+   "code": 200,
+   "spawns": 1,
+   "cmds": [
+    "log"
+   ],
+   "ms": 52.19420000503305,
+   "body": "{\"ok\": true, \"op\": \"reset\", \"mode\": \"mixed\", \"ref\": \"HEAD\", \"undone_commits\": [], \"note\": \"mixed: 移动 HEAD 到 HEAD,改动留在工作区(默认 git 行为)\"}"
+  },
+  {
+   "path": "/api/reset/plan?mode=hard",
+   "code": 200,
+   "spawns": 1,
+   "cmds": [
+    "log"
+   ],
+   "ms": 63.15650000033202,
+   "body": "{\"ok\": true, \"op\": \"reset\", \"mode\": \"hard\", \"ref\": \"HEAD\", \"undone_commits\": [], \"note\": \"hard: 未提交的改动将永久丢失;git clean -fd 会删掉所有未跟踪文件和目录\", \"warning\": \"未提交的改动将永久丢失\"}"
+  },
+  {
+   "path": "/api/discard/plan",
+   "code": 200,
+   "spawns": 2,
+   "cmds": [
+    "ls-files",
+    "ls-files"
+   ],
+   "ms": 101.77850000036415,
+   "body": "{\"ok\": true, \"op\": \"discard\", \"entries\": [], \"blocked\": [], \"untracked_total\": [], \"untracked_count\": 0, \"note\": \"action=restore 的丢的是**未提交的改动**; action=delete-* 的是 git 从没记过、删了就找不回的东西。\"}"
+  },
+  {
+   "path": "/api/discard/plan?files=README.md",
+   "code": 200,
+   "spawns": 2,
+   "cmds": [
+    "ls-files",
+    "ls-files"
+   ],
+   "ms": 99.34389999398263,
+   "body": "{\"ok\": true, \"op\": \"discard\", \"entries\": [{\"path\": \"README.md\", \"action\": \"restore\", \"detail\": \"已跟踪文件 -> 从 HEAD 恢复,改动丢失\"}], \"blocked\": [], \"untracked_total\": [], \"untracked_count\": 0, \"note\": \"action=restore 的丢的是**未提交的改动**; action=delete-* 的是 git 从没记过、删了就找不回的东西。\"}"
+  },
+  {
+   "path": "/api/remote/capability",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 2.323599997907877,
+   "body": "{\"ok\": true, \"op\": \"capability\", \"gate\": {\"level\": \"off\", \"source\": \"default\", \"env_var\": \"AIGIT_NET\", \"levels\": [\"off\", \"read\", \"write\"], \"allows_read\": false, \"allows_write\": false, \"read_ops\": [\"archive --exec\", \"archive --remote\", \"fetch\", \"fetch-pack\", \"ls-remote\", \"remote show\", \"remote update\", \"remote-ext\", \"remote-fd\"], \"write_ops\": [\"clone\", \"credential\", \"credential-cache\", \"credential-store\", \"daemon\", \"http-backend\", \"pull\", \"push\", \"receive-pack\", \"request-pull\", \"send-pack\", \"submodule\", \"upload-pack\"], \"local_verbs\": 55}}"
+  },
+  {
+   "path": "/api/remote/list",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 46.47510000359034,
+   "body": "{\"ok\": true, \"op\": \"remotes\", \"remotes\": [], \"gate\": {\"level\": \"off\", \"source\": \"default\", \"env_var\": \"AIGIT_NET\", \"levels\": [\"off\", \"read\", \"write\"], \"allows_read\": false, \"allows_write\": false, \"read_ops\": [\"archive --exec\", \"archive --remote\", \"fetch\", \"fetch-pack\", \"ls-remote\", \"remote show\", \"remote update\", \"remote-ext\", \"remote-fd\"], \"write_ops\": [\"clone\", \"credential\", \"credential-cache\", \"credential-store\", \"daemon\", \"http-backend\", \"pull\", \"push\", \"receive-pack\", \"request-pull\", \"send-pack\", \"submodule\", \"upload-pack\"], \"local_verbs\": 55}}"
+  },
+  {
+   "path": "/api/remote/heads?remote=origin",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 1.2416999961715192,
+   "body": "{\"ok\": false, \"error\": \"远程能力「read」当前是 **off**,拒绝执行(ls-remote)。aigit 默认不联网;要开就显式设 AIGIT_NET=read(本进程默认 default)。\", \"code\": \"net_disabled\", \"required\": \"read\", \"current\": \"off\", \"op\": \"ls-remote\"}"
+  },
+  {
+   "path": "/api/remote/heads?remote=upstream",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 12.13350000034552,
+   "body": "{\"ok\": false, \"error\": \"远程能力「read」当前是 **off**,拒绝执行(ls-remote)。aigit 默认不联网;要开就显式设 AIGIT_NET=read(本进程默认 default)。\", \"code\": \"net_disabled\", \"required\": \"read\", \"current\": \"off\", \"op\": \"ls-remote\"}"
+  },
+  {
+   "path": "/api/remote/ahead-behind?remote=origin",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 149.92050000000745,
+   "body": "{\"ok\": true, \"remote\": \"origin\", \"branch\": \"main\", \"basis\": \"本地没有 origin/main 这个远程跟踪 ref\", \"trackingRefExists\": false, \"ahead\": 1, \"behind\": null, \"note\": \"本地没有 origin/main 这个远程跟踪 ref,上面所有提交都算「待推」\"}"
+  },
+  {
+   "path": "/api/remote/plan/fetch?remote=origin",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 105.0634000057471,
+   "body": "{\"op\": \"fetch\", \"safe\": true, \"warning\": null, \"blocked\": null, \"executable\": true, \"requires_confirmation\": false, \"remote\": \"origin\", \"branch\": null, \"what\": \"只会往本地写 origin/? 这个远程跟踪 ref 与 FETCH_HEAD。不碰工作区, 不推任何东西, 撤销 = git reset --hard origin/?\", \"aheadBehind\": null}"
+  },
+  {
+   "path": "/api/remote/plan/push?remote=origin",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 144.61970000411384,
+   "body": "{\"op\": \"push\", \"safe\": false, \"warning\": \"将把这 1 个提交推到 origin/main。推出去撤不回来 —— 传输层没有「撤回」这个概念。\", \"blocked\": null, \"executable\": false, \"requires_confirmation\": true, \"remote\": \"origin\", \"branch\": \"main\", \"force\": false, \"revRange\": \"main\", \"commits\": [{\"sha\": \"247114b85937a12e85faf06800fe4d3e10d29081\", \"short\": \"247114b\", \"author\": \"aigit\", \"date\": \"2026-10-21T13:54:45+08:00\", \"subject\": \"init: sandbox\"}], \"count\": 1, \"gate\": {\"level\": \"off\", \"source\": \"default\", \"env_var\": \"AIGIT_NET\", \"levels\": [\"off\", \"read\", \"write\"], \"allows_read\": false, \"allows_write\": false, \"read_ops\": [\"archive --exec\", \"archive --remote\", \"fetch\", \"fetch-pack\", \"ls-remote\", \"remote show\", \"remote update\", \"remote-ext\", \"remote-fd\"], \"write_ops\": [\"clone\", \"credential\", \"credential-cache\", \"credential-store\", \"daemon\", \"http-backend\", \"pull\", \"push\", \"receive-pack\", \"request-pull\", \"send-pack\", \"submodule\", \"upload-pack\"], \"local_verbs\": 55}}"
+  }
+ ],
+ "off": [
+  {
+   "path": "/api/health",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 11.537999998836312,
+   "body": "{\"ok\": true, \"root\": \"C:\\\\Users\\\\Public\\\\tmp\\\\aigit_spawns_g4jspunn\\\\root\", \"isRepo\": true}"
+  },
+  {
+   "path": "/api/status",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 98.70560000126716,
+   "body": "{\"ok\": true, \"branch\": \"main\", \"root\": \"C:\\\\Users\\\\Public\\\\tmp\\\\aigit_spawns_g4jspunn\\\\root\", \"staged\": [], \"unstaged\": [], \"conflicted\": [], \"hasStaged\": false}"
+  },
+  {
+   "path": "/api/log?limit=30",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 51.90510000102222,
+   "body": "{\"ok\": true, \"log\": [{\"sha\": \"83fca761\", \"author\": \"aigit\", \"date\": \"2026-10-21\", \"subject\": \"init: sandbox\"}]}"
+  },
+  {
+   "path": "/api/log?limit=5",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 52.5294999970356,
+   "body": "{\"ok\": true, \"log\": [{\"sha\": \"83fca761\", \"author\": \"aigit\", \"date\": \"2026-10-21\", \"subject\": \"init: sandbox\"}]}"
+  },
+  {
+   "path": "/api/branches",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 64.05079999967711,
+   "body": "{\"ok\": true, \"branches\": [{\"name\": \"main\", \"current\": true}]}"
+  },
+  {
+   "path": "/api/diff?file=README.md",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 60.870799999975134,
+   "body": "{\"ok\": true, \"path\": \"README.md\", \"staged\": false, \"diff\": \"\"}"
+  },
+  {
+   "path": "/api/diff?file=README.md&staged=1",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 54.12329999671783,
+   "body": "{\"ok\": true, \"path\": \"README.md\", \"staged\": true, \"diff\": \"\"}"
+  },
+  {
+   "path": "/api/file?file=README.md",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 52.70849999942584,
+   "body": "{\"ok\": true, \"path\": \"README.md\", \"old\": \"# aigit sandbox\\n\\n这是一个演练仓,可以随便删。\\n\", \"new\": \"# aigit sandbox\\n\\n这是一个演练仓,可以随便删。\\n\"}"
+  },
+  {
+   "path": "/api/conflict/state",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 300.9152999948128,
+   "body": "{\"ok\": true, \"inMerge\": false, \"mergeHead\": null, \"origHead\": null, \"head\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"currentBranch\": \"main\", \"branches\": [], \"defaultMessage\": \"\", \"mergeMsgPath\": \"C:\\\\Users\\\\Public\\\\tmp\\\\aigit_spawns_g4jspunn\\\\root\\\\.git\\\\MERGE_MSG\", \"remaining\": 0, \"files\": []}"
+  },
+  {
+   "path": "/api/conflict/list",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 101.36400000192225,
+   "body": "{\"ok\": true, \"inMerge\": false, \"count\": 0, \"files\": []}"
+  },
+  {
+   "path": "/api/conflict/inspect?file=README.md",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 44.17169999942416,
+   "body": "{\"ok\": false, \"error\": \"该路径没有未合并的索引条目,不是冲突文件:README.md\"}"
+  },
+  {
+   "path": "/api/history/stashes",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 56.36989999766229,
+   "body": "[]"
+  },
+  {
+   "path": "/api/history/stash?index=0",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 45.31880000286037,
+   "body": "{\"ok\": false, \"error\": \"没有第 0 个 stash(共 0 个)\", \"code\": \"no_such_stash\"}"
+  },
+  {
+   "path": "/api/history/stash?index=0&stat=1",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 61.04079999931855,
+   "body": "{\"ok\": false, \"error\": \"没有第 0 个 stash(共 0 个)\", \"code\": \"no_such_stash\"}"
+  },
+  {
+   "path": "/api/history/reflog?limit=30",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 101.80920000129845,
+   "body": "[{\"index\": 0, \"sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"short\": \"83fca76\", \"selector\": \"HEAD@{0}\", \"author\": \"aigit\", \"date\": \"2026-10-21 13:54:50 +0800\", \"action\": \"commit (initial): init: sandbox\"}]"
+  },
+  {
+   "path": "/api/history/reflog?limit=5",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 103.01339999568881,
+   "body": "[{\"index\": 0, \"sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"short\": \"83fca76\", \"selector\": \"HEAD@{0}\", \"author\": \"aigit\", \"date\": \"2026-10-21 13:54:50 +0800\", \"action\": \"commit (initial): init: sandbox\"}]"
+  },
+  {
+   "path": "/api/history/tags",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 45.254800003021955,
+   "body": "[]"
+  },
+  {
+   "path": "/api/history/blame?file=README.md",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 90.91489999991609,
+   "body": "{\"ok\": true, \"path\": \"README.md\", \"count\": 3, \"requested_first\": 1, \"requested_end\": 3, \"first_line\": 1, \"last_line\": 3, \"total_lines\": 3, \"truncated\": false, \"next_line\": null, \"limit\": 500, \"lines\": [{\"line\": 1, \"sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"short\": \"83fca761\", \"author\": \"aigit\", \"author_email\": \"<aigit@localhost>\", \"time\": \"2026-10-21 13:54:50+0800\", \"summary\": \"init: sandbox\", \"filename\": \"README.md\", \"previous\": \"\", \"content\": \"# aigit sandbox\"}, {\"line\": 2, \"sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"short\": \"83fca761\", \"author\": \"aigit\", \"author_email\": \"<aigit@localhost>\", \"time\": \"2026-10-21 13:54:50+0800\", \"summary\": \"init: sandbox\", \"filename\": \"README.md\", \"previous\": \"\", \"content\": \"\"}, {\"line\": 3, \"sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"short\": \"83fca761\", \"author\": \"aigit\", \"author_email\": \"<aigit@localhost>\", \"time\": \"2026-10-21 13:54:50+0800\", \"summary\": \"init: sandbox\", \"filename\": \"README.md\", \"previous\": \"\", \"content\": \"这是一个演练仓,可以随便删。\"}]}"
+  },
+  {
+   "path": "/api/history/file?file=README.md",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 130.2021999945282,
+   "body": "{\"ok\": true, \"path\": \"README.md\", \"follow\": true, \"count\": 1, \"truncated\": false, \"commits\": [{\"sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"short\": \"83fca76\", \"author\": \"aigit\", \"email\": \"aigit@localhost\", \"date\": \"2026-10-21 13:54:50 +0800\", \"subject\": \"init: sandbox\", \"parents\": [], \"files\": [{\"status\": \"A\", \"path\": \"README.md\", \"rename\": false}]}], \"exists_in_worktree\": true, \"tracked\": true}"
+  },
+  {
+   "path": "/api/history/plan/stash?message=p",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 47.39050000353018,
+   "body": "{\"ok\": false, \"error\": \"工作区是干净的,没有东西可以暂存。git stash 在这种情况下会直接报错(而不是塞一个空条目进 stash 列表),所以这里提前拦下。\", \"code\": \"nothing_to_stash\", \"dirty\": {\"staged\": [], \"unstaged\": [], \"untracked\": [], \"conflicted\": []}}"
+  },
+  {
+   "path": "/api/history/plan/stash-drop?index=0",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 45.07749999902444,
+   "body": "{\"ok\": false, \"error\": \"没有第 0 个 stash(共 0 个)\", \"code\": \"no_such_stash\"}"
+  },
+  {
+   "path": "/api/history/plan/amend?message=p",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 325.76080000580987,
+   "body": "{\"op\": \"amend\", \"safe\": false, \"warning\": \"没有已暂存的改动 —— 这次 amend 只能改提交信息,提交内容不会变。 本地看不到它被推送过(只查了本地远端跟踪分支,没有联网)。如果你已经推过,请先确认远端。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"old_sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"old_short\": \"83fca761\", \"old_subject\": \"init: sandbox\", \"new_message\": \"p\", \"message_changes\": true, \"dirty\": {\"staged\": [], \"unstaged\": [], \"untracked\": [], \"conflicted\": []}, \"published\": {\"published\": false, \"remotes\": [], \"note\": \"只检查本地已有的远端跟踪分支,没有联网查询。查不到不等于没推送过。\"}}"
+  },
+  {
+   "path": "/api/history/plan/undo-last-commit",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 450.35370000550756,
+   "body": "{\"op\": \"undo-last-commit\", \"safe\": false, \"warning\": \"保留改动:所有改动回到暂存区(index),工作区文件不动。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"target_sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"target_short\": \"83fca761\", \"target_subject\": \"init: sandbox\", \"mode\": \"soft\", \"parents\": 0, \"dirty\": {\"staged\": [], \"unstaged\": [], \"untracked\": [], \"conflicted\": []}, \"published\": {\"published\": false, \"remotes\": [], \"note\": \"只检查本地已有的远端跟踪分支,没有联网查询。查不到不等于没推送过。\"}, \"recoverable_via\": \"git reset --soft HEAD@{0}\"}"
+  },
+  {
+   "path": "/api/history/plan/undo-last-commit?drop_changes=1",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 445.18930000049295,
+   "body": "{\"op\": \"undo-last-commit\", \"safe\": false, \"warning\": \"**丢弃**这个提交的改动:reset --hard 之后工作区与该提交完全一致,提交里的内容就没了。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"target_sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"target_short\": \"83fca761\", \"target_subject\": \"init: sandbox\", \"mode\": \"hard\", \"parents\": 0, \"dirty\": {\"staged\": [], \"unstaged\": [], \"untracked\": [], \"conflicted\": []}, \"published\": {\"published\": false, \"remotes\": [], \"note\": \"只检查本地已有的远端跟踪分支,没有联网查询。查不到不等于没推送过。\"}, \"recoverable_via\": \"git reset --hard HEAD@{0}\", \"legacy_op\": \"undo-dropped\"}"
+  },
+  {
+   "path": "/api/history/plan/reflog-restore?index=0",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 179.60019999736687,
+   "body": "{\"op\": \"reflog-restore\", \"safe\": true, \"warning\": \"把 HEAD 移到 83fca76(commit (initial): init: sandbox)。本次操作本身也会进 reflog,所以还能退回来,但别把 reflog 当保险箱 —— gc 之后就没了。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"target\": {\"index\": 0, \"sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"short\": \"83fca76\", \"selector\": \"HEAD@{0}\", \"action\": \"commit (initial): init: sandbox\"}, \"mode\": \"soft\", \"head_now\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"legacy_op\": \"restore-from-reflog\"}"
+  },
+  {
+   "path": "/api/history/plan/reflog-restore?index=0&mode=hard",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 189.14200000290293,
+   "body": "{\"op\": \"reflog-restore\", \"safe\": false, \"warning\": \"把 HEAD 移到 83fca76(commit (initial): init: sandbox)。mode=hard 会同时丢弃工作区未提交的改动。本次操作本身也会进 reflog,所以还能退回来,但别把 reflog 当保险箱 —— gc 之后就没了。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"target\": {\"index\": 0, \"sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"short\": \"83fca76\", \"selector\": \"HEAD@{0}\", \"action\": \"commit (initial): init: sandbox\"}, \"mode\": \"hard\", \"head_now\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"legacy_op\": \"restore-from-reflog\"}"
+  },
+  {
+   "path": "/api/history/plan/revert?sha=HEAD",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 208.58480000606505,
+   "body": "{\"op\": \"revert\", \"safe\": true, \"warning\": \"revert 会新建一个反向提交,不改写任何历史 —— 撤销错了再 revert 一次就行。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"short\": \"83fca761\", \"subject\": \"init: sandbox\", \"parents\": [], \"is_merge\": false, \"mainline\": null}"
+  },
+  {
+   "path": "/api/history/plan/branch-rename?old=main&new=main2",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 232.06439999921713,
+   "body": "{\"op\": \"branch-rename\", \"safe\": false, \"warning\": \"main 是当前分支,改名会同时更新 HEAD 和上游配置。 main 还被别的 worktree 检出着,git 会拒绝改名;先在那个 worktree 里切走。\", \"blocked\": null, \"executable\": true, \"requires_confirmation\": true, \"old\": \"main\", \"new\": \"main2\", \"old_sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"legacy_op\": \"rename-branch\"}"
+  },
+  {
+   "path": "/api/history/plan/branch-delete?name=hotfix",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 40.79979999369243,
+   "body": "{\"ok\": false, \"error\": \"没有这个分支:hotfix\", \"code\": \"no_such_branch\"}"
+  },
+  {
+   "path": "/api/history/plan/tag-delete?name=v1",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 50.980099993466865,
+   "body": "{\"ok\": false, \"error\": \"没有这个标签:v1\", \"code\": \"no_such_tag\"}"
+  },
+  {
+   "path": "/api/reset/plan?mode=soft",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 44.566099997609854,
+   "body": "{\"ok\": true, \"op\": \"reset\", \"mode\": \"soft\", \"ref\": \"HEAD\", \"undone_commits\": [], \"note\": \"soft: 移动 HEAD 到 HEAD,改动留在暂存区,工作区不动\"}"
+  },
+  {
+   "path": "/api/reset/plan?mode=mixed",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 56.20850000559585,
+   "body": "{\"ok\": true, \"op\": \"reset\", \"mode\": \"mixed\", \"ref\": \"HEAD\", \"undone_commits\": [], \"note\": \"mixed: 移动 HEAD 到 HEAD,改动留在工作区(默认 git 行为)\"}"
+  },
+  {
+   "path": "/api/reset/plan?mode=hard",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 52.85799999546725,
+   "body": "{\"ok\": true, \"op\": \"reset\", \"mode\": \"hard\", \"ref\": \"HEAD\", \"undone_commits\": [], \"note\": \"hard: 未提交的改动将永久丢失;git clean -fd 会删掉所有未跟踪文件和目录\", \"warning\": \"未提交的改动将永久丢失\"}"
+  },
+  {
+   "path": "/api/discard/plan",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 97.21629999694414,
+   "body": "{\"ok\": true, \"op\": \"discard\", \"entries\": [], \"blocked\": [], \"untracked_total\": [], \"untracked_count\": 0, \"note\": \"action=restore 的丢的是**未提交的改动**; action=delete-* 的是 git 从没记过、删了就找不回的东西。\"}"
+  },
+  {
+   "path": "/api/discard/plan?files=README.md",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 93.82960000220919,
+   "body": "{\"ok\": true, \"op\": \"discard\", \"entries\": [{\"path\": \"README.md\", \"action\": \"restore\", \"detail\": \"已跟踪文件 -> 从 HEAD 恢复,改动丢失\"}], \"blocked\": [], \"untracked_total\": [], \"untracked_count\": 0, \"note\": \"action=restore 的丢的是**未提交的改动**; action=delete-* 的是 git 从没记过、删了就找不回的东西。\"}"
+  },
+  {
+   "path": "/api/remote/capability",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 1.3077999974484555,
+   "body": "{\"ok\": true, \"op\": \"capability\", \"gate\": {\"level\": \"off\", \"source\": \"default\", \"env_var\": \"AIGIT_NET\", \"levels\": [\"off\", \"read\", \"write\"], \"allows_read\": false, \"allows_write\": false, \"read_ops\": [\"archive --exec\", \"archive --remote\", \"fetch\", \"fetch-pack\", \"ls-remote\", \"remote show\", \"remote update\", \"remote-ext\", \"remote-fd\"], \"write_ops\": [\"clone\", \"credential\", \"credential-cache\", \"credential-store\", \"daemon\", \"http-backend\", \"pull\", \"push\", \"receive-pack\", \"request-pull\", \"send-pack\", \"submodule\", \"upload-pack\"], \"local_verbs\": 55}}"
+  },
+  {
+   "path": "/api/remote/list",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 51.36009999841917,
+   "body": "{\"ok\": true, \"op\": \"remotes\", \"remotes\": [], \"gate\": {\"level\": \"off\", \"source\": \"default\", \"env_var\": \"AIGIT_NET\", \"levels\": [\"off\", \"read\", \"write\"], \"allows_read\": false, \"allows_write\": false, \"read_ops\": [\"archive --exec\", \"archive --remote\", \"fetch\", \"fetch-pack\", \"ls-remote\", \"remote show\", \"remote update\", \"remote-ext\", \"remote-fd\"], \"write_ops\": [\"clone\", \"credential\", \"credential-cache\", \"credential-store\", \"daemon\", \"http-backend\", \"pull\", \"push\", \"receive-pack\", \"request-pull\", \"send-pack\", \"submodule\", \"upload-pack\"], \"local_verbs\": 55}}"
+  },
+  {
+   "path": "/api/remote/heads?remote=origin",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 11.097700000391342,
+   "body": "{\"ok\": false, \"error\": \"远程能力「read」当前是 **off**,拒绝执行(ls-remote)。aigit 默认不联网;要开就显式设 AIGIT_NET=read(本进程默认 default)。\", \"code\": \"net_disabled\", \"required\": \"read\", \"current\": \"off\", \"op\": \"ls-remote\"}"
+  },
+  {
+   "path": "/api/remote/heads?remote=upstream",
+   "code": 400,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 1.186900000902824,
+   "body": "{\"ok\": false, \"error\": \"远程能力「read」当前是 **off**,拒绝执行(ls-remote)。aigit 默认不联网;要开就显式设 AIGIT_NET=read(本进程默认 default)。\", \"code\": \"net_disabled\", \"required\": \"read\", \"current\": \"off\", \"op\": \"ls-remote\"}"
+  },
+  {
+   "path": "/api/remote/ahead-behind?remote=origin",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 136.2756999951671,
+   "body": "{\"ok\": true, \"remote\": \"origin\", \"branch\": \"main\", \"basis\": \"本地没有 origin/main 这个远程跟踪 ref\", \"trackingRefExists\": false, \"ahead\": 1, \"behind\": null, \"note\": \"本地没有 origin/main 这个远程跟踪 ref,上面所有提交都算「待推」\"}"
+  },
+  {
+   "path": "/api/remote/plan/fetch?remote=origin",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 85.9576000002562,
+   "body": "{\"op\": \"fetch\", \"safe\": true, \"warning\": null, \"blocked\": null, \"executable\": true, \"requires_confirmation\": false, \"remote\": \"origin\", \"branch\": null, \"what\": \"只会往本地写 origin/? 这个远程跟踪 ref 与 FETCH_HEAD。不碰工作区, 不推任何东西, 撤销 = git reset --hard origin/?\", \"aheadBehind\": null}"
+  },
+  {
+   "path": "/api/remote/plan/push?remote=origin",
+   "code": 200,
+   "spawns": 0,
+   "cmds": [],
+   "ms": 157.5114000006579,
+   "body": "{\"op\": \"push\", \"safe\": false, \"warning\": \"将把这 1 个提交推到 origin/main。推出去撤不回来 —— 传输层没有「撤回」这个概念。\", \"blocked\": null, \"executable\": false, \"requires_confirmation\": true, \"remote\": \"origin\", \"branch\": \"main\", \"force\": false, \"revRange\": \"main\", \"commits\": [{\"sha\": \"83fca761081ec76aaf4f232ab64bf7ff9fda51f7\", \"short\": \"83fca76\", \"author\": \"aigit\", \"date\": \"2026-10-21T13:54:50+08:00\", \"subject\": \"init: sandbox\"}], \"count\": 1, \"gate\": {\"level\": \"off\", \"source\": \"default\", \"env_var\": \"AIGIT_NET\", \"levels\": [\"off\", \"read\", \"write\"], \"allows_read\": false, \"allows_write\": false, \"read_ops\": [\"archive --exec\", \"archive --remote\", \"fetch\", \"fetch-pack\", \"ls-remote\", \"remote show\", \"remote update\", \"remote-ext\", \"remote-fd\"], \"write_ops\": [\"clone\", \"credential\", \"credential-cache\", \"credential-store\", \"daemon\", \"http-backend\", \"pull\", \"push\", \"receive-pack\", \"request-pull\", \"send-pack\", \"submodule\", \"upload-pack\"], \"local_verbs\": 55}}"
+  }
+ ]
+}
