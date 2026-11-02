@@ -1,0 +1,24 @@
+# 工作区换行由这份文件钉死 —— 不再依赖每台机器的 core.autocrlf。
+#
+# 背景（2026-10-06 实测）：本仓所在机器的 `core.autocrlf = true`，而仓库里
+# 没有 .gitattributes。后果是**新克隆**时 git 会把 .py / .md / .txt 全部转成
+# CRLF，而 tools/check-encoding.ps1 要求这几个后缀是 **LF** —— 门禁必红。
+# 当时工作区之所以还是 LF，只是因为那些文件从没被重新 checkout 过。
+#
+# 属性优先于 core.autocrlf，所以下面这些行写死之后，换台机器 / 新克隆
+# 出来的工作区换行形态也一致。
+#
+# 只钉**门禁真正检查的**后缀（见 check-encoding.ps1 的 $expect 表）：
+#   .py / .md / .txt  -> LF
+#   .ps1              -> CRLF
+# 外加 .bat：README 明确写了 aigit.bat 是 GBK + CRLF，一并钉住免得被 autocrlf 改。
+#
+# ⚠ .html / .js 故意**不钉**：门禁不检查它们，而仓里现有 2 个 .html 的
+#   工作区形态并不一致（1 个 CRLF / 1 个 LF）。给它们加规则会顺手改掉那个
+#   现状，属于本次授权之外。要统一的话另开一条线。
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.ps1  text eol=crlf
+*.bat  text eol=crlf

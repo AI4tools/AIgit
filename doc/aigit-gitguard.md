@@ -109,7 +109,7 @@ E 线给了两处,我又找出四处:
 | 1 | `gen.py:59` 注释 | 「`merge.ours.driver` / `diff.external` 等**一律不碰**,只读原始字节」——读起来像安全声明 | **方向反了**。「不传值」≠「不执行」。实测仓里 `merge.drv.driver` 指向探针时裸 `merge` 就命中。**已就地加警告注释** |
 | 2 | `server.py:501`(原) | 在 `init()` 里 `git config commit.gpgsign false`,看着像关掉了签名 | **只对 aigit 自己 `init()` 出来的仓生效**。别人给的仓上从没跑过。E 线已指出,现由 gitguard 全局覆盖 |
 | 3 | `conflicts._GIT_CONFIG` / `gen._GIT_CONFIG` 里的 `commit.gpgsign=false` | 像是安全项 | 是**功能项**(免得卡在密码输入)。安全那一层此前不存在 |
-| 4 | `server_base.py`(117 KB,未跟踪) | 和 `server.py` 几乎一样的 `Repo._run_full`,连注释都一样 —— 读目录树的人会以为**它也被覆盖了** | **没有任何文件 import 它**(全库只在一个测试的 docstring 里被提到)。它保留着**未加固**的原始 `_run_full` |
+| 4 | ~~`server_base.py`~~ **已删**(2026-10-06) | 曾是和 `server.py` 几乎一样的 `Repo._run_full`,连注释都一样 —— 读目录树的人会以为**它也被覆盖了** | **没有任何文件 import 它**。它保留着**未加固**的原始 `_run_full`。已删除,`git show HEAD:server_base.py` 可恢复 |
 | 5 | `GIT_EDITOR` / `GIT_SEQUENCE_EDITOR` | `history_ops` / `conflicts` 都设了,像是想到过编辑器这一类 | **`server.py` 当时没设** —— 一处真实的不一致。实测 `-m`/`--no-edit` 挡住了触发,但这是运气不是防线。现由 gitguard 统一设 |
 | 6 | `test_aigit_net.py:566` 的 `-c core.hooksPath=/tmp/evil` | 像在测 hooksPath 中和 | 是拿这句话当**畸形 remote 名**测 argv 注入 |
 | 7 | `test_aigit_net.py:526-541` | 像在测配置值传给 git 前被中和 | 测的是 **`NetGate`**,不是中和 |
@@ -250,7 +250,7 @@ E 线给了两处,我又找出四处:
    (stage 为空);只污染 `merge.*` 时是 `rc=1` + `U=f.txt` + stage `base/mine/other` 齐全。
    两者都**不执行**外部程序(安全目标达成),但产品行为不一致,**我没完全定因**。
    aigit 的卖点就是冲突演示,这条建议优先。
-2. **`server_base.py` 要么删,要么加个「未加固」的横幅。** 它现在是个陷阱。
+2. ~~**`server_base.py` 要么删,要么加个「未加固」的横幅。**~~ **已删**(2026-10-06)。理由:AST 不可解析(U+E21E 乱码)、全库零 import、端点是 server.py 的严格子集(44 ⊂ 57)、保留未加固的 `_run_full` 执行面。`git show HEAD:server_base.py` 可恢复。
 3. `gitguard.report(root)` 建议在 `/api/status` 里露一眼 `parse_error_count`,
    让「枚举打折」可见,而不是静默。
 4. 联网闸打开时的 `uploadpack.packObjectsHook` / `core.gitProxy` 需要一次**联网**复测
@@ -266,7 +266,7 @@ E 线给了两处,我又找出四处:
 - **改了但没验证**:`uploadpack.packObjectsHook`、`core.gitProxy`(本地 remote 上
   触发不了,要联网);§6 `net_enabled=True` 的真实远程凭证链路。
 - **只是分析**:§4 里 #4(`server_base.py` 无引用)是用全库 import 检索确认的,
-  其余是对**代码文本**的判断;#1/#2/#5 有实测支撑。
+  其余是对**代码文本**的判断;#1/#2/#5 有实测支撑。该文件已于 2026-10-06 删除。
 - **`core.fsmonitor` 的 clone 门槛**沿用 E 线结论,我**未独立复测**。
 - **不宣称 RCE。** 全程只证明「配置指定的程序被 spawn 了」,探针只写标记文件。
 

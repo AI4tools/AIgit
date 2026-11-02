@@ -409,54 +409,43 @@ GBK 字节正确显示。代价是它本身必须是 GBK。这是有意的取舍
 常见是仓库里 `core.autocrlf` 或 `core.hooksPath` 的配置把 `server.py` 的
 `git status` 卡住了（smoke.py 用 120 秒超时兜着，超时会明确报出来）。
 
-### smoke.py 报 `通过 54 失败 8`
+### smoke.py 报失败
 
-先看每条 `[FAIL]` 下面的「期望 / 实际 / 响应体」三行。当前这 8 条失败**全部**
-指向同一个缺陷，见下一节。
+先看每条 `[FAIL]` 下面的「期望 / 实际 / 响应体」三行 —— 那三行直接写明了
+判据要什么、实际拿到什么。**别按条数猜原因**：本文件历史上就因为「8 条失败
+全是一个原因」这种推断栽过（见下一节的更正记录）。
 
 ---
 
-## 已知缺陷
+## 更正记录
 
-### `/api/merge` 每次调用都抛 `AttributeError`
+### ~~`/api/merge` 每次调用都抛 `AttributeError`~~ —— 已修（2026-10-06 核实）
 
-`server.py:220-226`：
+> 本节此前写着「**当前状态：未修**」，并称 `smoke.py` 有 8 条断言因此红着。
+> **那是过期的**，2026-10-06 实测 `smoke.py` 通过 62 / 失败 0 / 退出码 0。
+> 保留这段是为了：**万一再看到同一个 AttributeError，知道该往哪儿看。**
 
-```python
-def merge(self, name):
-    p = self._run(["merge", "--no-edit", name], check=False)
-    return {"ok": p.returncode == 0, ...}
-```
-
-但 `server.py:63` 的 `_run` 返回的是 **`p.stdout`（`str`）**，不是 `CompletedProcess`：
-
-```python
-return p.stdout
-```
-
-所以 `p.returncode` 在一个 `str` 上取值，每次 `/api/merge` 都炸：
+当时的症状（保留原样）：
 
 ```
 HTTP 500  {"ok": false, "error": "AttributeError: 'str' object has no attribute 'returncode'"}
 ```
 
-`repo.py` 的 `_run` 在 `check=True` 时会抛 `GitError`，从设计上就不打算把
-`CompletedProcess` 交出去。修法是让 `merge` 单独跑 `subprocess.run` 自己看
-`returncode`，或者给 `_run` 加一个 `want_proc=True` 开关。
+原因：`Repo.merge` 调 `self._run([...], check=False)` 然后读 `p.returncode`，
+而 `_run` 返回的是 **`p.stdout`（`str`）**，不是 `CompletedProcess`。
 
-**当前状态：未修。** `smoke.py` 的 8 条失败全部是这一个原因：
+**实际采用的修法**：新增 `Repo._run_full(args, check, stdin)` 返回真正的
+`CompletedProcess`；`Repo._run` 退化成它的 `.stdout` 包装（既有调用点一个字没改），
+`Repo.merge` 改调 `_run_full`。2026-10-06 按 **函数名**核实（不用行号——行号会漂）：
 
-```
-[FAIL] 11  mergeable merge 端点自身不报错
-       期望: HTTP 200 且响应里没有 error 字段(说明真的执行到了 merge 逻辑)
-       实际: HTTP 500  error=AttributeError: 'str' object has no attribute 'returncode'
-[FAIL] 12  mergeable 合并 B 进 A(应干净)
-       ...
-```
+- `Repo._run_full` 存在，`Repo._run` 的返回是 `self._run_full(args, ...).stdout`
+- `Repo.merge` 里是 `p = self._run_full(['merge', '--no-edit', name], check=False)`
+  之后才读 `p.returncode`
+- 实测 `smoke.py` 的 merge 相关 8 条断言（11/12/20/21/29/30/38/39）全 PASS
 
-注意 `smoke.py` 特意把「端点自身没报错」和「合并结果对不对」拆成两条独立断言。
-如果只判后者，对照组（`conflict` 档期望冲突）会因为 `ok=false` 而被误判成 PASS。
-`smoke.py` 的 62 条断言里有 8 条因为这个缺陷红着，其余 54 条全绿。
+> 教训与自查方式：这一节的原文把**行号**（`server.py:220-226`、`server.py:63`）
+> 写进了判据，而行号必然随编辑过期 —— 同一份文件里另一段「横幅」也是这么
+> 被自己的绝对值咬了三次。**引用代码位置请用函数名 + 一条复算命令，别写死行号。**
 
 ### `/api/gen` 的 `branches` 字段是场景对象列表
 
@@ -487,13 +476,18 @@ python smoke.py
 
 ```
 [PASS] 01  server 起来并应答 health                -> 200 {"ok": true, "root": "...", "isRepo": true}
-[FAIL] 11  mergeable merge 端点自身不报错
-       期望: HTTP 200 且响应里没有 error 字段(说明真的执行到了 merge 逻辑)
-       实际: HTTP 500  error=AttributeError: 'str' object has no attribute 'returncode'
-       响应体: {"ok": false, "error": "AttributeError: ..."}
-  通过 54    失败 8    跳过 0
-  退出码 1
+...
+[PASS] 43  diff 看已暂存改动                        -> 200 新增行=["+smoke line 1", "+smoke line 2"]
+[PASS] 44  commit 提交                          -> 200 output=[main 4d37b85] smoke: commit 1 file changed, 2 insertions(+) create mode 100644 smoke_edit.txt
+[PASS] 45  log 出现新提交                          -> 200 首条 subject='smoke: commit' 共 5 条
+...
+  通过 62    失败 0    跳过 0
+  退出码 0
 ```
+
+> 上面是 **2026-10-06 的一次实跑输出**（当次 HEAD `2f0f2c1` + 本轮未提交改动），
+> 用来展示每条长什么样，不是现状保证。`44 commit 提交` 会打印 `output=` ——
+> 那是 git 的真实回显，这个键曾经丢过，见「更正记录」。
 
 - 全部通过退 `0`，有任何失败退 `1`（可以直接接 CI）。
 - 演练仓建在 `%TEMP%\aigit-smoke-<pid>`，跑完自动删；日志在同级 `.log`，也删。
@@ -503,6 +497,318 @@ python smoke.py
 - 覆盖范围：`health` / `status` / `log` / `branches` / `diff` / `file` /
   `stage` / `unstage` / `discard` / `commit` / `branch` / `checkout` / `reset` /
   四类 `gen` + 各自的 `merge` / `merge-abort`，外加路径越界和 shell 注入的拒绝。
+
+## 测试集：有哪些套件、怎么跑
+
+`smoke.py` 是无头端到端演练；下面这些是**分层的套件**，覆盖比 smoke 细得多。
+每个都能单独 `python <文件>` 跑，全部走 `%TEMP%` 下的临时仓，**不碰任何真实仓库**。
+
+| 套件 | 干什么 | `--selftest` |
+|---|---|---|
+| `selftest.py` | 生成器（`gen.py`）自检：真合并 / 确定性 / 脏工作区拒绝 | 无 |
+| `test_aigit.py` | 主套件，端点行为 + 路径越权 + 分支名白名单 | 无 |
+| `test_aigit_extra.py` | 补充端点与边界 | 无 |
+| `test_aigit_gate.py` | 闸门类判据 | 无 |
+| `test_aigit_net.py` | 网络 / fetch / pull / 代理 | 无 |
+| `test_aigit_web.py` | 前端行为（无头 DOM） | 无 |
+| `test_aigit_concurrency.py` | 并发判据 C1~C6（锁、原子性） | 无 |
+| `test_f06_guard.py` | F-06 仓外逃逸的**五道**防线 | 无 |
+| `test_history_ops.py` | `history_ops.py` 的 stash / revert / branch / tag | 无 |
+| `test_conflicts.py` | 冲突解决与完成合并 | 无 |
+| `test_aigit_invariants.py` | 不变量（最快，1 秒） | 无 |
+| **`test_aigit_contract.py`** | **响应形状契约**（见下） | **有** |
+
+### `test_aigit_contract.py`：响应形状也是契约
+
+**为什么单独立一个文件。** 2026-10-06 第一次真跑全套件时发现：`f155916`
+（消除并发判据 C3）把 `/api/commit` 的响应从
+
+```python
+self._json({'ok': True, 'output': out, **REPO.status()})   # f155916^
+```
+
+改成 `self._ok_with_status(st, err)`，`out` 拿到手**一次都没再被读过**，
+`output` 键就此从响应里消失。而 `web/index.html:2095` 一直读 `d.output`,
+于是**每次提交前端都显示「(git 无输出)」**。那一版没有任何套件发现：
+全仓只有 `smoke.py:513` 断言过它，其余 5 个套件都是 **0 处**。
+
+所以「每个响应有哪些键」也得进测试：
+
+```
+python test_aigit_contract.py --selftest    # 只跑自证, 秒出
+python test_aigit_contract.py               # 自证 + 真实端点(起 server 子进程)
+```
+
+它钉 8 个端点的必需键（`health` / `status` / `stage` / `commit` /
+`checkout` / `branch` / `conflict/state` / `remote/ahead-behind`）。三条设计约束写在文件头，这里只说结论：
+
+- **期望键集是写死的字面量**，依据是 `git show f155916^:server.py` 的历史
+  handler 与 smoke.py 实测响应体。**不从现行 `server.py` 自动推导** ——
+  那样就变成「拿被检查者的说明书去检查被检查者」，永远绿。
+- **契约条数 < 6 直接抛**。0 项检查恒真，静默跳过比判错更险。
+- **阳性对照先单跑**：缺键必被抓、键齐必放过、响应非对象必被抓，
+  跑真实端点之前先证明这把尺子会响。
+
+### `find_test_gaps.py`：找「零提及」的响应面
+
+上面那条契约测试是**我挑着钉的**（当时 6 个端点）。问题是：**还有哪些响应键根本没人管？**
+这个工具回答它。它取代的是我原来那套 grep 关键词的做法 —— 那套**三次被推翻**
+（把注释里的同名字当成覆盖；`stash/pop` 说没测其实测了；拿 `_run_full` 去 doc 里找
+可那段在 README 里）。三条根因逐条堵：
+
+```
+python find_test_gaps.py --selftest    # 只跑自证, 不碰网络, 秒出
+python find_test_gaps.py               # 自证 + 真起 server 探面
+```
+
+- **只认 AST，不碰原文**：注释里的同名字不算数。
+- **面来自行为**：真起一遍 `server.py --sandbox`，记录每个端点**实际**返回什么键。
+  不从源码/文档推导 —— 那是「拿被检查者的说明书去检查被检查者」。
+- **尺子先证明自己会响**：自证组 8 条，含阳性哨兵（会命中必须命中）、
+  阴性哨兵（不存在的必须不命中）、注释哨兵（**不许**算进来）。
+
+**它只测一个方向，刻意不反推**：
+
+| 观察 | 能下什么结论 |
+|---|---|
+| 键在任何套件 AST 里都没出现 | **一定没被测**（下界，可信）|
+| 键出现了 | **不等于**被测（出现 ≠ 断言）|
+
+所以输出叫「零提及」，不叫「未覆盖」。它还单列一个**灰区**：原文里有、
+AST 字符串常量里没有（比如只出现在注释里）—— 那正是 grep 会误判的坑，
+交给人看，**不算零提及**。
+
+它**不负责**发现「只被一个套件覆盖」这类脆弱面 —— 那正是 `/api/commit` 的
+`output` 回归那一类（当时 `smoke.py:513` 确实断言了它）。那种面要靠**行为化的
+变异测试**，见下节。
+
+**首跑结果（2026-10-06，rc=0，2.4 秒）**：探 14 个端点 / 10 个返回带键 JSON /
+**31 个键**参与核对，报出 **4 个零提及**键 + 1 个灰区：
+| 档 | 键 | 出处 |
+|---|---|---|
+| 零提及 | `currentBranch` / `origHead` / `mergeMsgPath` | `/api/conflict/state` |
+| 零提及 | `trackingRefExists` | `/api/remote/ahead-behind` |
+| 灰区 | `behind` | 只在 `test_aigit_net.py` 的**注释**里（grep 会误判成已覆盖）|
+
+这 4 个键在整仓 grep 只命中产出它们的源码、文档、和 `conflicts-panel.js` 的一行
+**注释** —— 没有任何测试文件命中，零提及成立。**已按此补测试**：契约测试从 6 个
+端点扩到 8 个（钉住 4 个键），`test_aigit_net.py` 的 `b1()` 另加了**语义**判据
+（没推过 ⇒ `trackingRefExists is False` 且 `behind is None`，不是 `0`）。
+补完后重跑本工具：**零提及 4 → 0，灰区 1 → 0**。
+
+**扩面（2026-10-06 晚些时候）**：面从「只有 GET」扩到「GET + 安全的 POST」
+（`stage` / `commit` / `branch` / `merge`），并让 `call` **读 4xx 响应体**
+（`/api/merge` 无冲突时返回 400 + `{ok, error}`，那个 `error` 键正是要探的）。
+探 **18 个端点 / 15 个带键 / 36 个键**，**零提及 0、灰区 0**。
+
+键从 31 → 36，多出的 5 个是 `code` / `current` / `error` / `output` / `required`。
+**归因要算准**（实测，不是推测）：只有 `output` 来自新加的 POST 端点；
+`code` / `current` / `error` / `required` 来自「开始读 4xx body」
+（`/api/remote/heads` 的 400 响应体）。**加 POST 没有挖出新缺口** ——
+因为 `stage`/`branch`/`commit`/`checkout` 返回的都是 status 形状（契约测试的
+`STATUS_KEYS` 已经钉住）加一个 `output`（也已钉住）。**这反过来证明契约测试的
+status 形状钉是承重的**：它同时覆盖了 POST 面。
+
+**扩面到带参 GET（2026-10-20）**：又加了 7 条**带查询参数**的 GET
+（`/api/file` / `/api/diff` / `/api/history/blame` / `/api/history/file` /
+`/api/discard/plan` / `/api/reset/plan` / `/api/history/stash`）。
+
+⚠ **关键发现**：`--sandbox` 只建 `README.md`（`server.py:2184` 实测），
+所以原来那条 `/api/diff?file=probe.txt` 探的是**不存在**的文件 —— 吃到的是
+400 错误体，不是正常形状。新加的 7 条一律指向**真实存在**的 `README.md`。
+
+探 **25 个端点 / 22 个带键 / 59 个键**，**零提及 3 个、灰区 3 个** ——
+和 POST 那次（零收获）不同，这次**真挖到缺口**：
+
+| 键 | 端点 | 说明 |
+|---|---|---|
+| `requested_first` / `requested_end` | `/api/history/blame` | 本次请求的行区间（与 `first_line`/`last_line` 不是一回事）|
+| `exists_in_worktree` | `/api/history/file` | 文件在盘上还是已被删 |
+| 灰区 `follow` / `tracked` / `undone_commits` | blame / file / reset-plan | 原文有、AST 常量里没有 |
+
+补完 3 个零提及键后重跑：**零提及 3 → 0，灰区 3 → 2**（`follow` / `undone_commits`）。
+补的地方是 `test_history_ops.py` 的 `t_H2`（blame）与 `file_history` 那条，
+**值先量后写**（沙盒实测 `requested_first=1` / `requested_end=3` /
+`exists_in_worktree=True`），套件 **37/37 全过**。
+
+**扩面到只读 plan 预演（2026-10-21）**：又加了 5 条 plan 端点
+（`history/plan/amend` / `revert` / `branch-rename`、`remote/plan/fetch` / `push`）。
+
+先量后设计（`probe_plans.py`）：这 5 条都返回 200 且键很丰富
+（amend 13 键 / push 13 / revert 12 / branch-rename 10 / fetch 10）。
+
+探 **30 个端点 / 27 个带键 / 80 个键**，**零提及 8 个、灰区 3 个** ——
+**plan 端点的响应形状基本没人测**：
+
+| 零提及键 | 端点 |
+|---|---|
+| `aheadBehind` | `/api/remote/plan/fetch` |
+| `revRange` | `/api/remote/plan/push` |
+| `published` / `old_short` / `old_subject` / `message_changes` / `new_message` | `/api/history/plan/amend` |
+| `legacy_op` | `/api/history/plan/branch-rename` |
+
+**形状变异体**（删键）+ 补断言，逐条两组实测：
+
+| 变异体 | 不带 overlay | 带 overlay |
+|---|---|---|
+| `G-fetch-aheadbehind-off` | **SURVIVED** 0/1 | **KILLED** 1/1 |
+| `G-push-revrange-off` | **SURVIVED** 0/1 | **KILLED** 1/1 |
+| `H-amend-published-off` | **KILLED**（删掉 `published` 会让 `plan_amend()` 抛 `KeyError`，现有测试直接崩） | — |
+
+⇒ **`published` 是又一个「零提及 ≠ 没被测」**：测试没写这个字符串，
+但只要 `plan_amend()` 崩就被咬住。
+
+补完 2 个（`aheadBehind` / `revRange`）：**零提及 8 → 5**。`test_aigit_net.py` **56/56 全过**。
+
+**再补剩下 5 个（同一轮继续，2026-10-21）**：
+
+| 键 | 补在哪 |
+|---|---|
+| `legacy_op` | `test_aigit.py` 的 `t_n2`（`N-history-routes-wired`）|
+| `message_changes` / `new_message` / `old_short` / `old_subject` | `test_history_ops.py` 的 `t_C2` |
+
+**值先量后写**（沙盒实测）：
+
+```
+old_short        = old_sha[:8]        ('27aede1f')
+old_subject      = 'init: sandbox'
+new_message      = None / 'hello'     (传/不传 message)
+message_changes  = False / True
+op               = 'branch-rename'
+legacy_op        = 'rename-branch'    (内部旧名, 服务端归一到 URL 段)
+```
+
+**零提及 8 → 0，灰区 4。30 个端点 / 80 个键全部有提及。**
+`test_history_ops.py` **37/37 全过**，`test_aigit.py` 的
+`N-history-routes-wired` 通过。
+
+### 变异测试：测「测试本身有没有用」
+
+`mutation_runner.py` 把某道安全闸**故意拆掉**，看有没有套件能咬住它。
+判据是三态（`LANDED` / `NO-OP` / `PROBE-DRIFT`），先跑 `--verify-probes`
+确认探针在对照上签名逐字正确，再引用它的结论。
+
+```
+python mutation_runner.py --list                      # 列出全部变异体(1.5 秒)
+python mutation_runner.py --verify-probes             # 探针可证伪性总检(快)
+python mutation_runner.py --all --workers 4           # 全跑(28 个变异体)
+python mutation_runner.py --mutate S-commit-leak-guard-off
+python mutation_runner.py --all --base-ref <sha>      # 钉死基线, 可复现
+```
+
+沙盒建在 `%TEMP%\opencode\mut\`，每个变异体有自己的 TEMP/TMP。
+⚠ **开工前会先查磁盘余量，不够就直接退 4** —— 它上一轮就是这么被磁盘杀掉的
+（结果全丢），现在改成先查先拒。
+
+### 一次实测基线（2026-10-06，HEAD `2f0f2c1`）
+
+这是**某一天的实测结果，不是承诺**；改了代码请重跑，别拿这张表当现状。
+
+| 项 | 结果 |
+|---|---|
+| 变异体（15 个那次） | 有效 15 / KILLED 15 / 存活 **0** / VOID 0，杀灭率 **100.0%**（分母 = 15 个真正打上去并测出结论的），1393 秒 |
+| 变异体（**18 个那次**，带 overlay） | 有效 18 / KILLED **18** / 存活 **0** / VOID 0，杀灭率 **100.0%**，1453.8 秒，rc=0，**无 ENGINE-ERROR** |
+| 变异体（**21 个那次**，带 overlay） | 有效 21 / KILLED **21** / 存活 **0** / VOID 0，杀灭率 **100.0%**，rc=0，**无 ENGINE-ERROR**（见 §16）|
+| 变异体（**24 个那次**，带 overlay） | 有效 24 / KILLED **24** / 存活 **0** / VOID 0，杀灭率 **100.0%**，rc=0，**无 ENGINE-ERROR**（见 §17）|
+| 变异体（**25 个那次**，带 overlay） | 有效 25 / KILLED **25** / 存活 **0** / VOID 0，杀灭率 **100.0%**，1263 秒，rc=0，**无 ENGINE-ERROR**（见 §19）|
+| 变异体（**28 个那次**，带 overlay） | 有效 28 / KILLED **28** / 存活 **0** / VOID 0，杀灭率 **100.0%**，1228 秒，rc=0，**无 ENGINE-ERROR**（见 §20）|
+| 探针可证伪性 | 33/33 在对照上签名逐字正确 |
+| 解析器自测 | **12/12** 份 fixture 通过，覆盖 **10/10** 个套件 |
+| `smoke.py` | 62 条断言，**62 过 / 0 败**，退 0 |
+
+⚠ **上表那 15 个之外，2026-10-06 又加了第 16 个 `C-merge-add-scope-off`，它在
+「已提交的基线」上会 SURVIVED。这不是它无效，而是已提交的 `test_f06_guard.py`
+里那版旧 T3 判据本身是瞎的** —— 旧 T3 断言的是「防线关掉后**必须**泄漏」
+（`ck(lp and lc, ...)`），恰好把这条变异想暴露的后果当成了期望值。
+带上工作区里修好的 T3 就咬住了。两组实测：
+
+| 运行 | 用的 T3 | 结果 |
+|---|---|---|
+| 不带 overlay | 已提交的旧 T3（期望泄漏） | **SURVIVED**，0/1 = 0.0% |
+| `--overlay-test test_f06_guard.py` | 修好的新 T3（断言不泄漏） | **KILLED**，1/1 = 100.0% |
+
+杀它的那条断言原文：`FAIL T3  第四道已拆, 仓外路径却还是进了索引或进了历史 ——
+**第五道(作用域受限 add)没有独立挡住**, (leaked_path=True leaked_content=True)`。
+
+⇒ 在 T3 修复**提交之前**跑 `--all` 会看到 15/16，这是真事实，不粉饰；
+修复提交后即回到 16/16。（`--base-ref` 取的是**已提交**的测试文件，
+所以工作区改动必须靠 `--overlay-test` 才进沙盒。）
+
+⚠ **同一类情况又多了两条（第 17 / 18 个）**，都是 2026-10-06 为「零提及」键补的
+**形状变异体**（`C-conf-state-key-off` / `S-ab-trackingref-off`）。它们杀的是
+**新加的**断言，而那些断言都在**未提交**的工作区里，所以默认 `--all` 下同样
+SURVIVED。逐条实测（各 `--workers 1`）：
+
+| 变异体 | 不带 overlay | 带 overlay | 杀它的断言原文 |
+|---|---|---|---|
+| `C-conf-state-key-off` | SURVIVED，0/1 = 0.0% | **KILLED**，1/1 = 100.0% | `KeyError: 'currentBranch'`（`eq("main", st["currentBranch"], ...)`）|
+| `S-ab-trackingref-off` | SURVIVED，0/1 = 0.0% | **KILLED**，1/1 = 100.0% | `KeyError: 'trackingRefExists'`（`ck_eq(ab0["trackingRefExists"], False, ...)`）|
+
+⇒ 提交前跑 `--all` 会看到 **15/18 = 83.3%**（3 条存活，全部有解释）；
+提交后回到 18/18。**这不是回归，是「新测试还没落地」的如实记录。**
+
+⚠ **第 19 / 20 / 21 个（2026-10-06 晚些时候）**：用 **AST 普查**（`sweep_raises2.py`，
+只认 AST 字符串常量，判据是「消息被切成的**每一段**有没有出现在任何测试里」）
+从源码 **131 条 `raise` 里捞出 81 条零提及**，再逐条核实哪些**真的**没被测住。
+
+排查中**收回两条过重判词**（都是「以为没覆盖，其实有」）：
+- `NetGate.require()` —— 普查报零提及，但 `test_aigit_net.py` 的 `a11` 断言的是
+  `code="net_disabled"`，不是那条中文消息。**它早被覆盖。**
+- `server.py:1354`「没有可提交的改动」—— 实测 `git commit` 把
+  "nothing to commit" 写在 **stdout**，所以 `out` 永远非空，**这道闸是死代码**，
+  拆掉它没有任何可观测差异（探针对它 PROBE-NOOP）。**不该做变异体。**
+
+最终选定 3 条**危害是真的**（不是「报错变差」）的闸，逐条两组实测：
+
+| 变异体 | 拆掉的闸 | 危害 | 不带 overlay | 带 overlay |
+|---|---|---|---|---|
+| `C-del-stale-worktree-off` | `delete_file` 的 sha256 比对 | 过期客户端会**删掉它没见过的内容** | SURVIVED 0/1 | **KILLED** 1/1 |
+| `C-unresolve-notresolved-off` | `unresolve` 拒「还没解决的路径」 | `checkout --merge` 会**冲掉用户刚解决好的内容** | SURVIVED 0/1 | **KILLED** 1/1 |
+| `G-no-main-branch-off` | `gen` 要求 main 分支当基准点 | 在**没有基准分支**的仓上生成场景 | SURVIVED 0/1 | **KILLED** 1/1 |
+
+杀它们的是 `test_conflicts.py` 新增的 3 条（`t_delete_sha` / `t_unresolve_guard` /
+`t_gen_nomain`），该套件 14 → **17 条全过**。
+
+⚠ **第四条 `S-delete-tree-link-off` 被移除**（不是保留）：它复用了一条
+「已存在但没有任何变异体引用」的 `delete_tree_link` 探针，看着像缺口，
+实测 **PROBE-NOOP** —— `_delete_tree` 顶部还有 `_assert_pinned_plain` 那道
+**真闸**，server.py:881 的 `is_reparse_point` 检查只是**冗余后挡**。
+**探针存在 ≠ 那道闸是承重的。** 目录回到 **21 条、0 VOID**。
+
+### 第 22 / 23 / 24 个（同一方法，再一轮）
+
+同样的流程又捞到 3 条，全部对 `test_conflicts.py` 零提及、对变异体零提及：
+
+| 变异体 | 拆掉的闸 | 危害 | 不带 overlay | 带 overlay |
+|---|---|---|---|---|
+| `G-dirty-worktree-off` | `_check_clean`（有未提交改动就拒） | 往**用户未提交的活**里叠随机内容 | SURVIVED 0/1 | **KILLED** 1/1 |
+| `G-branch-clash-off` | gen 拒同名分支 | 反复生成互相踩，留下**半成品仓** | SURVIVED 0/1 | **KILLED** 1/1 |
+| `C-guard-unavailable-off` | 拿不到仓外联接防线时转成 `ConflictError` | 拒绝信号**裸奔成 ImportError**，调用方接不住 | SURVIVED 0/1 | **KILLED** 1/1 |
+
+杀它们的是 `test_conflicts.py` 的 `t_gen_dirty` / `t_gen_branch_clash` /
+`t_guard_unavailable`，该套件 17 → **20 条全过**。
+
+⚠ **这两条探针第一次都写错了判据形状**：一条写成「只 sig 有没有抛」→
+`PROBE-NOOP`（关掉 clash 闸后 git 自己也会抛 GenError，签名没变）；
+另一条让 ImportError 裸奔把探针本身打崩 → `MUTANT-UNLOADABLE`。
+改成 **sig 消息内容 / 错误归类** 才测出来 —— 与 `C-merge-add-scope-off` 那次
+同一个教训：**判据要判「哪条闸拒的」，不是「有没有拒绝」**。
+
+⇒ 提交前跑 `--all` 会看到 **20/28 = 71.4%**（8 条存活，全部有解释）；提交后回到 28/28。
+
+**全量基线（带 overlay）**：有效 28 / KILLED **28** / 存活 **0** / VOID **0**，
+杀灭率 **100.0%**，1228 秒，rc=0，无 ENGINE-ERROR。
+落盘 `D:\aigit_mut_tmp\mut\baseline28.json`。
+
+顺带修掉一个**引擎自身的真缺陷**：`S-ab-trackingref-off` 第一次跑直接
+`ENGINE-ERROR: KeyError: 'test_aigit_net.py'` —— `SUITE_PARSERS` 里没有这个
+套件（与 `test_f06_guard.py` 那次同一类）。补解析器时又发现**点计数**有个
+潜在 bug：`dot-pass-%d` 用**行内**下标，两行各有 5 个点会生成两套同名、去重后
+只剩 5 个。实测 `test_aigit_net.py` 的 56 个点散在 **12 行**上，旧写法只会数出
+13；`test_history_ops.py` 恰好把 37 个点挤在**一行**，所以一直没暴露。改成
+**跨行全局计数** + 新增 `dots_prefix_are_pass`（数行首连续的点，因为该套件的点
+后面紧跟着用例自己打的说明文字）。`--selftest-parsers` → **12/12 份 fixture，
+覆盖 10/10 个套件**；拿**真实**输出喂解析器：net 56/56、history 37/37 全对。
 
 其他自检脚本（由其他开发线维护）：
 
@@ -519,9 +825,14 @@ python selftest.py
 
 | 文件 | 编码 / 换行 | 作用 |
 |---|---|---|
+| `.gitattributes` | UTF-8 无 BOM + LF | 钉住工作区换行：`.py/.md/.txt`=LF、`.ps1/.bat`=CRLF。**没有它，新克隆会把 `.py` 变 CRLF，门禁必红** |
 | `aigit.bat` | **GBK** + CRLF | 双击运行的启动器，中文报错。**别用 UTF-8 保存** |
 | `aigit.ps1` | ASCII + UTF-8 无 BOM + CRLF | PowerShell 启动器，英文报错，参数更多 |
 | `smoke.py` | UTF-8 无 BOM + LF | 纯 stdlib 无头自检，62 条断言 |
+| `test_aigit_contract.py` | UTF-8 无 BOM + LF | 响应形状契约测试，8 个端点 + 自证组，`--selftest` 秒出 |
+| `mutation_runner.py` | UTF-8 无 BOM + LF | 变异测试引擎：拆掉安全闸看有没有套件咬住（见「测试集」一节） |
+| `find_test_gaps.py` | UTF-8 无 BOM + LF | 找「零提及」响应面（AST-only，面来自真跑 server；只给下界，不反推） |
+| `tools/check-encoding.ps1` | UTF-8 无 BOM + **CRLF** | 编码门禁本体。仓搬到 `D:\project\aigit` 后必须**跟着搬**，否则 `litematica-preview` 那份扫不到本仓（见「为什么需要 `.gitattributes`」末节） |
 | `server.py` | — | HTTP 层，本机服务，只 bind `127.0.0.1` |
 | `gen.py` | — | 测试数据生成器，不依赖 HTTP，可单独跑 |
 | `aigit_perf.py` | UTF-8 无 BOM + LF | **可选**性能层（分页 / diff 截断 / status 快路径）。默认不挂，靠 `--serve` 显式开；不带参数跑 = 纯内存自检 |
@@ -545,3 +856,49 @@ python selftest.py
 `.bat` 不参与 `check-encoding.ps1` 的门禁（它的 `$expect` 表里没有 `.bat` 条目，
 整个检查对 `.bat` 跳过），因为 cmd 的编码规则和 PowerShell 完全不同，
 用同一把尺子量必然误报。
+
+### 为什么需要 `.gitattributes`（2026-10-06 补）
+
+本机 `core.autocrlf = true`，而仓库里原先**没有** `.gitattributes`。后果不是
+「现在红」，而是**新克隆必红**：git 会把 `.py` / `.md` / `.txt` 全部转成
+CRLF，而门禁要求它们是 LF。当时工作区之所以还是 LF，只是因为这些文件从没被
+重新 checkout 过 —— 属于时序运气，不是配置正确。
+
+反事实实测（`git checkout-index` 从索引导出到临时目录，有/无那份文件各跑一次）：
+
+| 文件 | 无 `.gitattributes` | 有 `.gitattributes` |
+|---|---|---|
+| `test_aigit.py` | **CRLF** | LF |
+| `README.md` | **CRLF** | LF |
+| `aigit.ps1` | CRLF | CRLF |
+| `aigit.bat` | CRLF | CRLF |
+
+属性优先于 `core.autocrlf`，所以写死之后换机器 / 新克隆出来的换行形态也一致。
+只钉**门禁真正检查**的后缀（`.py/.md/.txt`=LF、`.ps1`=CRLF），外加 `.bat`
+（README 已写明它是 GBK+CRLF）。`.html` / `.js` **故意不钉**：门禁不检查它们，
+而仓里现有 2 个 `.html` 的工作区形态并不一致（1 个 CRLF / 1 个 LF），给它们加
+规则会顺手改掉现状，属于本次授权之外。
+
+### 编码门禁现在在**仓内**（2026-10-21 补）
+
+仓从 `litematica-preview\tools\aigit` 搬到 `D:\project\aigit` 之后，
+`litematica-preview\tools\check-encoding.ps1` 的 `$Root` 是
+`litematica-preview`，**不再扫 aigit** —— 门禁对它是失效的。
+
+修法：把那份脚本复制进 **`tools\check-encoding.ps1`**（`$Root = Split-Path -Parent
+$PSScriptRoot` = 仓根），aigit 从此**自带门禁**，不依赖兄弟项目。
+
+实测：
+
+| 步骤 | 结果 |
+|---|---|
+| `powershell -File tools\check-encoding.ps1` | **OK，0 advisory，rc=0**，3.8 秒 |
+| **阳性对照**：塞一个 UTF-16LE BOM 的 `.py` | `rc=1`，报 `\_enc_positive_control.py  UTF-16LE BOM  6 bytes  True` |
+| 移除后 | 回到 **OK，rc=0** |
+
+⚠ **复制过来时必须转成 CRLF**：`$expect` 表要求 `.ps1` = CRLF，而**源文件本身是
+LF**（167 LF / 0 CRLF）—— 直接拷贝会让门禁**把自己报成 advisory**。
+转成 CRLF 后 0 advisory。
+
+⚠ 源文件（`litematica-preview\tools\check-encoding.ps1`）**仍是 LF**，那边跑门禁
+会把自己报成 advisory。**那是另一条线的事，本轮没动它。**
