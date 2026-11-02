@@ -1754,7 +1754,7 @@ function doStage(paths, unstage) {
     toast("warn", "没有可" + (unstage ? "取消暂存" : "暂存") + "的已跟踪改动。");
     return Promise.resolve();
   }
-  return api(unstage ? "/api/unstage" : "/api/stage", { method: "POST", body: { files: paths } })
+  return api(unstage ? "/api/unstage" : "/api/stage", { method: "POST", body: { files: paths, status: false } })
     .then(function (d) {
       applyStatus(d);
       S.openKey = null;
@@ -1881,7 +1881,7 @@ function openDiscardConfirm(paths, plan) {
         /* confirmed 只认 JSON 布尔。写 confirmed: "true" 会被 _bb 拒成 400
            —— 那是对的：一个把 false 序列化成字符串的前端，在这里等于
            「没确认」。 */
-        body: { files: paths, confirmed: true }
+        body: { files: paths, confirmed: true, status: false }
       })
         .then(function (d) {
           applyStatus(d);
@@ -2034,7 +2034,7 @@ function doNewBranch() {
         return;
       }
       closeModal();
-      api("/api/branch", { method: "POST", body: { name: name } })
+      api("/api/branch", { method: "POST", body: { name: name, status: false } })
         .then(function (d) {
           applyStatus(d);
           S.openKey = null;
@@ -2057,7 +2057,7 @@ function doCheckout(name) {
     okLabel: "切换",
     onOk: function () {
       closeModal();
-      api("/api/checkout", { method: "POST", body: { name: name } })
+      api("/api/checkout", { method: "POST", body: { name: name, status: false } })
         .then(function (d) {
           applyStatus(d);
           S.openKey = null;
@@ -2080,7 +2080,7 @@ function doCommit(thenLog) {
     $("msg").focus();
     return;
   }
-  api("/api/commit", { method: "POST", body: { message: msg } })
+  api("/api/commit", { method: "POST", body: { message: msg, status: false } })
     .then(function (d) {
       applyStatus(d);
       $("msg").value = "";

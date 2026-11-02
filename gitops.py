@@ -90,6 +90,13 @@ WRITE = "write"
 LEVELS = (OFF, READ, WRITE)
 
 
+# P1 计数钩子(doc/aigit-perf.md §12.2): 由 server 注入
+# (`_gitops.COUNT_HOOK = server._count_hook`), 记每次 spawn 的子命令名。
+# 默认 None(独立使用零开销); 本模块按自己的规矩不 import aigit 模块,
+# 闸(NetGate)与中和层(guard)照旧 —— 这里只补账不碰闸。
+COUNT_HOOK = None
+
+
 class NetError(Exception):
     """本层所有可预期失败的唯一出口。带 code,让调用方靠 code 分支而不是 match 中文。"""
 
@@ -477,7 +484,12 @@ class GitOps(object):
         `confirmed` 在这里是**第二道**,不是唯一一道: 即使将来有人新写了个
         `do_xxx()` 忘了调 `_check_bool`, 只要它跑的是 WRITE 级动词而没把
         confirmed=True 传下来, 这里照样拒。防的就是这种「后来者漏了检查」。
+
+        COUNT_HOOK(可选): server 注入的 P1 计数回调(doc/aigit-perf.md §12.2),
+        只记子命令名; 未注入(独立使用)时零开销。闸与中和层照旧不动。
         """
+        if COUNT_HOOK is not None:
+            COUNT_HOOK(args)
         level, reason = self._verb_level(args)
         if level is None:
             raise NetError("拒绝执行 git %r:%s" % (args[0] if args else "", reason),

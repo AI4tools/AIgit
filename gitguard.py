@@ -91,6 +91,7 @@ aigit 把「目录/仓库」交给不受信的来源(下载、解压、拷贝、
 
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -144,6 +145,66 @@ _ENV_KEEP = {
     "GIT_TERGE_AUTOEDIT": "no",      # conflicts 原有
     "GIT_CONFIG_NOSYSTEM": "1",      # 系统级配置整个读不到
 }
+
+
+#: 从**用户视角**透传给 git 的配置键 —— 只收「影响结果、不能执行任何程序」的
+#: `core.*`：它们改变的是**比较/输出**（换行归一、大小写、路径引用、忽略文件位置），
+#: 不是安全面。
+#:
+#: 实测事故（2026-10-28，doc/aigit-perf.md §12.16）：Git for Windows 的 **system**
+#: 配置默认 `core.autocrlf=true`，而 `safe_env()` 用 `GIT_CONFIG_NOSYSTEM=1` 把它
+#: 屏蔽掉了。于是「plain git 检出 CRLF、索引存 LF」的仓：plain git 说「干净」，
+#: aigit 说「已修改」（diff 里却空空如也）；更糟的是**通过 aigit 提交**会把 CRLF
+#: 写进对象库，与用户 git 的历史不一致。
+#:
+#: 必须屏蔽的 executable 面**不在这里**：hooksPath / filter / gpg / ssh / pager /
+#: editor / fsmonitor / attributesFile / uploadpack.packObjectsHook / gitproxy。
+SEMANTIC_KEYS_RX = (r"^core\.(autocrlf|eol|safecrlf|symlinks|ignorecase|filemode|"
+                    r"quotepath|precomposeunicode|excludesfile|trustctime|checkstat)$")
+
+_SEM_CACHE = {}
+_SEM_MU = threading.Lock()
+
+
+def semantic_overrides(root):
+    """`SEMANTIC_KEYS_RX` 在**用户环境**下的取值；per-root 缓存，失败就是 {}。
+
+    刻意不经过 `safe_env()`：这条调用问的是「用户的 git 会怎么读这个仓」。
+    `git config --get-regexp` 不执行任何钩子/过滤器/别名。
+    """
+    key = os.path.normcase(os.path.abspath(str(root)))
+    with _SEM_MU:
+        if key in _SEM_CACHE:
+            return _SEM_CACHE[key]
+    out = {}
+    try:
+        p = subprocess.run(["git", "-C", str(root), "config", "--get-regexp",
+                            SEMANTIC_KEYS_RX],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=30, env=dict(os.environ))
+        if p.returncode == 0:
+            for line in (p.stdout or "").splitlines():
+                k, _, v = line.partition(" ")
+                if k:
+                    out[k.strip().lower()] = v
+    except Exception:
+        out = {}
+    with _SEM_MU:
+        _SEM_CACHE[key] = out
+    return out
+
+
+def apply_semantic(env, root):
+    """把用户视角的语义配置注入 env（走 GIT_CONFIG_*，优先级最高、位置无关）。"""
+    sem = semantic_overrides(root)
+    if not sem:
+        return env
+    env = dict(env)
+    env["GIT_CONFIG_COUNT"] = str(len(sem))
+    for i, (k, v) in enumerate(sorted(sem.items())):
+        env["GIT_CONFIG_KEY_%d" % i] = k
+        env["GIT_CONFIG_VALUE_%d" % i] = v
+    return env
 
 
 def safe_env(base=None, net_enabled=False):

@@ -48,6 +48,9 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import gitguard
+import gitrefs
+import gitcat
+import gitobjects
 
 # 仓库级互斥的唯一实现(2026-03 从 conflicts.py 搬进中立模块)。
 # repolock 自己只 import os / threading, 所以这里没有新环。
@@ -137,6 +140,30 @@ def _need(cond, message, code="history_error", **extra):
         raise HistoryError(message, code, **extra)
 
 
+def _need_msg(value, what, code="bad_message"):
+    """消息类参数收口：只收 str / None，且不许带 NUL。
+
+    为什么必须收口：`git ... -m <msg>` 里带 NUL 时，Python 在 subprocess 层抛
+    ValueError（embedded null byte），被顶层兜底成「请求参数不合法:...」——
+    用户看到的是 Python 文案；更糟的是**有些命令在失败前已经改了索引/工作区**
+    （commit 就是，见 `Repo.commit()` 里那段）。
+    非字符串（列表/数字）以前会被 `%s` / git 静默接受，现在一律拒。
+    """
+    if value is None:
+        return None
+    _need(isinstance(value, str), "%s必须是字符串,收到 %s"
+          % (what, type(value).__name__), code=code)
+    _need("\x00" not in value, "%s里不能包含 NUL 字符" % what, code=code)
+    return value
+
+
+# P1 计数钩子(doc/aigit-perf.md §12.2): 由 server.py 的接线函数注入
+# (`_hops.COUNT_HOOK = server._count_hook`), 记每次 git spawn 的子命令名到
+# `X-aigit-git-calls/cmds` 响应头。默认 None(单测直跑零开销), 本模块不 import
+# server(避免顶层反向依赖), 中和闸 gitguard 照旧 —— 这里只补**账**,不碰**闸**。
+COUNT_HOOK = None
+
+
 class HistoryOps:
     """对一个本地仓库的历史操作。构造后不写仓库,第一次写发生在某个 do_* 里。"""
 
@@ -167,8 +194,13 @@ class HistoryOps:
         GIT_SEQUENCE_EDITOR / GIT_MERGE_AUTOEDIT)全部保留,语义不变;
         gitguard 在此之上再叠一层「仓库配置指向的程序一个都执行不到」,
         其中包含必须剥离的 `GIT_CONFIG_*`(实测能注入枚举看不到的 driver)。
+
+        COUNT_HOOK(可选): server 注入的 P1 计数回调(doc/aigit-perf.md §12.2),
+        只记子命令名进 `X-aigit-git-calls/cmds` 响应头; 未注入(单测直跑)时零开销。
         """
-        env = gitguard.safe_env(net_enabled=False)
+        if COUNT_HOOK is not None:
+            COUNT_HOOK(args)
+        env = gitguard.apply_semantic(gitguard.safe_env(net_enabled=False), self.root)
         with self._lock:
             p = subprocess.run(
                 gitguard.for_root(self.root, args, net_enabled=False, base=env),
@@ -330,13 +362,25 @@ class HistoryOps:
                         "查不到不等于没推送过。"}
 
     def default_branch(self):
-        """判断哪个分支是 default。顺序:远端 HEAD -> main -> master -> None。"""
-        p = self._run(["for-each-ref", "--format=%(refname:short)",
-                       "refs/remotes/*/HEAD"], check=False)
-        lines = [ln.strip() for ln in p.stdout.splitlines() if ln.strip()]
-        if lines:
-            # "origin/main" -> "main"
-            return lines[0].split("/", 1)[1] if "/" in lines[0] else lines[0]
+        """判断哪个分支是 default。顺序:远端 HEAD -> main -> master -> None。
+
+        快路径：`refs/remotes/<r>/HEAD` 是符号引用，直接读文件就能拿到
+        **它指向的分支名**（省一次 spawn）。
+
+        ⚠ 不能用 `%(refname:short)`：实测它对 `refs/remotes/origin/HEAD` 输出
+        **`origin`**（远端 HEAD 的短名规则），旧实现据此返回 `"origin"`，再被
+        `_branch_exists("origin")` 挡掉 —— 这一支从来没生效过。2026-10-27 修，
+        回退路径改用 `%(symref)`（真正的目标引用）。见 doc §12.13.6。
+        """
+        rb = gitrefs.remote_head_branch(self.root)
+        if rb:
+            return rb
+        p = self._run(["for-each-ref", "--format=%(symref)", "refs/remotes/*/HEAD"],
+                      check=False)
+        for line in p.stdout.splitlines():
+            t = line.strip()
+            if t.startswith("refs/remotes/"):
+                return t.rsplit("/", 1)[-1]
         names = {b["name"] for b in self.list_branches()}
         for cand in ("main", "master"):
             if cand in names:
@@ -344,6 +388,17 @@ class HistoryOps:
         return None
 
     def list_branches(self):
+        """本地分支（名字 + 当前标记 + sha）。
+
+        快路径：直接读 `refs/heads` + `packed-refs` + `HEAD`，省一次 spawn。
+        看不懂就回退 `for-each-ref`；输出是显示，宁可慢也不报错名字。
+        """
+        shas = gitrefs.head_shas(self.root)
+        state = gitrefs.head_state(self.root)
+        if shas is not None and state is not None:
+            cur = state[1] if state[0] == "branch" else None
+            return [{"name": n, "current": n == cur, "sha": shas[n]}
+                    for n in sorted(shas)]
         out = self._out(["for-each-ref",
                          "--format=%(refname:short)" + FS + "%(HEAD)" + FS + "%(objectname)",
                          "refs/heads"], check=False)
@@ -452,6 +507,7 @@ class HistoryOps:
 
     def do_stash(self, message=None, include_untracked=False, keep_index=False):
         """真的暂存。git stash 是可恢复的,所以不设确认闸。"""
+        message = _need_msg(message, "stash 说明")
         info = self.plan_stash(message, include_untracked)
         args = ["stash", "push"]
         if include_untracked:
@@ -467,8 +523,20 @@ class HistoryOps:
                 "stash_count": len(self.list_stashes())}
 
     def list_stashes(self, limit=50):
-        """stash 列表。索引就是 do_stash_pop/apply/drop 接受的那个 index。"""
-        out = self._out(["stash", "list", "-%d" % _clamp(limit, 1, 200)], check=False)
+        """stash 列表。索引就是 do_stash_pop/apply/drop 接受的那个 index。
+
+        快路径：`git stash list` 的每一行就是 `"stash@{n}: " + reflog 消息`，
+        而 reflog 就是 `.git/logs/refs/stash`。所以直接读文件拼出同样的行，
+        **后面那段解析一个字都不用改**（同一份解析器 ⇒ 不会漂）。
+        读不到（worktree / reflog 结构不认识）就回退原命令。
+        """
+        n = _clamp(limit, 1, 200)
+        entries = gitrefs.stash_entries(self.root)
+        if entries is None:
+            out = self._out(["stash", "list", "-%d" % n], check=False)
+        else:
+            out = "\n".join("stash@{%d}: %s" % (i, msg)
+                            for i, (_sha, msg) in enumerate(entries[::-1][:n]))
         rows = []
         for line in out.splitlines():
             if not line.strip():
@@ -612,16 +680,43 @@ class HistoryOps:
         在 warning 里逐条说明的事。要提交它们,调用方自己 stage 之后再进来。
         """
         self._require_confirm("amend", confirmed)
+        message = _need_msg(message, "提交信息")
         info = self.plan_amend(message)
         args = ["commit", "--amend", "--no-verify", "--allow-empty-message"]
         if message is not None:
             args += ["-m", message]
-        rc, out = self._ok(args)
-        _need(rc == 0, "git commit --amend 失败:" + out, code="amend_failed")
-        new_sha = self.head_sha()
+        # 🔴 归属: commit 与「把**它自己**的 sha / subject 读回来」之间不能有缝。
+        #   `_run` 是**每条命令各取一次**锁(repolock 的 RLock, 按 root 全域同一把),
+        #   所以原写法是 3 次**互相独立**的取锁、中间 2 条缝: 别的 amend 可以挤进来
+        #   把 HEAD 再改一次, 于是本请求报出去的是**别人的提交**。
+        #   实测(台账 §22.2, C4): 响应 subject 与自己提交的 message 不符 **10/18
+        #   = 55.6%**, 两次独立跑一致; 最狠的一条返回的 subject 是原始 base
+        #   提交的 "c1: base"。
+        #   修法 = 让归属所需的三条命令**处在同一次持有里**, 缝 = 0。
+        #
+        #   为什么这样写不会死锁: self._lock 是 **RLock**, 同线程再取是重入而不是等待。
+        #   实测先决条件(不是照抄 repolock.py:38-49 的注释):
+        #     · Repo x2 / HistoryOps x2 / conflicts.Git x2 / repo_git_lock 共 7 个
+        #       引用, 唯一锁对象数 = 1(同 id), 全部 RLock;
+        #     · 同线程 acquire 两次(blocking=False, 不挂死)目标锁返 True、
+        #       普通 threading.Lock 返 False —— 阴性对照, 所以这把尺子抓得住;
+        #     · 拟真三层嵌套实测跑通, 最大层数 3, 未挂死。
+        #
+        # ⚠ 只把**参与归属**的三条命令放进去。dirty() 留在锁外: 它只是工作区
+        #   快照, 不参与归属判断, 而这把锁是 server / history / conflicts 三域
+        #   共用的 —— 多在锁里待一条 git 命令的时长, 就多一分别人排队。
+        # ⚠ `info["old_sha"]` 是 plan_amend **在锁外**读的, 所以 `rewritten` 这个
+        #   布尔在并发下仍是 advisory; 权威的是 new_sha 与 subject, 两者现在与
+        #   本次 commit 原子。要 old_sha 也权威就得把整个 plan 搬进锁里, 那是
+        #   另一件事(会把 plan 的多条 git 命令也纳入临界区), 这里不做。
+        with self._lock:
+            rc, out = self._ok(args)
+            _need(rc == 0, "git commit --amend 失败:" + out, code="amend_failed")
+            new_sha = self.head_sha()
+            subject = self.subject_of(new_sha)
         return {"ok": True, "old_sha": info["old_sha"], "new_sha": new_sha,
                 "rewritten": info["old_sha"] != new_sha,
-                "subject": self.subject_of(new_sha),
+                "subject": subject,
                 "unstaged_kept": self.dirty()["unstaged"], "output": out}
 
     # ═══════════════════════════════════════════════════ 撤销上一次提交
@@ -677,11 +772,23 @@ class HistoryOps:
                               else "undo-last-commit", confirmed)
         info = self.plan_undo_last_commit(drop_changes)
         args = ["reset", "--hard" if drop_changes else "--soft", "HEAD~1"]
-        rc, out = self._ok(args)
-        _need(rc == 0, "git reset 失败:" + out, code="reset_failed")
+        # 🔴 归属: `reset` 与「把**它自己**造成的 HEAD 读回来」之间不能有缝。
+        #   与 do_amend 同一个根因: `_run` 是**每条命令各取一次**锁, 所以原写法
+        #   在 `reset` 与 `head_sha()` 之间留了一条缝, 别的 undo / revert /
+        #   reflog 恢复能挤进来再改一次 HEAD —— 于是本请求报出去的是**别人的**落点。
+        #   实测(台账 §22.11, C4B): 成功的 undo 响应里 **8/16 = 50.0%** 报了与
+        #   另一条响应**完全相同**的 head_now, 而两条 undo 是各自 HEAD~1 一级
+        #   一级往回退, 落点不可能相同。
+        # ⚠ `target_sha` 与 `recoverable_via` 是 plan 在**锁外**读的, 并发下仍
+        #   是 advisory(同 do_amend 里那条注释)。要它们也权威就得把整个 plan
+        #   搬进锁里, 那是另一件事, 这里不做。
+        with self._lock:
+            rc, out = self._ok(args)
+            _need(rc == 0, "git reset 失败:" + out, code="reset_failed")
+            head_now = self.head_sha()
         return {"ok": True, "undone": info["target_sha"],
                 "undone_short": info["target_short"],
-                "mode": info["mode"], "head_now": self.head_sha(),
+                "mode": info["mode"], "head_now": head_now,
                 "recoverable_via": info["recoverable_via"], "output": out}
 
     # ═══════════════════════════════════════════════════ reflog 恢复
@@ -701,17 +808,115 @@ class HistoryOps:
                 return "git reset %s %s" % (flag, "HEAD@{%d}" % i)
         return "git reflog"
 
+    # -- 快路径：只读文件 + 常驻 cat-file（2026-10-27）---------------------
+    def _short_sha(self, sha, mode):
+        """`%h` 的宽度：`core.abbrev` 指定就用它；auto 则从 7 起逐级试探唯一性。
+
+        唯一性判定**复用 git 自己**：`cat-file --batch` 对歧义前缀答 ambiguous，
+        对我们找的那个对象答 ok —— 那正是 git 给 `%h` 加长的依据；自己扫对象库
+        既慢又可能与 git 的规则漂移。
+        """
+        if mode == "full":
+            return sha
+        start = mode if isinstance(mode, int) else 7
+        for length in range(start, len(sha) + 1):
+            st, got, _typ, _data = gitcat.read_ex(self.root, sha[:length])
+            if st == "ambiguous":
+                continue
+            if st == "ok" and got == sha:
+                return sha[:length]
+            return None
+        return None
+
+    def _reflog_fast(self, n):
+        ents = gitrefs.head_reflog(self.root)
+        if ents is None:
+            return None
+        mode = gitrefs.core_abbrev(self.root)
+        if mode is False:
+            return None
+        rows = []
+        for i, (sha, msg) in enumerate(ents[::-1][:n]):
+            st, _got, typ, data = gitcat.read_ex(self.root, sha)
+            if st != "ok" or typ != "commit":
+                return None
+            info = gitobjects.parse_commit(data)
+            if info is None:
+                return None
+            name, ts, tz = info["author"]
+            short = self._short_sha(sha, mode)
+            if short is None:
+                return None
+            rows.append({"index": i, "sha": sha, "short": short,
+                         "selector": "HEAD@{%d}" % i, "author": name,
+                         "date": gitobjects.iso(ts, tz), "action": msg})
+        return rows
+
+    def _tags_fast(self, n):
+        refs = gitrefs.tag_refs(self.root)
+        if refs is None or len(refs) > 500:
+            return None                   # 标签太多就交回 git（要全读才能排序）
+        rows = []
+        for name, sha in sorted(refs.items()):
+            st, _got, typ, data = gitcat.read_ex(self.root, sha)
+            if st != "ok":
+                return None
+            if typ == "tag":
+                info = gitobjects.parse_tag(data)
+                if info is None:
+                    return None
+                ts, tz = info["tagger"][1], info["tagger"][2]
+                msg, otype = info["message"], "tag"
+            elif typ == "commit":
+                info = gitobjects.parse_commit(data)
+                if info is None:
+                    return None
+                ts, tz = info["committer"][1], info["committer"][2]
+                msg, otype = info["message"], "commit"
+            else:
+                return None               # 指到 blob/tree 的极少见，交回 git
+            rows.append({"name": name, "sha": sha, "type": otype,
+                         "subject": gitobjects.subject(msg),
+                         "date": gitobjects.short_date(ts, tz),
+                         "annotated": otype == "tag", "_ts": ts})
+        if len({r["_ts"] for r in rows}) < len(rows):
+            # 时间戳打平：git 是「按 refname 排好序后**稳定**排序」，所以打平项
+            # 保持字典序。这里用同样的两步（上面已按 name 建行，这里稳定排序），
+            # 不再整条回退 —— 实测同秒创建的一组标签, git 的顺序就是字典序。
+            pass
+        rows.sort(key=lambda r: -r["_ts"])
+        out = []
+        for r in rows[:n]:
+            r.pop("_ts", None)
+            out.append(r)
+        return out
+
     def list_reflog(self, limit=30):
-        """reflog 列表。reflog 为空(仓库无提交)时返回空 list,不是错误。"""
-        if not self._has_commits():
-            return []
+        """reflog 列表。reflog 为空(仓库无提交)时返回空 list,不是错误。
+
+        ⚠ 2026-10-21 惰性守卫: 去掉了一次 `_has_commits()`(一次 spawn ≈40ms)。
+        `git reflog` 在空仓上本来就 rc=128, 所以「失败 → 返回 []」与今天**可观察
+        行为逐字相同**(空仓今天也是 200 + [])。注: 这里 rc!=0 一律 [] — 与原来
+        check=False 时解析空 stdout 的效果一致。
+
+        2026-10-27: 快路径 —— reflog 文件给出 (sha, 消息)，作者名/作者时间从
+        `cat-file` 常驻进程读 commit 对象；`%h` 的宽度用「前缀在 batch 里能否
+        唯一解析」逐级试探（与 git 自己的判定同源）。任何一处不确定就整条回退。
+        """
+        n = _clamp(limit, 1, 500)
+        fast = self._reflog_fast(n)
+        if fast is not None:
+            return fast
         # selector **自己拼**而不用 %gd:配了 --date 之后 %gd 会吐出日期
         # (实测 "HEAD@{2026-10-01 00:21:27 +0800}"),那不是能粘回命令行的东西。
         # 列表下标即 reflog 序号,所以 HEAD@{index} 一定对得上。
-        out = self._out(["reflog", "-%d" % _clamp(limit, 1, 500),
-                         "--date=iso", "--pretty=format:" + FS.join(
-                             ["%H", "%h", "%an", "%ad", "%gs"])],
-                        check=False)
+        p = self._run(["reflog", "-%d" % n,
+                       "--date=iso", "--pretty=format:" + FS.join(
+                           ["%H", "%h", "%an", "%ad", "%gs"])],
+                      check=False)
+        if p.returncode != 0:
+            return []
+        out = p.stdout or ""
         rows = []
         for line in out.splitlines():
             if not line.strip():
@@ -729,7 +934,11 @@ class HistoryOps:
         rows = self.list_reflog(limit=500)
         _need(rows, "reflog 是空的(仓库还没有提交,或 reflog 被 gc 清掉),"
                     "没有可恢复的历史。", code="empty_reflog")
-        _need(isinstance(index, int) and 0 <= index < len(rows),
+        # 类型必须先判: 下面那句 `% (index, len(rows))` 会在 _need 之前求值,
+        # index=None 时先抛 TypeError, 于是泄漏「%d format: ... not NoneType」。
+        _need(isinstance(index, int) and not isinstance(index, bool),
+              "reflog 索引必须是整数,收到 %r" % (index,), code="bad_index")
+        _need(0 <= index < len(rows),
               "reflog 里没有第 %d 条(共 %d 条)" % (index, len(rows)),
               code="bad_index")
         _need(mode in ("soft", "mixed", "hard", "merge"),
@@ -749,11 +958,20 @@ class HistoryOps:
     def do_restore_from_reflog(self, index=0, mode="soft", confirmed=False):
         self._require_confirm("restore-from-reflog", confirmed)
         info = self.plan_restore_from_reflog(index, mode)
-        rc, out = self._ok(["reset", "--" + info["mode"], info["target"]["sha"]])
-        _need(rc == 0, "git reset --%s 失败:%s" % (info["mode"], out),
-              code="reset_failed")
+        # 🔴 归属: 与 do_amend / do_undo_last_commit 同一个根因。这里还多一条好处:
+        #   reset 的目标是 reflog **某一行**里读出来的 sha, 而那行写下之后就不再变
+        #   —— 每次 HEAD 移动只是往 reflog **追加**一条。所以 `head_now` 本来就该
+        #   **恒等于** `restored.sha`: 那是判据成立的前提, 不是修法带来的性质。
+        #   实测(台账 §22.11, C4B): 成功响应里 **6/16 = 37.5%** head_now ≠
+        #   restored.sha。
+        with self._lock:
+            rc, out = self._ok(["reset", "--" + info["mode"],
+                                info["target"]["sha"]])
+            _need(rc == 0, "git reset --%s 失败:%s" % (info["mode"], out),
+                  code="reset_failed")
+            head_now = self.head_sha()
         return {"ok": True, "restored": info["target"], "mode": info["mode"],
-                "head_now": self.head_sha(), "output": out}
+                "head_now": head_now, "output": out}
 
     # ═══════════════════════════════════════════════════ revert
 
@@ -809,17 +1027,27 @@ class HistoryOps:
         if mainline is not None:
             args += ["-m", str(mainline)]
         args.append(info["sha"])
-        rc, out = self._ok(args)
-        if rc != 0:
-            conflicted = self._conflicted_paths()
-            raise HistoryError(
-                "revert 失败:%s%s\n仓库可能停在 revert 中途,"
-                "用 do_revert_abort() 收场,或者手工解冲突后 git revert --continue。"
-                % (out, ("\n冲突路径:" + ", ".join(conflicted)) if conflicted else ""),
-                code="revert_conflict" if conflicted else "revert_failed",
-                conflicted=conflicted, output=out)
+        # 🔴 归属: 与 do_amend 同一个根因。这里的判据是「new_head 必须**是一个
+        #   revert 提交**」—— git 自己写的提交信息形如 `Revert "<原 subject>"`,
+        #   所以 new_head 一旦被别人的提交顶替, 它的 subject 就是 `amend T3 r5`
+        #   这类东西, 直接抓得到(而且这条**不依赖并发时序**, 抓的是绝对性质)。
+        #   实测(台账 §22.11, C4B): 成功响应里 **9/12 = 75.0%** 的 new_head 不是
+        #   revert 提交。
+        # ⚠ 失败路径里的 `_conflicted_paths()` 留在锁**内**: 它读的就是刚刚这条
+        #   失败 revert 留下的索引/工作区状态, 放出去量到的是别人的。
+        with self._lock:
+            rc, out = self._ok(args)
+            if rc != 0:
+                conflicted = self._conflicted_paths()
+                raise HistoryError(
+                    "revert 失败:%s%s\n仓库可能停在 revert 中途,"
+                    "用 do_revert_abort() 收场,或者手工解冲突后 git revert --continue。"
+                    % (out, ("\n冲突路径:" + ", ".join(conflicted)) if conflicted else ""),
+                    code="revert_conflict" if conflicted else "revert_failed",
+                    conflicted=conflicted, output=out)
+            new_head = self.head_sha()
         return {"ok": True, "reverted": info["short"], "mainline": mainline,
-                "new_head": self.head_sha(), "output": out}
+                "new_head": new_head, "output": out}
 
     def _revert_in_progress(self):
         """仓库是否停在 revert 中途。
@@ -972,10 +1200,16 @@ class HistoryOps:
     # ═══════════════════════════════════════════════════ 标签
 
     def list_tags(self, limit=100):
+        # 快路径（2026-10-27）：refs + 对象都由文件/常驻 cat-file 给出，0 spawn。
+        # 看不懂就整条回退下面的 for-each-ref —— 这是显示，不许猜。
+        n = _clamp(limit, 1, 500)
+        fast = self._tags_fast(n)
+        if fast is not None:
+            return fast
         # for-each-ref 只认 --count=<n>,不认 git log 那种 -<n> 简写。这里用
         # check=True:查询函数唯一的失败原因就是 git 自己出错,那必须冒出来,
         # 不能被 check=False 吞成"一个标签都没有" —— 那是静默失败。
-        out = self._out(["for-each-ref", "--count=%d" % _clamp(limit, 1, 500),
+        out = self._out(["for-each-ref", "--count=%d" % n,
                          "--sort=-creatordate",
                          "--format=" + FS.join(["%(refname:short)", "%(objectname)",
                                                "%(objecttype)", "%(contents:subject)",
@@ -997,6 +1231,7 @@ class HistoryOps:
         self._require_commits("打标签")
         name = self.validate_ref_name(name, "标签名")
         target = self._check_sha(sha or "HEAD", "提交")
+        message = _need_msg(message, "标签说明")
         if self._out(["for-each-ref", "--count=1", "refs/tags/" + name],
                      check=False).strip():
             _need(force, "标签 %s 已存在。删了重建,或者传 force=True 覆盖。"
@@ -1108,14 +1343,20 @@ class HistoryOps:
         截断在这里做,而且是在**问 git 之前**就决定好范围:先用 -L 把范围卡住,
         再在参数层把 limit 夹到 [1, MAX_BLAME_LINES]。十万行的文件不该让 git
         把整份 --line-porcelain 吐出来再由我们扔掉。
+
+        ⚠ 2026-10-21 惰性守卫: `_require_commits` 原来在**最前面**无条件跑
+        (每次请求一次 `rev-parse --verify HEAD` ≈40ms)。现在只在实际要**报错**时补跑
+        —— 失败路径的优先级与文案逐字不变(空仓 no_commits 优先于 no_such_file /
+        binary_file / blame_failed),判据是 test_blame_guard_signatures.py 与
+        doc/aigit-perf.md §12.4.1 第 4 行。成功路径因此少一次 spawn。
         """
         self._require_repo()
-        self._require_commits("blame")
         ap = self.resolve_path(path)
         rel = ap.relative_to(self.root).as_posix()
-        _need(ap.exists() or self._out(["cat-file", "-e", "HEAD:" + rel],
-                                       check=False).strip() != "",
-              "文件不存在,也没有历史:%s" % rel, code="no_such_file")
+        if not (ap.exists() or self._out(["cat-file", "-e", "HEAD:" + rel],
+                                        check=False).strip() != ""):
+            self._require_commits("blame")     # 空仓的报错优先级更高(今天的行为)
+            _need(False, "文件不存在,也没有历史:%s" % rel, code="no_such_file")
         # 二进制文件 blame 没意义,而且 porcelain 解析会被 NUL 搅乱。
         data = b""
         if ap.exists() and ap.is_file():
@@ -1124,8 +1365,9 @@ class HistoryOps:
         else:
             b = self._run(["cat-file", "blob", "HEAD:" + rel], check=False)
             data = b.stdout.encode("utf-8", "replace")[:8000]
-        _need(b"\0" not in data, "这是二进制文件,blame 没有意义。",
-              code="binary_file")
+        if b"\0" in data:
+            self._require_commits("blame")     # 同上: 空仓优先于 binary_file
+            _need(False, "这是二进制文件,blame 没有意义。", code="binary_file")
 
         limit = _clamp(limit, 1, MAX_BLAME_LINES)
         total = self._file_total_lines(ap, rel)
@@ -1147,8 +1389,10 @@ class HistoryOps:
             args += ["-L", "%d,%d" % (first, last)]
         args += ["--", rel]
         p = self._run(args, check=False)
-        _need(p.returncode == 0, "git blame 失败:" + (p.stderr or p.stdout).strip(),
-              code="blame_failed")
+        if p.returncode != 0:
+            self._require_commits("blame")     # 其它失败原因也保持空仓优先的旧文案
+            _need(False, "git blame 失败:" + (p.stderr or p.stdout).strip(),
+                  code="blame_failed")
         lines = p.stdout.split("\n")
         recs, i = [], 0
         while i < len(lines):

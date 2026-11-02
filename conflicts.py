@@ -82,6 +82,7 @@ import sys
 from pathlib import Path
 
 import gitguard
+import gitrefs
 
 __all__ = ["ConflictError", "Git", "ConflictResolver", "parse_markers",
            "repo_git_lock", "escaping_links", "install_escaping_guard"]
@@ -101,6 +102,12 @@ _GIT_CONFIG = [
     "-c", "core.safecrlf=false",
 ]
 
+# P1 计数钩子(doc/aigit-perf.md §12.2): 由 server.py 的接线函数注入
+# (`conflicts.COUNT_HOOK = server._count_hook`), 记每次 git spawn 的子命令名到
+# `X-aigit-git-calls/cmds` 响应头。默认 None(单测直跑零开销); 本模块依旧
+# **不 import server**(设计约束见文件头), gitguard 中和闸不受影响 —— 只补账不碰闸。
+COUNT_HOOK = None
+
 
 def _argv(root, args):
     """本模块**唯一**拼 git argv 的地方(两处 subprocess.run 都调它)。
@@ -119,14 +126,14 @@ def _argv(root, args):
         extra_pre=["--literal-pathspecs"] + _GIT_CONFIG)
 
 
-def _env():
+def _env(root):
     """本模块**唯一**造 env 的地方。
 
     原来手写的 5 个变量全部保留(语义不许变),`GIT_EDITOR` 那两个也在,
     再叠上 gitguard 的(其中就包括 `GIT_CONFIG_*` 的剥离 —— 这一条必需,
     实测环境注入能带进枚举看不到的 driver)。
     """
-    return gitguard.safe_env(net_enabled=False)
+    return gitguard.apply_semantic(gitguard.safe_env(net_enabled=False), root)
 
 
 class ConflictError(Exception):
@@ -231,13 +238,15 @@ class Git:
         self._lock = repo_git_lock(self.root)
 
     def run(self, args, check=True, binary=False):
+        if COUNT_HOOK is not None:
+            COUNT_HOOK(args)
         try:
             with self._lock:
                 p = subprocess.run(
                     _argv(self.root, args),
                     capture_output=True, text=not binary, encoding=None if binary else "utf-8",
                     errors=None if binary else "replace",
-                    env=_env(),
+                    env=_env(self.root),
                     timeout=GIT_TIMEOUT,
                 )
         except subprocess.TimeoutExpired:
@@ -265,12 +274,14 @@ class Git:
         if not specs:
             return {}
         try:
+            if COUNT_HOOK is not None:
+                COUNT_HOOK(["cat-file", "--batch"])
             with self._lock:
                 p = subprocess.run(
                     _argv(self.root, ["cat-file", "--batch"]),
                     input=("\n".join(str(s) for s in specs) + "\n").encode("utf-8"),
                     capture_output=True, timeout=GIT_TIMEOUT,
-                    env=_env(),
+                    env=_env(self.root),
                 )
         except subprocess.TimeoutExpired:
             raise ConflictError("git cat-file --batch 超时(>%ds)" % GIT_TIMEOUT)
@@ -511,6 +522,13 @@ class ConflictResolver:
 
     def __init__(self, root):
         self.git = Git(root)
+        # 2026-10-21: .git 目录解析缓存。_gd() 原来**每查一个状态文件就 spawn 一次**
+        # `rev-parse --git-dir`; merge_state() 一次请求要查 MERGE_HEAD / MERGE_MSG /
+        # ORIG_HEAD / MERGE_MSG(路径) —— 实测 6 次 spawn 里 4 次耗在这
+        # (doc/aigit-perf.md §12.7)。缓存后与仓库布局无关:worktree 的 .git 是文件时
+        # rev-parse 已经给出真正的 gitdir,这里只记住它。
+        # 多线程下两个线程同时算出的值是同一个(幂等),不需要加锁。
+        self._gitdir_cache = None
 
     # -- 护栏 ----------------------------------------------------------
     def _abs(self, rel):
@@ -540,13 +558,27 @@ class ConflictResolver:
             raise ConflictError("拒绝操作 .git 内的路径:%s" % rel)
         return p
 
+    def _gitdir(self):
+        """.git 的实际目录(**缓存**)。worktree/子模块的 .git 是文件 → gitdir 在别处。
+
+        快路径：`.git` 是**目录**时它按定义就是 gitdir，用不着 spawn 一次
+        `rev-parse --git-dir`（这一步原来让每个冷缓存的冲突端点白付 ~40ms）。
+        是文件（worktree / 子模块）或环境变量改写了布局，才回退去问 git。
+        """
+        if self._gitdir_cache is None:
+            gd = gitrefs.gitdir(self.git.root)
+            if gd is None:
+                out = self.git.run(["rev-parse", "--git-dir"]).stdout.strip()
+                base = Path(out)
+                if not base.is_absolute():
+                    base = self.git.root / base
+                gd = str(base)
+            self._gitdir_cache = Path(gd).resolve()
+        return self._gitdir_cache
+
     def _gd(self, name):
         """.git 下某个状态文件(可能 .git 是文件 → gitdir 指向别处)。"""
-        gd = self.git.run(["rev-parse", "--git-dir"]).stdout.strip()
-        base = Path(gd)
-        if not base.is_absolute():
-            base = self.git.root / base
-        return (base / name).resolve()
+        return (self._gitdir() / name).resolve()
 
     def _read_gd(self, name):
         p = self._gd(name)
@@ -587,6 +619,7 @@ class ConflictResolver:
         """当前合并态的完整快照。面板顶部那条横幅吃这个。"""
         merge_head = self._read_gd("MERGE_HEAD")
         msg = self._read_gd("MERGE_MSG")
+        orig = self._read_gd("ORIG_HEAD")   # 2026-10-21: 原来这条在下面的三元里读了**两遍**
         in_merge = bool(merge_head and merge_head.split())
         first_line = ""
         if msg:
@@ -596,15 +629,26 @@ class ConflictResolver:
                     break
         conflicts = self.list_conflicts() if in_merge else {
             "ok": True, "inMerge": False, "files": [], "count": 0}
+        # HEAD 的两件事（sha + 分支名）不再各 spawn 一次：
+        # 直接读 `.git/HEAD` 与 ref 文件即可，看不懂才回退到原来那两条 git。
+        hs = gitrefs.head_state(self.git.root)
+        if hs is not None:
+            head_sha = hs[2]
+            # 与 `rev-parse --abbrev-ref HEAD` 的可观察输出逐字对齐：
+            # 正常 → 分支名；游离 → "HEAD"；未出生 → git 也打 "HEAD"(rc=128)。
+            current = (hs[1] if hs[0] == "branch"
+                       else ("HEAD" if hs[0] in ("detached", "unborn") else None))
+        else:
+            head_sha = self.git.rev_parse("HEAD")
+            current = (self.git.run(["rev-parse", "--abbrev-ref", "HEAD"],
+                                    check=False).stdout.strip() or None)
         return {
             "ok": True,
             "inMerge": in_merge,
             "mergeHead": (merge_head or "").split()[0] if in_merge else None,
-            "origHead": (self._read_gd("ORIG_HEAD") or "").split()[:1][0]
-                        if self._read_gd("ORIG_HEAD") else None,
-            "head": self.git.rev_parse("HEAD"),
-            "currentBranch": (self.git.run(["rev-parse", "--abbrev-ref", "HEAD"],
-                                           check=False).stdout.strip() or None),
+            "origHead": (orig or "").split()[:1][0] if orig else None,
+            "head": head_sha,
+            "currentBranch": current,
             # 从 MERGE_MSG 读出来的参与分支
             "branches": self._branches_from_merge_msg(msg),
             "defaultMessage": first_line,
@@ -860,7 +904,15 @@ class ConflictResolver:
           5. 一次 cat-file --batch 拿全部 HEAD:/MERGE_HEAD:/mb: 内容。
         每个文件剩下的就只是磁盘读 + 标记解析 + 锚点对齐(纯 CPU)。
         字段名与 inspect 的摘要字段保持同名同义,UI 依赖不变。
+
+        **空清单快路径**:`diff --diff-filter=U` 只有在**索引里存在 stage≠0 的
+        条目**时才可能非空 —— 那件事读一次索引就知道。没有 ⇒ 直接返回空
+        (省一次 spawn);有 ⇒ 走下面原本的多进程批量路径,一个字不改。
         """
+        in_merge = bool(self._read_gd("MERGE_HEAD"))
+        unm = gitrefs.unmerged_paths(self.git.root)
+        if unm is not None and not unm:
+            return {"ok": True, "inMerge": in_merge, "count": 0, "files": []}
         p = self.git.run(["diff", "--name-only", "--diff-filter=U", "-z"],
                          check=False)
         paths = [x for x in p.stdout.split("\0") if x.strip()]

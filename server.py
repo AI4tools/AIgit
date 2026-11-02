@@ -30,6 +30,7 @@ import json
 import os
 import random
 import re
+import struct
 import subprocess
 import sys
 import threading
@@ -37,6 +38,9 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import gitcat
+import gitrefs
 
 try:
     # 只用标准库(ctypes 属于标准库), 不引入任何第三方依赖 —— 见文件头的设计约束。
@@ -89,6 +93,7 @@ _REMOTE = None
 def conflict_resolver():
     global _CONFLICTS
     if _CONFLICTS is None:
+        _conflicts.COUNT_HOOK = _count_hook       # P1 计数覆盖补全(见 _count_hook)
         _CONFLICTS = _conflicts.ConflictResolver(REPO.root)
     return _CONFLICTS
 
@@ -96,6 +101,7 @@ def conflict_resolver():
 def history_ops():
     global _HISTORY
     if _HISTORY is None:
+        _hops.COUNT_HOOK = _count_hook            # P1 计数覆盖补全(见 _count_hook)
         _HISTORY = _hops.HistoryOps(REPO.root)
     return _HISTORY
 
@@ -117,6 +123,7 @@ def remote_ops():
         # (test_aigit_net c3 用 ast.walk 查,函数内 import 也算),
         # 所以中和层由这里递进去。不传的话 gitops 会退到 _FallbackGuard,
         # 那档**枚举不到 filter.*/diff.*/merge.* 的子段名**(见 gitops 里的说明)。
+        _gitops.COUNT_HOOK = _count_hook          # P1 计数覆盖补全(见 _count_hook)
         _REMOTE = _gitops.GitOps(REPO.root, guard=gitguard)
     return _REMOTE
 
@@ -126,9 +133,19 @@ def remote_ops():
 # `except (ValueError, TypeError, KeyError) -> 400` 兜住, 所以这里不重复包 try。
 
 def _qi(q, key, default):
-    """整型查询参数, 缺省用 default。"""
+    """整型查询参数, 缺省用 default。
+
+    ⚠ 2026-10-21: 以前 int() 失败直接抛 ValueError, 由 do_GET 兜成 400,
+    但**错误文案是 Python 原文**(`invalid literal for int() with base 10: 'abc'`)
+    —— 对客户端既不可操作又暴露实现。现在给干净的参数名文案。
+    """
     v = q.get(key, [None])[0]
-    return default if v is None or v == "" else int(v)
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        raise GitError("参数 %s 必须是整数,收到 %r" % (key, v))
 
 
 def _qflag(q, key, default=False):
@@ -141,7 +158,23 @@ def _qflag(q, key, default=False):
 def _qopt(q, key):
     """可选的整型参数: 给了就转 int, 没给就是 None(交给下游区分「不限」)。"""
     v = q.get(key, [None])[0]
-    return None if v is None or v == "" else int(v)
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        raise GitError("参数 %s 必须是整数,收到 %r" % (key, v))
+
+
+def _bi(b, key, default):
+    """请求体里的整型参数: 文案与 _qi 同款(不再泄漏 Python 原文)。"""
+    v = b.get(key, default)
+    if isinstance(v, bool) or not isinstance(v, int):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            raise GitError("参数 %s 必须是整数,收到 %r" % (key, v))
+    return v
 
 
 def _bb(b, key, default=False):
@@ -467,6 +500,135 @@ def as_file_list(files):
     return out
 
 
+# ---------------------------------------------------------------- git 子进程计数器(P1)
+#
+# 门控: **设了 AIGIT_GIT_COUNT=1 才有开销**。进程级开关在 import 时读一次
+# 定死; 没设时 _run_full / _send / 请求入口里只剩一次为 False 的布尔判断,
+# 与改动前行为完全一致(响应零差异, 也不发那两个头)。
+# 用途见 tools/aigit/measure_spawns.py 与 doc/aigit-perf-spawns.md。
+_GIT_COUNT_ON = os.environ.get("AIGIT_GIT_COUNT") == "1"
+
+# 状态按**线程**隔离 —— 但注意光靠 threading.local() 初始化一次是不够的:
+# ThreadingHTTPServer 一条连接一个线程, 而本服务是 HTTP/1.1, keep-alive 时
+# 同一条连接上的多个请求**复用同一个线程**。所以隔离单位是「请求」,
+# do_GET / do_POST 入口处各调一次 _git_count_reset()。
+_git_count_state = threading.local()
+
+
+def _git_count_reset():
+    """一个请求进来时清零(不是一条连接清零)。"""
+    if _GIT_COUNT_ON:
+        _git_count_state.n = 0
+        _git_count_state.cmds = []
+
+
+def _git_count_hit(args):
+    """在 _run_full 里记一次 git 子进程。**只记命令名**(status / rev-parse /
+    add / ...), 不记参数 —— 参数里有文件路径, 不让它们进响应头。
+    命令序列最多记 32 条(够了, 超出靠计数说明), 计数本身不封顶。"""
+    name = next((a for a in args if not a.startswith("-")), "?")
+    n = getattr(_git_count_state, "n", 0) + 1
+    cmds = getattr(_git_count_state, "cmds", [])
+    if len(cmds) < 32:
+        cmds = cmds + [name]
+    _git_count_state.n = n
+    _git_count_state.cmds = cmds
+
+
+def _count_hook(args):
+    """P1 计数覆盖补全(23→91): 挂给 history_ops / conflicts / gitops 的回调。
+
+    那三个模块各有自己的 subprocess 出口(server.py L78 起的接线注释),
+    此前计数器只罩 Repo._run_full 的 23 处 —— 实测活证据: blame 真 spawn
+    2 次, `X-aigit-git-calls` 头却报 0(doc/aigit-perf.md §12.2)。
+    模块侧只判 `COUNT_HOOK is not None`, 所以门(GIT_COUNT)关着时是
+    零额外开销; 这里再叠一层门闸判断, 双保险且语义清楚。
+    注意安全边界不变: 四模块的 gitguard 中和闸照旧, 这里只补**账**。
+    """
+    if _GIT_COUNT_ON:
+        _git_count_hit(args)
+
+
+def _v2_xy(xy):
+    """v2 的 XY 归一成 v1 空格语义(v2 的「未改动」是 `.`)。"""
+    x = xy[0] if len(xy) > 0 else " "
+    y = xy[1] if len(xy) > 1 else " "
+    return (" " if x == "." else x, " " if y == "." else y)
+
+
+def parse_porcelain_v2(out):
+    """解析 `git status --porcelain=v2 --branch -z` → (branch, staged, unstaged, conflicted)。
+
+    2026-10-21 主线化: 移植自 aigit_perf.parse_porcelain_v2(E13 已实测的版本,
+    含两个坑的修法), 目的是把 status 从 2 次 spawn 降成 1 次(省 ~40ms,
+    写操作走 commit_and_status 等同样受益)。
+
+    **两个必须保持的细节**(改之前先读 aigit-E13-perf-layer.md §3.2/§3.3):
+      * `split(" ", 8/9/10)` 的 maxsplit **不是**随手写的: path 前的前导字段
+        定长, 剩下的整段都是 path —— 无参 split 会把含空格路径截断;
+      * v2 的 `.` 必须归一成空格, 否则 `.` 会当状态码吐给前端。
+    """
+    branch, staged, unstaged, conflicted = "", [], [], []
+    fields = out.split("\0")
+    i, n = 0, len(fields)
+    while i < n:
+        f = fields[i]
+        i += 1
+        if not f:
+            continue
+        head = f[0]
+        if head == "#":
+            rest = f[2:].strip()
+            if rest.startswith("branch.head "):
+                b = rest[len("branch.head "):].strip()
+                # v2 写 "(detached)"; 旧路径 rev-parse 报 "HEAD", 保持后者
+                branch = "HEAD" if b == "(detached)" else b
+            continue
+        if head == "?":
+            path = f[2:] if f[1:2] == " " else f[1:]
+            if path:
+                unstaged.append({"path": path, "status": "?", "staged": False})
+            continue
+        if head == "!":
+            continue                       # ignored, 当前不展示
+        kind, _, _tail = f.partition(" ")
+        if kind == "1":
+            parts = f.split(" ", 8)
+            if len(parts) <= 8:
+                continue
+            xy, path = parts[1], parts[8]
+        elif kind == "2":
+            parts = f.split(" ", 9)
+            if len(parts) <= 9:
+                continue
+            xy, path = parts[1], parts[9]
+            i += 1                         # 吃掉紧随的 origPath 字段
+        elif kind == "u":
+            parts = f.split(" ", 10)
+            if len(parts) <= 10:
+                continue
+            xy, path = parts[1], parts[10]
+            x, y = _v2_xy(xy)
+            conflicted.append({"path": path, "status": "U"})
+            if x not in (" ", "?"):
+                staged.append({"path": path, "staged": True, "status": x})
+            if y not in (" ", "?"):
+                unstaged.append({"path": path, "staged": False, "status": y})
+            continue
+        else:
+            continue                       # 认不出的记录丢掉,绝不猜
+        if not path:
+            continue
+        x, y = _v2_xy(xy)
+        if x not in (" ", "?"):
+            staged.append({"path": path, "staged": True, "status": x})
+        if y not in (" ", "?"):
+            unstaged.append({"path": path, "staged": False, "status": y})
+        if x == "U" or y == "U" or (x == "A" and y == "A") or (x == "D" and y == "D"):
+            conflicted.append({"path": path, "status": "U"})
+    return branch, staged, unstaged, conflicted
+
+
 class Repo:
     def __init__(self, root: Path):
         self.root = root.resolve()
@@ -483,7 +645,10 @@ class Repo:
         #   `nested_edges: []`)看不见这个转发器中转的嵌套 —— 假阴性, 别拿来论证无嵌套。
         self._lock = repo_git_lock(self.root)
 
+
     # -- 底层 ------------------------------------------------------------
+    #: 从**用户视角**透传给 git 的语义配置见 `gitguard.semantic_overrides()`。
+    #: 实测事故与边界写在 gitguard 里，这里不重复。
     def _run_full(self, args, check=True, stdin=None):
         """跑一条 git,返回 CompletedProcess。
 
@@ -494,12 +659,17 @@ class Repo:
         所以配置中和只需要在这里接一次,不存在「漏掉的调用点」。
         覆盖面与实测证据见 gitguard.py 文件头。
         """
+        if _GIT_COUNT_ON:               # P1 计数器, 门关上时这是唯一新增开销
+            _git_count_hit(args)
+        # 用户视角的语义配置(core.autocrlf 等)必须透传 —— 否则 CRLF 仓会被报成
+        # 「已修改」, 提交还会把 CRLF 写进对象库。见 gitguard 里的实测记录。
+        env = gitguard.apply_semantic(gitguard.safe_env(net_enabled=self._net_enabled()), self.root)
         with self._lock:
             p = subprocess.run(
                 gitguard.for_root(self.root, args, net_enabled=self._net_enabled()),
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", input=stdin,
-                env=gitguard.safe_env(net_enabled=self._net_enabled()),
+                env=env,
                 timeout=120,
             )
         if check and p.returncode != 0:
@@ -580,6 +750,12 @@ class Repo:
             raise GitError("路径为空")
         if not isinstance(rel, str):
             raise GitError("路径必须是字符串,收到 %s" % type(rel).__name__)
+        # NUL 必须在**碰 Path 之前**拒掉: Windows 上 `Path("a.txt\0.png").resolve()`
+        # 会**静默截断成 `a.txt`**(不抛任何异常, 实测), 于是「用户请求的是哪个文件」
+        # 在解析后就换了人 —— unstage/discard 会去动另一个文件(discard 就是数据丢失)。
+        # 这不只是「路径不合法」, 是路径走私。
+        if "\x00" in rel:
+            raise GitError("路径里不能包含 NUL 字符,已拒绝:%r" % rel)
         try:
             p = (self.root / rel).resolve()
         except (ValueError, OSError) as e:
@@ -606,6 +782,18 @@ class Repo:
         返回的 rel 已经过 resolve 规约, 交给 git 前再加 -- 就能当字面名用。
         """
         return self.resolve_in_root(rel).relative_to(self.root).as_posix()
+
+    def reject_dir(self, rel):
+        """目录不是文件: 统一 400, 文案与 /api/file 的 E23 拒绝**逐字一致**。
+
+        2026-10-21 巡检抓到的横向不一致: 同样是「请求一个目录」,
+        `/api/diff` 返回 200 + 空 diff, `/api/history/file` 返回 200 + commits[],
+        `/api/history/blame` 返回 400 + git 原文(`fatal: no such path ...`,
+        还白烧一次 169ms 的 spawn), 而 `/api/file` 早就明确拒绝。
+        一个路径不是文件, 就不该被任何一个读取接口当成文件。
+        """
+        if (self.root / rel).is_dir():
+            raise GitError("不是文件(是目录),已拒绝:%s" % rel)
 
     def _live_paths(self, rels, tracked):
         """滤掉「既不在工作区、也没被跟踪」的路径。
@@ -652,10 +840,12 @@ class Repo:
         """返回三段状态:已暂存 / 未暂存 / 冲突。
 
         两条 git(`status` 与 `_head_branch()`)**包进同一次持锁**(2026-10-04 修)。
-        修前它们各取一次锁、中间没有外层持锁包着, 别的请求能在那道缝里插队 ——
-        打点实测那道缝最宽 **1578 ms**(是 status() 在**等锁**, 那期间别的请求
-        正持锁跑 commit), 并发判据 C3 因此读 26/50。修完 commit/checkout 已原子,
-        这道缝是 C3 剩下的**唯一**来源(见 doc 台账 §20.3)。
+        ⚠ 2026-10-21 起只剩**一条** git(`status --porcelain=v2 --branch` 自带分支名,
+        省掉 `_head_branch()` 那次 ~40ms spawn); 下面「两条 git」这段保留为历史,
+        持锁形状不变。原记录: 修前它们各取一次锁、中间没有外层持锁包着, 别的请求
+        能在那道缝里插队 —— 打点实测那道缝最宽 **1578 ms**(是 status() 在**等锁**,
+        那期间别的请求正持锁跑 commit), 并发判据 C3 因此读 26/50。修完 commit/checkout
+        已原子, 这道缝是 C3 剩下的**唯一**来源(见 doc 台账 §20.3)。
 
         `self._lock` 是 RLock(repolock.py:97 `threading.RLock()`), 同线程嵌套取锁
         安全 —— `_run_full():497` 内部还会各自再取一次(实测同线程二次 acquire
@@ -665,23 +855,15 @@ class Repo:
         ⚠ 持锁范围只包这两条 git, 不包下面的解析 —— 解析是纯计算, 别把 CPU 时间
           算进锁里。
         """
+        # 2026-10-21 主线化: v2 --branch **一次 spawn** 拿全(状态 + 分支名)。
+        # 此前是 status(v1) + _head_branch() 两次, 实测各 40-58ms; 快路径在
+        # aigit_perf.py 里已实测 96.0→57.5ms(doc/aigit-E13-perf-layer.md §3.1),
+        # 现在把同一份解析(parse_porcelain_v2)挪进主线, 全部写操作一起受益。
+        # 语义差分判据: doc/aigit-perf.md §12.9 的 10-fixture 新旧逐字比对。
         with self._lock:
-            out = self._run(["status", "--porcelain=v1", "-z",
+            out = self._run(["status", "--porcelain=v2", "--branch", "-z",
                              "--untracked-files=all"])
-            branch = self._head_branch()
-        staged, unstaged, conflicted = [], [], []
-        for x, y, path in self.porcelain_z_parse(out):
-            if x == "?" and y == "?":
-                unstaged.append({"path": path, "status": "?",
-                                 "staged": False})
-                continue
-            item = {"path": path, "staged": True}
-            if x not in (" ", "?"):
-                staged.append(dict(item, status=x))
-            if y not in (" ", "?"):
-                unstaged.append(dict(item, status=y, staged=False))
-            if x == "U" or y == "U" or (x == "A" and y == "A") or (x == "D" and y == "D"):
-                conflicted.append({"path": path, "status": "U"})
+        branch, staged, unstaged, conflicted = parse_porcelain_v2(out)
 
         staged_paths = [i["path"] for i in staged]
         return {
@@ -729,16 +911,39 @@ class Repo:
         return self._run(args, check=False)
 
     def show_file(self, rel, ref="HEAD"):
+        """读某个 ref 下的文件内容。P4：常驻 cat-file 命中时 0 spawn。
+
+        只接 **blob**：tree（目录）那类仍然回退到 `git show` —— 它对
+        `HEAD:sub` 会打印一棵 tree 清单，那是既有行为，不能在这里悄悄改成 None。
+        空 blob 返回 None，与 `git show` 的空 stdout 同义（既有语义）。
+        """
         check_ref_name(ref)
+        got = gitcat.read(self.root, "%s:%s" % (ref, rel))
+        if got is not None and got[1] == "blob":
+            return got[0].decode("utf-8", "replace") or None
         p = self._run(["show", f"{ref}:{rel}"], check=False)
         return None if p == "" else p
 
     def staged_file(self, rel):
-        """读**索引里**(暂存区)的版本: `git show :<path>`。"""
+        """读**索引里**(暂存区)的版本: `git show :<path>`（同上，blob 才走常驻）。"""
+        got = gitcat.read(self.root, ":%s" % rel)
+        if got is not None and got[1] == "blob":
+            return got[0].decode("utf-8", "replace") or None
         p = self._run(["show", f":{rel}"], check=False)
         return p or None
 
     def log(self, limit=30):
+        """最近提交。
+
+        `limit` 夹到 **[1, 1000]** —— 与 `history_ops.blame` 同一口径。改之前
+        `limit<=0` 会被拼成 `git log -0` / `--1`，结果是**静默空**；同一族端点
+        一个夹取、一个静默空，比「少返回几条」更容易误导。
+        """
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 30
+        limit = max(1, min(limit, 1000))
         fmt = "%H\x1f%an\x1f%ad\x1f%s\x1e"
         out = self._run(
             ["log", f"-{limit}", f"--pretty=format:{fmt}", "--date=short"],
@@ -755,6 +960,17 @@ class Repo:
         return rows
 
     def branches(self):
+        """本地分支 + 当前分支标记。
+
+        快路径：直接读 `refs/heads`（松散 + `packed-refs`），省一次 spawn。
+        任何一处看不懂（worktree / reftable / 解析失败）就回退 `for-each-ref`
+        —— 这是**显示**，宁可慢也不能报出一个错的分支名。
+        """
+        names = gitrefs.head_names(self.root)
+        state = gitrefs.head_state(self.root)
+        if names is not None and state is not None:
+            cur = state[1] if state[0] == "branch" else None
+            return [{"name": n, "current": n == cur} for n in names]
         out = self._run(
             ["for-each-ref", "--format=%(refname:short)\x1f%(HEAD)",
              "refs/heads"], check=False)
@@ -768,13 +984,112 @@ class Repo:
 
     # -- 变更操作 --------------------------------------------------------
     def _tracked_set(self):
+        """已跟踪路径集合 —— **问 git 本人**。破坏性判断只许用它。"""
         ls = self._run(["ls-files", "-z"], check=False).split("\0")
         return {x for x in ls if x}
+
+    def path_known(self, rel):
+        """这个路径在 git 的世界里存在吗：**磁盘 / 索引 / HEAD 任一处有**就算。
+
+        用途：`/api/diff` 拒绝「从来不存在过」的路径（2026-11-02 契约收口）。
+        不能只看磁盘 —— 工作区删掉但索引/HEAD 里还有的文件，diff 必须能给出
+        删除差异，那是这个端点最有价值的场景之一。
+
+        索引走 `_tracked_for_filter()`（快路径 0 spawn）；HEAD 走 `show_file()`
+        （P4 命中 0 spawn）。两条都是「不确定就回退」，不会误报「不存在」。
+        """
+        ap = self.root / rel
+        if ap.exists() or ap.is_symlink():
+            return True
+        tracked = self._tracked_for_filter()
+        if tracked is not None and rel in tracked:
+            return True
+        return self.show_file(rel) is not None
+
+    def _index_tracked_fast(self):
+        """直接读 `.git/index` 取已跟踪集合；不认识的结构返回 None。
+
+        解析器在 `gitrefs.parse_index`（`conflicts.py` 也要用同一份，而它不能
+        import server —— 所以逻辑必须住在下层模块里，不能各写一份）。
+
+        这里只保留**谁能用、谁不能用**这条纪律：
+
+        这是 `_live_paths()` 那道过滤的**加速器**（省一次 ~37ms spawn），
+        不是 `_tracked_set()` 的替代品。判错的方向必须无害：那条过滤里最坏
+        后果是「少暂存一个路径」或「把一个不存在的路径交给 git 拿到 rc=128」，
+        都不会静默丢数据。
+
+        ⚠ `discard()` / `discard_plan()` **禁止**用它：那里的判断决定
+        「checkout 还原」还是「unlink / rmtree」，判错 = 把已跟踪文件当未跟踪
+        删掉（F-02 数据丢失）。它们必须走 `_tracked_set()`。
+
+        等价性实测：`cmp_index_tracked.py` 8 态、`test_index_fastpath.py`。
+        """
+        got = gitrefs.parse_index(self.root)
+        return None if got is None else got[0]
+
+    def _tracked_for_filter(self):
+        """`_live_paths()` 用的已跟踪集合: 先试索引直读, 不认识就 spawn。
+
+        空集合是**合法结果**(空仓), 所以判的是 `is None` 而不是真假。
+        """
+        got = self._index_tracked_fast()
+        return self._tracked_set() if got is None else got
+
+    def _local_branch_exists(self, name):
+        """refs/heads/<name> 存在且内容像一条 ref → True；不确定 → None。
+
+        为什么不是 True/False 两态: 仓可能用 reftable 后端, 那时分支既不在
+        loose ref 也不在 packed-refs —— 从文件层面只能得出「没看见」, 不能得出
+        「不存在」。所以没看见一律返回 None, 让调用方回退到
+        `show-ref --verify`(它才是权威), 请求只是没省下那一次 spawn。
+
+        name 已经过 `check_branch_name()`, 不含 `..` / 反斜杠 / 前导 `-`,
+        所以拼进 refs/heads/ 下面不会越界。
+
+        ⚠ 2026-10-28: gitdir 走 `gitrefs.gitdir()`，不是硬拼 `root/.git`。
+        硬拼会漏掉两类情况：`GIT_DIR` 被设置(那时 git 用的是**另一个**仓，
+        我们却去读本仓的 ref) 和 worktree(`.git` 是文件)。漏掉它们的方向是
+        「拿 A 仓的 ref 去判 B 仓的分支」，比慢一次严重。
+        """
+        gd_text = gitrefs.gitdir(self.root)
+        if gd_text is None:
+            return None
+        gd = Path(gd_text)
+        hexdigits = set("0123456789abcdefABCDEF")
+
+        def looks_like_ref(text):
+            t = text.strip()
+            if t.startswith("ref: "):
+                return len(t) > 5 and "/" in t
+            return len(t) in (40, 64) and all(ch in hexdigits for ch in t)
+
+        p = gd / "refs" / "heads" / name
+        try:
+            if p.is_file():
+                return looks_like_ref(p.read_text(encoding="utf-8", errors="strict")) or None
+        except OSError:
+            return None
+        except UnicodeDecodeError:
+            return None
+        try:
+            with open(str(gd / "packed-refs"), "r", encoding="utf-8",
+                      errors="strict") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or line.startswith("^"):
+                        continue
+                    parts = line.split(" ", 1)
+                    if len(parts) == 2 and parts[1] == "refs/heads/" + name:
+                        return looks_like_ref(parts[0]) or None
+        except (OSError, UnicodeDecodeError):
+            return None
+        return None
 
     def stage(self, files):
         if not files:
             return
-        tracked = self._tracked_set()
+        tracked = self._tracked_for_filter()
         rels = self._live_paths([self.rel_in_root(f) for f in files], tracked)
         if not rels:
             return
@@ -783,7 +1098,7 @@ class Repo:
     def unstage(self, files):
         if not files:
             return
-        tracked = self._tracked_set()
+        tracked = self._tracked_for_filter()
         rels = self._live_paths([self.rel_in_root(f) for f in files], tracked)
         if not rels:
             return
@@ -1121,9 +1436,22 @@ class Repo:
         已被跟踪但改了内容的、被删掉的, 都在里面。加 `--no-renames` 是为了让
         重命名展开成「旧路径(删)+ 新路径(增)」两条确定的路径, 不依赖 git 猜。
         """
-        tracked = {os.path.normcase(x)
-                   for x in self._run(["ls-files", "-z"], check=False).split("\0")
-                   if x}
+        # 已跟踪 + 未跟踪**一次**问完: `-t` 给每条打标记(`?` = 未跟踪, 其余 = 已
+        # 跟踪), 省掉一次 ~37ms 的进程启动税。等价性实测: cmp_ls_scope.py 在
+        # 10 种状态(clean/dirty/untracked/staged/rename/deleted/空格+中文/ignore/
+        # 合并冲突/skip-worktree)下, 与「两次 ls-files」集合 **10/10 完全一致**。
+        t = self._run_full(["ls-files", "-t", "-z", "--cached",
+                            "--others", "--exclude-standard"], check=False)
+        if t.returncode != 0:
+            # 拿不到清单就 fail closed —— 宁可拒绝提交, 也不能在不知道范围的
+            # 情况下往索引里写东西。
+            raise GitError("读不到已跟踪/未跟踪文件清单(%s),已拒绝提交"
+                           % ((t.stderr or "").strip()[:160] or "git rc=%d" % t.returncode))
+        tracked, untracked = set(), set()
+        for e in t.stdout.split("\0"):
+            if not e or len(e) < 3:
+                continue
+            (untracked if e[0] == "?" else tracked).add(os.path.normcase(e[2:]))
         d = self._run_full(["diff", "--no-renames", "--name-only", "-z"],
                            check=False)
         if d.returncode != 0:
@@ -1132,12 +1460,7 @@ class Repo:
             raise GitError("读不到工作区与索引的差异(%s),已拒绝提交"
                            % ((d.stderr or "").strip()[:160] or "git rc=%d" % d.returncode))
         wanted = {os.path.normcase(x) for x in d.stdout.split("\0") if x}
-        u = self._run_full(["ls-files", "--others", "--exclude-standard", "-z"],
-                           check=False)
-        if u.returncode != 0:
-            raise GitError("读不到未跟踪文件清单(%s),已拒绝提交"
-                           % ((u.stderr or "").strip()[:160] or "git rc=%d" % u.returncode))
-        wanted |= {os.path.normcase(x) for x in u.stdout.split("\0") if x}
+        wanted |= untracked
         return wanted, tracked
 
     def _walk_add_scope(self):
@@ -1226,13 +1549,25 @@ class Repo:
                 return False
         return True
 
-    def _index_delta(self):
+    def _index_delta(self, head_exists=None, index_all=None):
         """索引里「与 HEAD 不一致」的路径集合(normcase 之后)。未出生 HEAD = 整个索引。
 
         问的是**索引**而不是工作区: 索引就是 `git commit` 的输入, 问它没有窗口。
+
+        两个参数是**省启动税**用的, 都不改语义:
+          * `head_exists`: 持锁段内 `git add` 不动 HEAD, 同一段问两次拿到的是同一个
+            答案 —— 第二次只是多花 ~37ms。调用方问一次传进来, 省一次 spawn。
+          * `index_all`: 「未出生 HEAD = 整个索引」时, 若调用方手里已经有同一时刻的
+            整个索引集合(就是 `_add_scope` 的 `tracked`), 直接复用。**只在 before
+            那一侧能传** —— after 是哨兵, 必须保持新鲜(见 `_assert_index_scope`)。
         """
-        if self._run_full(["rev-parse", "--verify", "--quiet", "HEAD"],
-                          check=False).returncode != 0:
+        if head_exists is None:
+            head_exists = self._run_full(
+                ["rev-parse", "--verify", "--quiet", "HEAD"],
+                check=False).returncode == 0
+        if not head_exists:
+            if index_all is not None:
+                return set(index_all)
             return {os.path.normcase(x)
                     for x in self._run(["ls-files", "-z"], check=False).split("\0")
                     if x}
@@ -1243,7 +1578,7 @@ class Repo:
                            % ((p.stderr or "").strip()[:160] or "git rc=%d" % p.returncode))
         return {os.path.normcase(x) for x in p.stdout.split("\0") if x}
 
-    def _assert_index_scope(self, allowed, before):
+    def _assert_index_scope(self, allowed, before, head_exists=None):
         """add 之后核对索引。**多出来的路径一律撤下来并拒绝提交。**
 
         `allowed` 是 normcase 之后的关键字集合(与 `_index_delta()` 同一口径),
@@ -1263,7 +1598,7 @@ class Repo:
         原则上不可能暂存我们没点名的路径。它是哨兵 —— 万一上面哪一条被后人改坏,
         这一条会先响, 而且响的方式是「拒绝提交」而不是「写进历史」。
         """
-        after = self._index_delta()
+        after = self._index_delta(head_exists)
         extra = sorted(x for x in (after - before) if x not in allowed)
         if not extra:
             return
@@ -1323,10 +1658,18 @@ class Repo:
                 if p.reparse():
                     raise GitError("枚举与暂存之间有目录被换成了联接(%s),已拒绝提交"
                                    % os.path.relpath(p.path, str(self.root)))
-            before = self._index_delta()
+            # HEAD 存在性在持锁段内**只问一次**(`git add` 不移动 HEAD), 两个
+            # `_index_delta` 共用这一个答案, 省一次 ~37ms 启动税。
+            # 未出生 HEAD 时 before = 整个索引, 而 `tracked` 正是同一时刻的整个
+            # 索引(同一把锁内, 中间没有人动过索引), 直接复用; after 仍取新鲜的。
+            head_exists = self._run_full(
+                ["rev-parse", "--verify", "--quiet", "HEAD"],
+                check=False).returncode == 0
+            before = self._index_delta(head_exists,
+                                       tracked if not head_exists else None)
             paths = sorted(allow.values())
             self._run_paths(["add"], paths)
-            self._assert_index_scope(set(allow), before)
+            self._assert_index_scope(set(allow), before, head_exists)
             skipped = [Path(d).relative_to(self.root).as_posix() for d in unpinned]
             return len(paths), skipped
         finally:
@@ -1336,6 +1679,11 @@ class Repo:
     def commit(self, message):
         if not isinstance(message, str) or not message.strip():
             raise GitError("提交信息不能为空")
+        # NUL 必须在**暂存之前**拒: 否则 `stage_everything_safely()` 已经把文件写进
+        # 索引了, 然后 `git commit -m` 才因为 embedded null 失败 —— 请求返回 400,
+        # 索引却被改了(实测)。拒绝就是拒绝, 不许有前半截副作用。
+        if "\x00" in message:
+            raise GitError("提交信息里不能包含 NUL 字符,已拒绝")
         # 整段持锁: 校验 → 暂存 → 核对索引 → commit 之间不能有另一个走 aigit 的
         # 请求插进来改工作区。
         # ⚠ 这把锁管不到 C6 的对手(它直接在文件系统上 mklink/rmdir, 整个循环里
@@ -1349,10 +1697,17 @@ class Repo:
                     "索引、再写进历史, 而删掉链接也删不掉历史。"
                     "请先把它移出工作区, 或把它移进仓内。共发现 %d 个。" % (names, len(leaks)))
             n, skipped = self.stage_everything_safely()
-            out = self._run(["commit", "-m", message], check=False)
-            if not out.strip():
-                raise GitError("没有可提交的改动(或提交被 hook 拒绝)")
-            out = out.strip()
+            p = self._run_full(["commit", "-m", message], check=False)
+            text = ((p.stdout or "") + (p.stderr or "")).strip()
+            # 2026-11-02 修: 以前只看 stdout 是否为空, **不看 returncode** ——
+            # `git commit` 失败时把 "nothing to commit" 打到 **stdout**, 于是
+            # 提交没发生、接口却回 200 + ok:true。拒绝就是拒绝, rc 必须看。
+            if p.returncode != 0:
+                if "nothing to commit" in text or "no changes added to commit" in text:
+                    raise GitError("没有可提交的改动(工作区与索引都没有变化)")
+                raise GitError("提交失败:%s"
+                               % (text[:400] or "git rc=%d" % p.returncode))
+            out = text or "(git 没有输出)"
             if skipped:
                 # 静默少提交几个文件比报错更难解释, 所以明说。这几棵子树是
                 # **握不住**的(通常是别的程序短暂占着目录), 不是校验不过。
@@ -1470,9 +1825,12 @@ class Repo:
         # 不是新引入的用法。server.py:478-483 记着「实测嵌套 97 次,
         # 换普通 Lock 每次都自死锁」。
         with self._lock:
-            if self._run_full(["show-ref", "--verify", "--quiet",
-                               "refs/heads/" + name], check=False).returncode != 0:
-                raise GitError("分支不存在,已拒绝 checkout:%s" % name)
+            # 快路径: 从 loose ref / packed-refs 直接看到这条分支, 就不必再 spawn
+            # 一次 `show-ref --verify`; 看不见或内容不像 ref, 一律以 git 为准。
+            if not self._local_branch_exists(name):
+                if self._run_full(["show-ref", "--verify", "--quiet",
+                                   "refs/heads/" + name], check=False).returncode != 0:
+                    raise GitError("分支不存在,已拒绝 checkout:%s" % name)
             self._run(["checkout", name])
 
     def new_branch(self, name):
@@ -1612,6 +1970,16 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if _GIT_COUNT_ON:
+            # P1: 计数头(只加头, 响应体零改动)。所有响应(含 4xx/5xx)都从
+            # 这里出, 所以一个请求起几个 git 总是可读的。
+            self.send_header("X-aigit-git-calls",
+                             str(getattr(_git_count_state, "n", 0)))
+            cmds = ",".join(getattr(_git_count_state, "cmds", []))
+            if len(cmds) > 200:          # 截断口径: 头不是数据载体,长序列
+                cmds = cmds[:197] + "..."  # 说明端点本来就起了很多 git
+            if cmds:
+                self.send_header("X-aigit-git-cmds", cmds)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1643,7 +2011,7 @@ class Handler(BaseHTTPRequestHandler):
     def _q(self):
         return urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
 
-    def _ok_with_status(self, st=_STATUS_UNSET, err=None):
+    def _ok_with_status(self, st=_STATUS_UNSET, err=None, extra=None):
         """操作成功之后的响应。**取不到 status 时不能报失败**(E3)。
 
         这是 E3 的一般形态, 不只是「未出生 HEAD」那一种: 每个 POST 结尾都要
@@ -1667,7 +2035,30 @@ class Handler(BaseHTTPRequestHandler):
           * `st` 是 dict → 正常报。
           用 None 当缺省会撞车: `_status_quiet()` 取不到时返回的正是 None,
           而 `st=None` 必须走兜底、不能被当成「没传」而再去取一次。
+
+        ## `extra` 参数(2026-10-06, 修 f155916 引入的字段丢失)
+
+        `/api/commit` 在 `f155916`(消除并发判据 C3)之前返回
+        `{'ok': True, 'output': out, **REPO.status()}`。合成一次持锁之后
+        handler 变成 `self._ok_with_status(st, err)` —— `out` 拿到了却
+        **一次都没再被读过**, 于是 `output` 键从响应里消失, 而
+        `web/index.html:2095` 仍在读 `d.output`, 结果是**每次提交都显示
+        "(git 无输出)"**。`test_aigit_contract.py` 现在钉住这个键。
+
+        `extra` 就是把这种「操作自己产出、但不是 status」的字段带回来的口子。
+        两条约束:
+          * **E3 兜底路径也要带** —— 提交已经发生了, `output` 不该因为
+            status 读不出来就丢掉(丢掉等于又退回「报成功但不报结果」);
+          * **撞名时 status 优先** —— status 是权威视图, `extra` 里同名键
+            会被 `**st` 盖掉, 所以 `extra` 只能加键不能改键。
         """
+        # 2026-11-02: 客户端可以显式要求**省略** status（body 里 `status: false`）。
+        # 动机：UI 的每个写操作后面都紧跟一次 `refresh()`（它会再取一次
+        # /api/status），所以响应里的那份 status 是**重复计算**（一次 spawn ≈40ms）。
+        # 默认仍然带（契约不变），只有显式 opt-out 才省。
+        # ⚠ 必须在**取 status 之前**返回 —— 放在后面等于「取完了再省略」。
+        if not getattr(self, "_want_status", True):
+            return self._json({"ok": True, **(extra or {}), "statusOmitted": True}, 200)
         if st is _STATUS_UNSET:
             try:
                 st, err = REPO.status(), None
@@ -1675,16 +2066,18 @@ class Handler(BaseHTTPRequestHandler):
                 st, err = None, e
         if err is not None:
             return self._json({"ok": True,
+                               **(extra or {}),
                                "branch": None,
                                "staged": [], "unstaged": [], "conflicted": [],
                                "hasStaged": False,
                                "root": str(REPO.root),
                                "statusError": "%s: %s" % (type(err).__name__, err)},
                               200)
-        return self._json({"ok": True, **st}, 200)
+        return self._json({"ok": True, **(extra or {}), **st}, 200)
 
     # -- routes ----------------------------------------------------------
     def do_GET(self):
+        _git_count_reset()      # P1: 每请求清零(keep-alive 下同线程复用)
         path = urllib.parse.urlparse(self.path).path
         q = self._q()
         try:
@@ -1713,7 +2106,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, **REPO.status()})
             if path == "/api/log":
                 return self._json({"ok": True,
-                                   "log": REPO.log(int(q.get("limit", ["30"])[0]))})
+                                   "log": REPO.log(_qi(q, "limit", 30))})
             if path == "/api/branches":
                 return self._json({"ok": True, "branches": REPO.branches()})
             if path == "/api/diff":
@@ -1722,6 +2115,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise GitError("缺少 file 参数")
                 staged = q.get("staged", ["0"])[0] in ("1", "true", "yes")
                 rel = REPO.rel_in_root(f)
+                REPO.reject_dir(rel)          # 2026-10-21: 目录不是文件(与 /api/file 同一句话)
+                # 2026-11-02: 从来不存在过的路径 -> 400。**不能一刀切**：
+                # 工作区删掉但索引/HEAD 里还有的文件，diff 本来就该给出删除差异；
+                # 只有「磁盘没有 + 索引没有 + HEAD 也没有」才是真的不存在。
+                if not REPO.path_known(rel):
+                    raise GitError("文件不存在,已拒绝:%s" % rel)
                 text = REPO.diff(rel, staged=staged)
                 return self._json({"ok": True, "path": rel, "staged": staged,
                                    "diff": text})
@@ -1768,22 +2167,27 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(conflict_resolver().inspect(rel))
             # -- 历史 / 危险操作(接线自 history_ops.py)----------------
             if path == "/api/history/stashes":
-                return self._json(history_ops().list_stashes(
-                    _qi(q, "limit", 50)))
+                # 同上：从裸数组改成 {ok:true, stashes:[...]}
+                return self._json({"ok": True, "stashes": history_ops().list_stashes(
+                    _qi(q, "limit", 50))})
             if path == "/api/history/stash":
                 return self._json(history_ops().stash_show(
                     _qi(q, "index", 0), _qflag(q, "stat")))
             if path == "/api/history/reflog":
-                return self._json(history_ops().list_reflog(
-                    _qi(q, "limit", 30)))
+                # 2026-11-02: 原先是裸数组，与其余端点 {ok:...} 不同形状。
+                # 前端 asArray() 两种形状都认，见 web/history-panel.js。
+                return self._json({"ok": True, "reflog": history_ops().list_reflog(
+                    _qi(q, "limit", 30))})
             if path == "/api/history/tags":
-                return self._json(history_ops().list_tags(
-                    _qi(q, "limit", 100)))
+                # 同上：从裸数组改成 {ok:true, tags:[...]}
+                return self._json({"ok": True, "tags": history_ops().list_tags(
+                    _qi(q, "limit", 100))})
             if path == "/api/history/blame":
                 f = q.get("file", [None])[0]
                 if f is None:
                     raise GitError("缺少 file 参数")
                 rel = REPO.rel_in_root(f)
+                REPO.reject_dir(rel)          # 2026-10-21: 目录不是文件(与 /api/file 同一句话)
                 return self._json(history_ops().blame(
                     rel, _qopt(q, "start"), _qopt(q, "end"),
                     _qi(q, "limit", _hops.DEFAULT_BLAME_LINES)))
@@ -1792,6 +2196,7 @@ class Handler(BaseHTTPRequestHandler):
                 if f is None:
                     raise GitError("缺少 file 参数")
                 rel = REPO.rel_in_root(f)
+                REPO.reject_dir(rel)          # 2026-10-21: 目录不是文件(与 /api/file 同一句话)
                 return self._json(history_ops().file_history(
                     rel, _qi(q, "limit", 50), _qflag(q, "follow", True)))
             # -- plan: 只读的「这一步会做什么」预演 ---------------------
@@ -1876,9 +2281,13 @@ class Handler(BaseHTTPRequestHandler):
                              err_code="internal_error")
 
     def do_POST(self):
+        _git_count_reset()      # P1: 每请求清零(keep-alive 下同线程复用)
         path = urllib.parse.urlparse(self.path).path
         try:
             b = self._body()
+            # 2026-11-02: 写操作可以显式 opt-out「响应里带刷新后 status」。
+            # 只有字面 false 才算省略；缺省/其它值一律照旧（契约不变）。
+            self._want_status = (b.get("status", True) is not False)
             if path == "/api/stage":
                 REPO.stage(as_file_list(b.get("files")))
             elif path == "/api/unstage":
@@ -1904,16 +2313,32 @@ class Handler(BaseHTTPRequestHandler):
                 # ⚠ 2026-10-04 修(判据 C3 实测 23/24 真非原子): 原来 commit()
                 # 释放锁之后又调 REPO.status() 取一次锁, 中间那道缝会让**响应里的
                 # status 可能不是自己那次提交的**。合成一次持锁, 缝就没了。
+                # ⚠ 2026-10-06 补(实测 test_aigit_contract.py FAIL「缺键 output」):
+                # 合并不带 out, 那一版把 `output` 键整个弄丢了 ——
+                # `git show f155916^:server.py` 这里是
+                # `self._json({'ok': True, 'output': out, **REPO.status()})`,
+                # 而 web/index.html:2095 一直读 `d.output`, 于是每次提交都显示
+                # "(git 无输出)"。用 extra= 带回去。
+                if not getattr(self, "_want_status", True):
+                    return self._json({"ok": True, "output": REPO.commit(msg or ""),
+                                       "statusOmitted": True})
                 out, st, err = REPO.commit_and_status(msg or "")
-                return self._ok_with_status(st, err)   # **必须**走这条, E3 兜底在里头
+                return self._ok_with_status(st, err,
+                                            extra={"output": out})  # **必须**走这条, E3 兜底在里头
             elif path == "/api/checkout":
                 # ⚠ 2026-10-04 修(与上面 commit 同构): 原来先 checkout(释放锁)
                 # 再由下面的 `return self._ok_with_status()` 取一次锁做 status,
                 # 中间那道缝让**响应里的 status 可能不是自己这次 checkout 之后的**。
                 # 打点实测那 1.2~1.4s 的缝就在这里(§20.3)。
+                if not getattr(self, "_want_status", True):
+                    REPO.checkout(b.get("name", ""))
+                    return self._json({"ok": True, "statusOmitted": True})
                 _, st, err = REPO.checkout_and_status(b.get("name", ""))
                 return self._ok_with_status(st, err)
             elif path == "/api/branch":
+                if not getattr(self, "_want_status", True):
+                    REPO.new_branch(b.get("name", ""))
+                    return self._json({"ok": True, "statusOmitted": True})
                 _, st, err = REPO.new_branch_and_status(b.get("name", ""))
                 return self._ok_with_status(st, err)
             elif path == "/api/merge":
@@ -2066,7 +2491,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 同上: gen.py 自己在 allVerified=False 时把 ok 置 false,
                 # 这里不能再用 ok:True 盖掉。
                 return self._json(REPO.generate(b.get("kind", "all"),
-                                                int(b.get("count", 3)),
+                                                _bi(b, "count", 3),
                                                 b.get("seed")))
             else:
                 return self._err("没有这个接口", 404)
@@ -2094,6 +2519,32 @@ class Handler(BaseHTTPRequestHandler):
             traceback.print_exc()
             return self._err("服务端内部错误,详情见服务端日志", 500,
                              err_code="internal_error")
+
+    # -- 不支持的方法：405 而不是 501（2026-11-02 契约收口）----------------
+    #
+    # 改之前：`BaseHTTPRequestHandler` 对未实现的 do_PUT/do_DELETE 回 **501
+    # Not Implemented**，而 aigit 明明实现了 GET/POST —— 501 的意思是「服务器
+    # 不认识这个方法」，会误导调用方去查协议；正确语义是 **405 Method Not
+    # Allowed**（方法认识，但这个资源不允许），并按 RFC 7231 带 `Allow` 头。
+    def _method_not_allowed(self):
+        body = {"ok": False, "error": "不支持的 HTTP 方法:%s（本服务只有 GET / POST）"
+                % self.command, "code": "method_not_allowed"}
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(405)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Allow", "GET, POST")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_PUT(self):
+        return self._method_not_allowed()
+
+    def do_DELETE(self):
+        return self._method_not_allowed()
+
+    def do_PATCH(self):
+        return self._method_not_allowed()
 
 
 def _bind_error(port, exc):

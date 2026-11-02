@@ -33,9 +33,9 @@
  *                                            「换了分支」，看不出「多了提交」。
  *     /api/branch  (POST)                 → {ok, branch:<字符串>, ...status}
  *                                          ← branch 是字符串不是对象（建分支/切分支）
- *     /api/history/stashes?limit=N        → [ {index,ref,name,subject,raw} ]   ← 裸数组
+ *     /api/history/stashes?limit=N        → {ok,stashes:[{index,ref,name,subject,raw}]}
  *     /api/history/stash?index=N&stat=1   → {ok,index,ref,name,text}   ← ok 可能是 false 而 HTTP 200
- *     /api/history/reflog?limit=N         → [ {index,sha,short,selector,author,date,action} ] ← 裸数组
+ *     /api/history/reflog?limit=N         → {ok,reflog:[{index,sha,short,selector,author,date,action}]}
  *     /api/history/tags?limit=N           → [ {name,sha,type,subject,date,annotated} ] ← 裸数组
  *     /api/history/plan/<op>?…            → {op,safe,warning,blocked,executable,requires_confirmation,…}
  *       可用的 <op> 段只有这九个（op 段的名单与响应里 op 字段的值**不是一回事**，见下）：
@@ -91,7 +91,19 @@
     return out;
   }
 
-  function asArray(v) { return Array.isArray(v) ? v : []; }
+  /* 2026-11-02: reflog / stashes 从「裸数组」改成 {ok:true, reflog|stashes:[...]}
+   之后，这里同时接受两种形状 —— 旧版服务端(裸数组)与新版(包一层)都能渲染，
+   这样前端不用跟着服务端升级节奏走。 */
+function asArray(v) {
+  if (Array.isArray(v)) return v;
+  if (v && typeof v === "object") {
+    var keys = ["reflog", "stashes", "tags", "items", "rows", "list"];
+    for (var i = 0; i < keys.length; i++) {
+      if (Array.isArray(v[keys[i]])) return v[keys[i]];
+    }
+  }
+  return [];
+}
 
   function shortSha(s) { return String(s || "").slice(0, 8); }
 
