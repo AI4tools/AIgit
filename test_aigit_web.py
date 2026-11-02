@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """aigit 前端无头审计 —— 补 doc/aigit-review.md §4.5「前端一行都没测」那个洞。
 

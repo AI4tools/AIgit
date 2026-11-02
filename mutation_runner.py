@@ -87,9 +87,12 @@ SUITES_BY_TARGET = {
     "server.py": ["test_aigit.py", "test_aigit_extra.py", "smoke.py",
                   "test_aigit_web.py"],
     "conflicts.py": ["test_conflicts.py"],
+    "gitops.py": ["test_aigit_net.py"],
     "history_ops.py": ["test_history_ops.py"],
     "gen.py": ["selftest.py", "test_aigit.py"],
     "index.html": ["test_aigit_web.py"],
+    # 2026-10-27: 引用/reflog/索引直读的下沉模块(快路径/回退的两套差分都在这儿)
+    "gitrefs.py": ["test_index_fastpath.py", "test_refstore.py"],
     "conflicts-demo.html": ["test_aigit_web.py"],
 }
 
@@ -459,6 +462,90 @@ rmt(d)
 )
 
 probe(
+    "conf_merge_add_scope",
+    "conflict=1|committed=1|leaked=0",
+    r'''
+import conflicts
+d, g = mkrepo()
+# 造一个**真冲突**。conflict 进签名当非空守卫: 造不出冲突时下面两条
+# 观测全是空真, 必须让它自己暴露。
+(d / "c.txt").write_text("base\n", encoding="utf-8", newline="\n")
+g("add", "-A"); g("commit", "-qm", "base")
+g("checkout", "-q", "-b", "side")
+(d / "c.txt").write_text("side\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "side")
+g("checkout", "-q", "main")
+(d / "c.txt").write_text("main\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "main")
+p = g("merge", "--no-edit", "side")
+sig("conflict", 1 if p.returncode != 0 else 0)
+# ⚠ 联接必须在仓**里**。挂仓外的话 escaping_links() 根本看不见,
+#   这条探针会因「没有泄漏」而空跑(与 test_f06_guard.py 第一版同一个坑)。
+outside = d.parent / (d.name + "_out5")
+outside.mkdir()
+(outside / "leak.txt").write_text("SECRET\n", encoding="utf-8", newline="\n")
+mkjunction(d / "escape", outside)
+# 拆掉**第四道**(escaping_links), 让**第五道**(作用域受限 add)单独暴露 ——
+# 这正是 test_f06_guard.py T3 的场景: 第四道在位时它会先拒绝, 观测不到第五道。
+prev = conflicts.install_escaping_guard(lambda root: [])
+try:
+    c = conflicts.ConflictResolver(d)
+    c.resolve("c.txt", "resolved\n")
+    try:
+        c.commit_merge("m")
+        sig("committed", 1)
+    except Exception:
+        sig("committed", 0)
+    sig("leaked", 1 if "escape/leak.txt" in g("ls-files").stdout else 0)
+finally:
+    conflicts.install_escaping_guard(prev)
+rmt(d); rmt(outside)
+''',
+)
+
+probe(
+    "conf_state_keys",
+    "conflict=1|has_currentBranch=1|has_origHead=1|has_mergeMsgPath=1",
+    r'''
+import conflicts
+d, g = mkrepo()
+# 造一个**真冲突**(单文件同行冲突, 与 test_conflicts.py 的 identify 用例同形态)。
+(d / "c.txt").write_text("base\n", encoding="utf-8", newline="\n")
+g("add", "-A"); g("commit", "-qm", "base")
+g("checkout", "-q", "-b", "side")
+(d / "c.txt").write_text("side\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "side")
+g("checkout", "-q", "main")
+(d / "c.txt").write_text("main\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "main")
+p = g("merge", "--no-edit", "side")
+# 非空守卫: 没造出冲突的话下面三条全是空真, 必须让它自己暴露。
+sig("conflict", 1 if p.returncode != 0 else 0)
+st = conflicts.ConflictResolver(d).merge_state()
+for k in ("currentBranch", "origHead", "mergeMsgPath"):
+    sig("has_" + k, 1 if k in st else 0)
+rmt(d)
+''',
+)
+
+probe(
+    "ab_trackingref",
+    "has_trackingRefExists=1|behind_none=1",
+    r'''
+import gitops
+d, g = mkrepo()
+# mkrepo **没有配 remote** => ahead_behind 走「没有远程跟踪 ref」那条分支,
+# 也就是 trackingRefExists=False / behind=None 的那条。
+go = gitops.GitOps(d, gitops.NetGate(gitops.OFF))
+ab = go.ahead_behind()
+sig("has_trackingRefExists", 1 if "trackingRefExists" in ab else 0)
+# 非空守卫: behind 必须**真的是 None**(不是键缺失) —— 否则上面那条也可能是空真。
+sig("behind_none", 1 if ("behind" in ab and ab["behind"] is None) else 0)
+rmt(d)
+''',
+)
+
+probe(
     "discard_inner_tracked",
     "raised=1|tracked_alive=1",
     r'''
@@ -635,6 +722,647 @@ console.log("sq=" + (esc("a'b").indexOf('&#39;') >= 0 ? 1 : 0));
 ''',
 )
 
+# ---- 过期工作区守卫(stale-worktree guards) + 联网闸 ----
+# 造冲突的前置在两条探针里**各写一遍**(不用拼接): 拼接会让 raw/非 raw 的
+# 边界出错 —— 实测踩过一次: r'''''' 是空串, 后面那段变成**非** raw,
+# 于是 "tampered\n" 的 \n 成了真换行, 探针直接 SyntaxError。
+# conflict 进签名当**非空守卫** —— 造不出冲突时下面几条观测全是空真。
+
+probe(
+    "conf_del_stale",
+    "conflict=1|raised=1",
+    r'''
+import hashlib, conflicts
+d, g = mkrepo()
+(d / "c.txt").write_text("base\n", encoding="utf-8", newline="\n")
+g("add", "-A"); g("commit", "-qm", "base")
+g("checkout", "-q", "-b", "side")
+(d / "c.txt").write_text("side\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "side")
+g("checkout", "-q", "main")
+(d / "c.txt").write_text("main\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "main")
+p = g("merge", "--no-edit", "side")
+sig("conflict", 1 if p.returncode != 0 else 0)
+c = conflicts.ConflictResolver(d)
+# 先记下当前内容的 sha256, 再把工作区改掉 —— 模拟「客户端读到的状态已过期」。
+old = hashlib.sha256((d / "c.txt").read_bytes()).hexdigest()
+(d / "c.txt").write_text("tampered\n", encoding="utf-8", newline="\n")
+raised = 0
+try:
+    c.delete_file("c.txt", old)
+except conflicts.ConflictError:
+    raised = 1
+sig("raised", raised)
+rmt(d)
+''',
+)
+
+# ---- gen 的场景基准点守卫 ----
+probe(
+    "gen_no_main",
+    "raised=1",
+    r'''
+import gen
+d, g = mkrepo()
+# mkrepo 建的是 -b main, 这里把 main 改名, 让「场景基准点」消失。
+g("branch", "-m", "main", "other")
+sg = gen.ScenarioGen(d)
+raised = 0
+try:
+    sg.generate("conflict", 1, seed=1)
+except gen.GenError:
+    raised = 1
+sig("raised", raised)
+rmt(d)
+''',
+)
+
+# ---- gen 的脏工作区 / 分支冲突守卫 + 仓外联接防线不可用 ----
+probe(
+    "gen_dirty",
+    "raised=1",
+    r'''
+import gen
+d, g = mkrepo()
+# mkrepo 之后是干净的。加一个**未跟踪**文件 -> porcelain 有输出 -> 脏。
+(d / "dirty.txt").write_text("x\n", encoding="utf-8", newline="\n")
+sg = gen.ScenarioGen(d)
+raised = 0
+try:
+    sg.generate("conflict", 1, seed=1)
+except gen.GenError:
+    raised = 1
+sig("raised", raised)
+rmt(d)
+''',
+)
+
+probe(
+    "gen_branch_clash",
+    "clean=1|clash_refused=1",
+    r'''
+import gen
+d, g = mkrepo()
+sg = gen.ScenarioGen(d)
+sg.generate("conflict", 1, seed=7)
+# generate 会留下未提交的产物 -> 先提交, 让 _check_clean 不再抢先拦。
+g("add", "-A"); g("commit", "-qm", "after gen")
+dirty = g("status", "--porcelain").stdout.strip()
+# 非空守卫: 仓不干净的话, 下面拦下来的会是 _check_clean 而不是 clash 闸。
+sig("clean", 1 if not dirty else 0)
+msg = ""
+try:
+    sg.generate("conflict", 1, seed=7)   # 同 seed -> 同名分支 -> clash
+except gen.GenError as e:
+    msg = str(e)
+# 判据是「**哪条**闸拒的」: 关掉 clash 闸后 git 自己也会报错, 只 sig
+# 「有没有抛」分不出来, 必须 sig 消息内容。
+sig("clash_refused", 1 if "以下分支已存在" in msg else 0)
+rmt(d)
+''',
+)
+
+probe(
+    "conf_guard_unavailable",
+    "conflict=1|import_error=0",
+    r'''
+import sys, conflicts
+# sys.modules 里放 None 会让 `import server` 抛 ImportError
+# —— 正是「仓外联接防线不可用」那条分支要处理的情况。
+saved = sys.modules.get("server")
+sys.modules["server"] = None
+conflict = 0
+importerr = 0
+try:
+    conflicts._default_escaping_guard(".")
+except conflicts.ConflictError:
+    conflict = 1
+except ImportError:
+    importerr = 1
+finally:
+    if saved is None:
+        sys.modules.pop("server", None)
+    else:
+        sys.modules["server"] = saved
+# 判据的形状是「**归类**」: 防不住时必须报成 ConflictError, 不能裸奔成 ImportError。
+sig("conflict", conflict)
+sig("import_error", importerr)
+''',
+)
+
+# ---- 路径越界 / 暂存区核对 / 未解决合并 ----
+probe(
+    "conf_merge_unresolved",
+    "conflict=1|unresolved_refused=1",
+    r'''
+import conflicts
+d, g = mkrepo()
+(d / "c.txt").write_text("base\n", encoding="utf-8", newline="\n")
+g("add", "-A"); g("commit", "-qm", "base")
+g("checkout", "-q", "-b", "side")
+(d / "c.txt").write_text("side\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "side")
+g("checkout", "-q", "main")
+(d / "c.txt").write_text("main\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "main")
+p = g("merge", "--no-edit", "side")
+sig("conflict", 1 if p.returncode != 0 else 0)
+c = conflicts.ConflictResolver(d)
+msg = ""
+try:
+    c.commit_merge()
+except conflicts.ConflictError as e:
+    msg = str(e)
+# 判据是「**哪条**闸拒的」: 关掉这条后 git 自己也会拒(索引里还有 U 条目),
+# 只 sig「有没有抛」分不出来。
+sig("unresolved_refused", 1 if "没解决" in msg else 0)
+rmt(d)
+''',
+)
+
+# ---- plan 预演的响应形状 ----
+probe(
+    "amend_published",
+    "has_published=1|inner_is_bool=1",
+    r'''
+import history_ops
+d, g = mkrepo()
+h = history_ops.HistoryOps(d)
+res = h.plan_amend()
+# plan_amend 把 published_info() 的整个 dict 嵌进 published:
+#   {"published": {"published": bool, "remotes": [...], "note": "..."}}
+pub = res.get("published")
+sig("has_published", 1 if isinstance(pub, dict) and "published" in pub else 0)
+sig("inner_is_bool", 1 if isinstance(pub, dict)
+    and isinstance(pub.get("published"), bool) else 0)
+''',
+)
+
+probe(
+    "fetch_aheadBehind",
+    "has_aheadBehind=1",
+    r'''
+import gitops
+d, g = mkrepo()
+o = gitops.GitOps(d)
+res = o.plan_fetch("origin")
+sig("has_aheadBehind", 1 if "aheadBehind" in res else 0)
+''',
+)
+
+probe(
+    "push_revRange",
+    "has_revRange=1",
+    r'''
+import gitops
+d, g = mkrepo()
+o = gitops.GitOps(d)
+res = o.plan_push("origin")
+sig("has_revRange", 1 if "revRange" in res else 0)
+''',
+)
+
+probe(
+    "conf_unresolve_notresolved",
+    "conflict=1|raised=1",
+    r'''
+import conflicts
+d, g = mkrepo()
+(d / "c.txt").write_text("base\n", encoding="utf-8", newline="\n")
+g("add", "-A"); g("commit", "-qm", "base")
+g("checkout", "-q", "-b", "side")
+(d / "c.txt").write_text("side\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "side")
+g("checkout", "-q", "main")
+(d / "c.txt").write_text("main\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "main")
+p = g("merge", "--no-edit", "side")
+sig("conflict", 1 if p.returncode != 0 else 0)
+c = conflicts.ConflictResolver(d)
+# c.txt 还在冲突态(没解决)。这时调 unresolve 应当被拒 —— 它只对已解决路径有意义。
+raised = 0
+try:
+    c.unresolve("c.txt")
+except conflicts.ConflictError:
+    raised = 1
+sig("raised", raised)
+rmt(d)
+''',
+)
+
+# ---------- 快路径/回退边界(2026-10-22) ----------
+probe(
+    "index_fast_extgate",
+    "fast_none=1",
+    r'''
+import server
+d, g = mkrepo()
+(d / "sub").mkdir(exist_ok=True)
+(d / "sub" / "deep.txt").write_text("d\n", encoding="utf-8", newline="\n")
+g("add", "-A"); g("commit", "-qm", "sub")
+# 用 sparse-index 做探针: 它的 sdir 扩展会把目录条目写进索引(名字带 '/'),
+# 关掉扩展闸之后读到的是目录名而不是文件集合 —— 签名必须变。
+# 刻意**不用** split-index: 它同时被「空路径」那道守卫兜住, 是等价变异(实测
+# 关掉扩展闸签名照样不变, 引擎会把那条记成 PROBE-NOOP)。
+g("sparse-checkout", "init", "--cone", "--no-sparse-index")
+g("sparse-checkout", "set", "--sparse-index", "sub")
+v = server.Repo(d)._index_tracked_fast()
+sig("fast_none", 1 if v is None else 0)
+rmt(d)
+''',
+)
+
+probe(
+    "index_fast_count",
+    "equal=1|n=4",
+    r'''
+import server
+d, g = mkrepo()
+for i in range(3):
+    (d / ("f%d.txt" % i)).write_text("v%d\n" % i, encoding="utf-8", newline="\n")
+g("add", "-A"); g("commit", "-qm", "c2")
+fast = server.Repo(d)._index_tracked_fast()
+truth = {x for x in g("ls-files", "-z").stdout.split("\0") if x}
+sig("equal", 1 if fast == truth else 0)
+sig("n", len(truth))
+rmt(d)
+''',
+)
+
+probe(
+    "branch_ref_loose",
+    "loose=1",
+    r'''
+import server
+d, g = mkrepo()
+g("branch", "feature")
+sig("loose", 1 if server.Repo(d)._local_branch_exists("feature") else 0)
+rmt(d)
+''',
+)
+
+# ---------- 引用/reflog/索引直读(2026-10-27) ----------
+probe(
+    "refs_packed_names",
+    "n=4",
+    r'''
+import gitrefs
+d, g = mkrepo()
+for i in range(3):
+    g("branch", "p%d" % i)
+g("pack-refs", "--all")
+names = gitrefs.head_names(d)
+sig("n", -1 if names is None else len(names))
+rmt(d)
+''',
+)
+
+probe(
+    "refs_head_mark",
+    "cur=1",
+    r'''
+import server
+d, g = mkrepo()
+g("branch", "feature")
+rows = server.Repo(d).branches()
+sig("cur", sum(1 for r in rows if r["current"]))
+rmt(d)
+''',
+)
+
+probe(
+    "stash_order",
+    "newest_first=1",
+    r'''
+import history_ops
+d, g = mkrepo()
+(d / "a.txt").write_text("d1\n", encoding="utf-8", newline="\n")
+g("stash", "push", "-q", "-m", "OLD")
+(d / "a.txt").write_text("d2\n", encoding="utf-8", newline="\n")
+g("stash", "push", "-q", "-m", "NEW")
+rows = history_ops.HistoryOps(d).list_stashes()
+sig("newest_first", 1 if rows and "NEW" in rows[0]["raw"] else 0)
+rmt(d)
+''',
+)
+
+probe(
+    "unmerged_list",
+    "n=1",
+    r'''
+import gitrefs
+d, g = mkrepo()
+(d / "c.txt").write_text("base\n", encoding="utf-8", newline="\n")
+g("add", "-A"); g("commit", "-qm", "base")
+g("checkout", "-q", "-b", "side")
+(d / "c.txt").write_text("side\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "side")
+g("checkout", "-q", "main")
+(d / "c.txt").write_text("main\n", encoding="utf-8", newline="\n")
+g("commit", "-qam", "main")
+g("merge", "--no-edit", "side")
+u = gitrefs.unmerged_paths(d)
+sig("n", -1 if u is None else len(u))
+rmt(d)
+''',
+)
+
+# ---------- 写端点输入边界(2026-10-27) ----------
+probe(
+    "path_nul_guard",
+    "raised=1",
+    r'''
+import server
+d, g = mkrepo()
+raised = 0
+try:
+    server.Repo(d).resolve_in_root("a.txt\0.png")
+except server.GitError:
+    raised = 1
+sig("raised", raised)
+rmt(d)
+''',
+)
+
+probe(
+    "commit_nul_msg",
+    "raised=1|staged=0",
+    r'''
+import server
+d, g = mkrepo()
+(d / "new.txt").write_text("n\n", encoding="utf-8", newline="\n")
+raised = 0
+try:
+    server.Repo(d).commit("a\0b")
+except server.GitError:
+    raised = 1
+except Exception:
+    # 守卫被拿掉时 NUL 会漏到 subprocess, 抛的是 Python 原生 ValueError ——
+    # 单独标成 2, 否则探针自己崩掉, 变异会被误记成 ENGINE-ERROR。
+    raised = 2
+staged = g("diff", "--cached", "--name-only").stdout.strip()
+sig("raised", raised)
+sig("staged", 0 if not staged else 1)
+rmt(d)
+''',
+)
+
+probe(
+    "msg_type_guard",
+    "raised=1",
+    r'''
+import history_ops
+d, g = mkrepo()
+(d / "a.txt").write_text("dirty\n", encoding="utf-8", newline="\n")
+raised = 0
+try:
+    history_ops.HistoryOps(d).do_stash(message=["x"])
+except history_ops.HistoryError:
+    raised = 1
+sig("raised", raised)
+rmt(d)
+''',
+)
+
+probe(
+    "reflog_index_type",
+    "clean=1",
+    r'''
+import history_ops
+d, g = mkrepo()
+clean = 0
+try:
+    history_ops.HistoryOps(d).do_restore_from_reflog(index=None, confirmed=True)
+except history_ops.HistoryError:
+    clean = 1
+except Exception:
+    clean = 0
+sig("clean", clean)
+rmt(d)
+''',
+)
+
+probe(
+    "catfile_type",
+    "type=2",
+    r'''
+import gitcat
+d, g = mkrepo()
+(d / "sub").mkdir()
+(d / "sub" / "in.txt").write_text("i\n", encoding="utf-8", newline="\n")
+g("add", "-A"); g("commit", "-qm", "sub")
+got = gitcat.read(d, "HEAD:sub")
+sig("type", 0 if got is None else (1 if got[1] == "blob" else 2))
+rmt(d)
+''',
+)
+
+# ---------- tags/reflog 快路径(2026-10-27) ----------
+probe(
+    "tag_subject_rule",
+    "subject=M1 M2",
+    r'''
+import history_ops
+d, g = mkrepo()
+g("tag", "-a", "m", "-m", "M1\nM2\n\nrest")
+rows = history_ops.HistoryOps(d).list_tags(10)
+sig("subject", rows[0]["subject"] if rows else "EMPTY")
+rmt(d)
+''',
+)
+
+probe(
+    "reflog_order",
+    "newest_is_head=1",
+    r'''
+import history_ops
+d, g = mkrepo()
+for i in range(2):
+    g("commit", "--allow-empty", "-qm", "c%d" % i)
+head = g("rev-parse", "HEAD").stdout.strip()
+rows = history_ops.HistoryOps(d).list_reflog(10)
+sig("newest_is_head", 1 if rows and rows[0]["sha"] == head else 0)
+rmt(d)
+''',
+)
+
+probe(
+    "abbrev_minlen",
+    "len=7",
+    r'''
+import history_ops
+d, g = mkrepo()
+g("commit", "--allow-empty", "-qm", "c2")
+rows = history_ops.HistoryOps(d).list_reflog(5)
+sig("len", len(rows[0]["short"]) if rows else -1)
+rmt(d)
+''',
+)
+
+probe(
+    "tags_sort",
+    "first=new",
+    r'''
+import os, subprocess
+import history_ops
+d, g = mkrepo()
+def tag(name, date):
+    env = dict(os.environ, GIT_COMMITTER_DATE=date)
+    subprocess.run(["git", "-C", str(d), "tag", "-a", name, "-m", name],
+                   env=env, capture_output=True)
+tag("old", "2020-01-02 03:04:05 +0800")
+tag("new", "2021-01-02 03:04:05 +0800")
+rows = history_ops.HistoryOps(d).list_tags(10)
+sig("first", rows[0]["name"] if rows else "EMPTY")
+rmt(d)
+''',
+)
+
+probe(
+    "semantic_autocrlf",
+    "crlf=1|unstaged=0",
+    r'''
+import os, subprocess
+import server
+d, g = mkrepo()
+cfg = d.parent / "gc_autocrlf"
+cfg.write_text("[core]\n\tautocrlf = true\n", encoding="utf-8", newline="\n")
+os.environ["GIT_CONFIG_GLOBAL"] = str(cfg)
+(d / "a.txt").unlink()
+subprocess.run(["git", "-C", str(d), "checkout", "-f", "--", "a.txt"],
+               env=dict(os.environ), capture_output=True)
+crlf = 1 if b"\r\n" in (d / "a.txt").read_bytes() else 0
+st = server.Repo(d).status()
+sig("crlf", crlf)
+sig("unstaged", len(st["unstaged"]))
+rmt(d)
+''',
+)
+
+# ---------- 契约收口(2026-11-02) ----------
+probe(
+    "log_limit_clamp",
+    "n0=1|nneg=1",
+    r'''
+import server
+d, g = mkrepo()
+g("commit", "--allow-empty", "-qm", "c2")
+r = server.Repo(d)
+sig("n0", len(r.log(0)))
+sig("nneg", len(r.log(-1)))
+rmt(d)
+''',
+)
+
+probe(
+    "diff_path_known",
+    "nope=0|real=1",
+    r'''
+import server
+d, g = mkrepo()
+r = server.Repo(d)
+sig("nope", 1 if r.path_known("never_existed.txt") else 0)
+sig("real", 1 if r.path_known("a.txt") else 0)
+rmt(d)
+''',
+)
+
+probe(
+    "tags_shape",
+    "shape=1",    r'''
+import json, os, subprocess, sys, time, urllib.request
+d, g = mkrepo()
+g("tag", "-a", "v1", "-m", "rel")
+srv_dir = os.environ.get("PYTHONPATH") or os.getcwd()
+port = 8900 + (os.getpid() % 400)
+p = subprocess.Popen([sys.executable, "-X", "utf8",
+                      os.path.join(srv_dir, "server.py"),
+                      "--root", str(d), "--port", str(port)],
+                     env=dict(os.environ),
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    for _ in range(80):
+        try:
+            urllib.request.urlopen("http://127.0.0.1:%d/api/health" % port, timeout=1).read()
+            break
+        except Exception:
+            if p.poll() is not None:
+                break
+            time.sleep(0.25)
+    body = json.loads(urllib.request.urlopen(
+        "http://127.0.0.1:%d/api/history/tags" % port, timeout=30).read().decode("utf-8"))
+    ok = isinstance(body, dict) and isinstance(body.get("tags"), list)
+    sig("shape", 1 if ok else 0)
+finally:
+    p.terminate()
+    try:
+        p.wait(10)
+    except Exception:
+        p.kill()
+rmt(d)
+''',
+)
+
+probe(
+    "commit_rc_guard",
+    "raised=1|head_same=1",
+    r'''
+import server
+d, g = mkrepo()
+head0 = g("rev-parse", "HEAD").stdout.strip()
+raised = 0
+try:
+    server.Repo(d).commit("nothing to commit here")
+except server.GitError:
+    raised = 1
+head1 = g("rev-parse", "HEAD").stdout.strip()
+sig("raised", raised)
+sig("head_same", 1 if head0 == head1 else 0)
+rmt(d)
+''',
+)
+
+probe(
+    "status_optout",
+    "omitted=1|has_staged=0",
+    r'''
+import json, os, subprocess, sys, time, urllib.request
+d, g = mkrepo()
+(d / "a.txt").write_text("dirty\n", encoding="utf-8", newline="\n")
+srv_dir = os.environ.get("PYTHONPATH") or os.getcwd()
+port = 8900 + (os.getpid() % 400)
+p = subprocess.Popen([sys.executable, "-X", "utf8",
+                      os.path.join(srv_dir, "server.py"),
+                      "--root", str(d), "--port", str(port)],
+                     env=dict(os.environ),
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    for _ in range(80):
+        try:
+            urllib.request.urlopen("http://127.0.0.1:%d/api/health" % port, timeout=1).read()
+            break
+        except Exception:
+            if p.poll() is not None:
+                break
+            time.sleep(0.25)
+    data = json.dumps({"files": ["a.txt"], "status": False}).encode()
+    rq = urllib.request.Request("http://127.0.0.1:%d/api/stage" % port, data=data,
+                                headers={"Content-Type": "application/json"},
+                                method="POST")
+    body = json.loads(urllib.request.urlopen(rq, timeout=30).read().decode("utf-8"))
+    sig("omitted", 1 if body.get("statusOmitted") is True else 0)
+    sig("has_staged", 1 if "staged" in body else 0)
+finally:
+    p.terminate()
+    try:
+        p.wait(10)
+    except Exception:
+        p.kill()
+rmt(d)
+''',
+)
+
 
 # ════════════════════════════════════════════════════════ 套件输出解析
 #
@@ -719,7 +1447,73 @@ SUITE_PARSERS = {
                               r"FAIL (?P<fail>\d+)\s+SKIP (?P<skip>\d+)\s+"
                               r"ERROR (?P<error>\d+)"),
     },
+    # 2026-10-27 新增: 引用 / reflog / 索引直读的「快路径 ∪ 回退」判据。
+    "test_refstore.py": {
+        "cases": [_case(MARK_RE, {"  ok  ": "pass", " FAIL ": "fail",
+                                  " skip ": "skip", "ERROR ": "error"})],
+        "summary": re.compile(r"汇总: 共 (?P<total>\d+) 条\s+PASS (?P<pass>\d+)\s+"
+                              r"FAIL (?P<fail>\d+)\s+SKIP (?P<skip>\d+)\s+"
+                              r"ERROR (?P<error>\d+)"),
+    },
+    # 2026-10-27 新增: 写端点输入边界(NUL 路径 / 消息类型 / 索引类型)。
+    "test_write_inputs.py": {
+        "cases": [_case(MARK_RE, {"  ok  ": "pass", " FAIL ": "fail",
+                                  " skip ": "skip", "ERROR ": "error"})],
+        "summary": re.compile(r"汇总: 共 (?P<total>\d+) 条\s+PASS (?P<pass>\d+)\s+"
+                              r"FAIL (?P<fail>\d+)\s+SKIP (?P<skip>\d+)\s+"
+                              r"ERROR (?P<error>\d+)"),
+    },
+    # 2026-10-27 新增: 常驻 cat-file 的等价性与回退。
+    "test_object_read.py": {
+        "cases": [_case(MARK_RE, {"  ok  ": "pass", " FAIL ": "fail",
+                                  " skip ": "skip", "ERROR ": "error"})],
+        "summary": re.compile(r"汇总: 共 (?P<total>\d+) 条\s+PASS (?P<pass>\d+)\s+"
+                              r"FAIL (?P<fail>\d+)\s+SKIP (?P<skip>\d+)\s+"
+                              r"ERROR (?P<error>\d+)"),
+    },
+    # 2026-10-27 新增: tags/reflog 快路径(格式化语义与 git 逐字段对齐)。
+    "test_history_fast.py": {
+        "cases": [_case(MARK_RE, {"  ok  ": "pass", " FAIL ": "fail",
+                                  " skip ": "skip", "ERROR ": "error"})],
+        "summary": re.compile(r"汇总: 共 (?P<total>\d+) 条\s+PASS (?P<pass>\d+)\s+"
+                              r"FAIL (?P<fail>\d+)\s+SKIP (?P<skip>\d+)\s+"
+                              r"ERROR (?P<error>\d+)"),
+    },
+    # 2026-10-28 新增: aigit vs 真 git 的差分（含 autocrlf 透传与阴性对照）。
+    "test_vs_git.py": {
+        "cases": [_case(MARK_RE, {"  ok  ": "pass", " FAIL ": "fail",
+                                  " skip ": "skip", "ERROR ": "error"})],
+        "summary": re.compile(r"汇总: 共 (?P<total>\d+) 条\s+PASS (?P<pass>\d+)\s+"
+                              r"FAIL (?P<fail>\d+)\s+SKIP (?P<skip>\d+)\s+"
+                              r"ERROR (?P<error>\d+)"),
+    },
+    # 2026-10-30 新增: 写操作 vs 真 git（同一次提交的 sha 必须逐字相同）。
+    "test_write_vs_git.py": {
+        "cases": [_case(MARK_RE, {"  ok  ": "pass", " FAIL ": "fail",
+                                  " skip ": "skip", "ERROR ": "error"})],
+        "summary": re.compile(r"汇总: 共 (?P<total>\d+) 条\s+PASS (?P<pass>\d+)\s+"
+                              r"FAIL (?P<fail>\d+)\s+SKIP (?P<skip>\d+)\s+"
+                              r"ERROR (?P<error>\d+)"),
+    },
+    # 2026-11-02 新增: 四条对外契约收口(log 夹取 / diff 不存在 / 形状 / 405)。
+    "test_api_contract.py": {
+        "cases": [_case(MARK_RE, {"  ok  ": "pass", " FAIL ": "fail",
+                                  " skip ": "skip", "ERROR ": "error"})],
+        "summary": re.compile(r"汇总: 共 (?P<total>\d+) 条\s+PASS (?P<pass>\d+)\s+"
+                              r"FAIL (?P<fail>\d+)\s+SKIP (?P<skip>\d+)\s+"
+                              r"ERROR (?P<error>\d+)"),
+    },
     "test_conflicts.py": _tap_parser(),
+    # 2026-10-22 新增: 索引直读 / ref 直读的「快路径 ∪ 回退」边界套件。
+    # 它自跑式输出与 test_aigit.py 同形(2 空格 + mark + 空格 + 名字 / 汇总行),
+    # 所以共用同一份 MARK_RE 与 summary 正则。
+    "test_index_fastpath.py": {
+        "cases": [_case(MARK_RE, {"  ok  ": "pass", " FAIL ": "fail",
+                                  " skip ": "skip", "ERROR ": "error"})],
+        "summary": re.compile(r"汇总: 共 (?P<total>\d+) 条\s+PASS (?P<pass>\d+)\s+"
+                              r"FAIL (?P<fail>\d+)\s+SKIP (?P<skip>\d+)\s+"
+                              r"ERROR (?P<error>\d+)"),
+    },
     # 2026-10-03 新增: 专测「守卫被关掉时必须有人喊」的护栏不变量。
     # 格式与 test_conflicts.py 同为 TAP, 共用同一份正则(见 _tap_parser)。
     "test_aigit_invariants.py": _tap_parser(),
@@ -740,6 +1534,20 @@ SUITE_PARSERS = {
                                    r"(?:\s+\(异常\))?\s*$"),
                         {"ok": "pass", "not ok": "fail"})],
         "dots_are_pass": True,
+        "summary": re.compile(r"共 (?P<total>\d+) 条,过 (?P<pass>\d+),"
+                              r"失败 (?P<fail>\d+),异常 (?P<error>\d+)"),
+    },
+    # 2026-10-06 新增: S-ab-trackingref-off 第一次跑就 KeyError 崩在这条缺失的
+    # 解析器上(ENGINE-ERROR, 与 test_f06_guard.py 那次同一类)。
+    "test_aigit_net.py": {
+        # summary 与 test_history_ops.py **同形**(共 N 条,过 P,失败 F,异常 E),
+        # 但点**不是独占一行** —— 实测 56 个点散在 12 行, 每行后面都跟着
+        # 该用例打的说明文字。所以用 dots_prefix_are_pass(数行首连续的点)。
+        # 失败行: '\nnot ok <id> - <name>', id 里含 '-'、名字含中文/空格。
+        # 引擎跑套件**不带 -v**(见 run_suite), 所以通过用例只有点、没有 ok 行。
+        "cases": [_case(re.compile(r"^\s*(?P<st>not ok)\s+(?P<nm>.+?)\s*$"),
+                        {"not ok": "fail"})],
+        "dots_prefix_are_pass": True,
         "summary": re.compile(r"共 (?P<total>\d+) 条,过 (?P<pass>\d+),"
                               r"失败 (?P<fail>\d+),异常 (?P<error>\d+)"),
     },
@@ -775,6 +1583,19 @@ SUITE_PARSERS = {
                         {"PASS": "pass", "FAIL": "fail"})],
         "summary": re.compile(r"通过\s+(?P<pass>\d+)\s+失败\s+(?P<fail>\d+)\s+"
                               r"跳过\s+(?P<skip>\d+)"),
+    },
+    # 2026-10-06 新增: 这条防线(commit_merge 第五道)由 T3 在测, 而
+    # SUITES_BY_TARGET["conflicts.py"] 原来只有 test_conflicts.py ——
+    # 缺这条解析器时引擎直接 KeyError 崩成 ENGINE-ERROR(实测
+    # C-merge-add-scope-off 第一次跑就是这个)。
+    # ⚠ 本套件行首**没有**缩进(与 MARK_RE 不同): 'ok   T1   (1.6s)'。
+    # ⚠ 'base' 行是**基线测量**, 不进 PASS/FAIL 汇总 —— 必须排除,
+    #   否则 parsed_total 会比 summary 多, 判成假 MISMATCH。
+    "test_f06_guard.py": {
+        "cases": [_case(re.compile(r"^(?P<st>ok|FAIL|skip)\s+(?P<nm>\S+)"),
+                        {"ok": "pass", "FAIL": "fail", "skip": "skip"})],
+        "summary": re.compile(r"# 共 (?P<total>\d+) 条\s+PASS (?P<pass>\d+)\s+"
+                              r"FAIL (?P<fail>\d+)\s+SKIP (?P<skip>\d+)"),
     },
 }
 
@@ -842,6 +1663,7 @@ def parse_suite(suite, out):
     """
     spec = SUITE_PARSERS[suite]
     cases = {}
+    dot_n = 0
     for line in out.splitlines():
         done = False
         for rule in spec["cases"]:
@@ -869,14 +1691,26 @@ def parse_suite(suite, out):
             break
         if done:
             continue
-        # test_history_ops.py: 通过用例只在进度里点 '.', 不打用例行。
-        # 点数 = 通过数。这是它「声称 37 条却只解析出 4 条」的正解。
+        # test_history_ops.py / test_aigit_net.py: 通过用例只在进度里点 '.',
+        # 不打用例行。点数 = 通过数。这是它「声称 N 条却只解析出几条」的正解。
+        #
+        # ⚠ 名字必须**跨行全局唯一**。旧写法用行内下标 `dot-pass-%d`: 两行各有
+        #   5 个点时会生成两套 dot-pass-0..4, 去重后只剩 5 个 —— 实测
+        #   test_aigit_net.py 的 56 个点散在 **12 行**上, 旧写法只会数出 13。
+        #   (test_history_ops.py 恰好把 37 个点挤在**一行**, 所以一直没暴露。)
+        ndots = 0
         if spec.get("dots_are_pass"):
             s = line.strip()
             if s and set(s) == {"."}:
-                cases.setdefault("pass", [])
-                for i in range(len(s)):
-                    cases["pass"].append("dot-pass-%d" % i)
+                ndots = len(s)
+        elif spec.get("dots_prefix_are_pass"):
+            # test_aigit_net.py: 点后面**紧跟着**该用例自己打的说明文字
+            # (如 '.        逐字段比对通过: ...'), 所以「整行只有点」永不成立,
+            # 必须数**行首连续的点**。
+            ndots = len(line) - len(line.lstrip("."))
+        for _ in range(ndots):
+            cases.setdefault("pass", []).append("dot-pass-%d" % dot_n)
+            dot_n += 1
 
     for st in ("pass", "fail", "error", "skip", "warn"):
         cases.setdefault(st, [])
@@ -1471,6 +2305,33 @@ PARSER_FIXTURES = [
      "want": {"pass": 9, "fail": 2, "error": 0, "skip": 0, "warn": 0,
               "parsed_total": 11, "claimed_total": 2, "claimed_fail": 2,
               "crosscheck": "OK", "parse_ok": False}},
+    # ⚠ 上面那份 fixture 把 9 个点挤在**一行** —— 正好躲开了「点散在多行时
+    #   名字碰撞」那个洞。这份**故意拆成两行**, 旧写法会数成 5 个 pass
+    #   (dot-pass-0..2 与 dot-pass-0..4 去重), parsed_total=6 != 9 -> MISMATCH。
+    {"suite": "test_history_ops.py",
+     "why": "点在**多行**上(旧写法行内下标会碰撞 -> 少算 pass)",
+     "out": ("...\n"
+             ".....\n"
+             "not ok A-x - 某用例\n"
+             "共 9 条,过 8,失败 1,异常 0\n"),
+     "want": {"pass": 8, "fail": 1, "error": 0, "skip": 0, "warn": 0,
+              "parsed_total": 9, "claimed_total": 9, "claimed_fail": 1,
+              "crosscheck": "OK", "parse_ok": True}},
+    # ---- test_aigit_net.py: 点是**行首连续的点**, 后面紧跟用例自己打的文字 ----
+    {"suite": "test_aigit_net.py",
+     "why": "点散在 12 行且每行后面有文字 -> 必须数行首连续的点, 且名字跨行唯一",
+     "out": ("测试目录: X\n"
+             ".\n"
+             "...\n"
+             ".....        import 语句共 8 条\n"
+             "not ok B1-foo - 某用例\n"
+             "        某失败详情\n"
+             "...\n"
+             ".....        GitOps 公开方法 11 个\n"
+             "共 18 条,过 17,失败 1,异常 0,用时 1.0s\n"),
+     "want": {"pass": 17, "fail": 1, "error": 0, "skip": 0, "warn": 0,
+              "parsed_total": 18, "claimed_total": 18, "claimed_fail": 1,
+              "crosscheck": "OK", "parse_ok": True}},
     # ---- selftest.py: [通过] / [失败], 名字含空格 ----
     # summary "N / M 组通过" **有** total 字段(=M), 但**没有**失败字段,
     # 所以 claimed_total 可对账、claimed_fail 不可对账(NO-FAIL-FIELD)。
@@ -1503,6 +2364,20 @@ PARSER_FIXTURES = [
              "  通过 1    失败 1    跳过 0\n"),
      "want": {"pass": 1, "fail": 1, "error": 0, "skip": 0, "warn": 0,
               "parsed_total": 2, "claimed_total": None, "claimed_fail": 1,
+              "crosscheck": "OK", "parse_ok": True}},
+    # ---- test_f06_guard.py: 行首**无缩进** + 'base' 行必须被排除 ----
+    {"suite": "test_f06_guard.py",
+     "why": "行首无缩进(与 MARK_RE 相反); 'base' 是基线测量不进汇总, "
+            "fixture 里故意放一条 —— 若被算进去 parsed_total 会变 6 而 summary 说 5",
+     "out": ("ok   T1                               (1.6s)\n"
+             "ok   T2                               (1.1s)\n"
+             "FAIL T3                               T1 的 PASS 不可信\n"
+             "ok   T4                               (11.0s)\n"
+             "skip T5                               net\n"
+             "base L-1                              (1.2s)\n"
+             "# 共 5 条  PASS 3  FAIL 1  SKIP 1  用时 15.0s\n"),
+     "want": {"pass": 3, "fail": 1, "error": 0, "skip": 1, "warn": 0,
+              "parsed_total": 5, "claimed_total": 5, "claimed_fail": 1,
               "crosscheck": "OK", "parse_ok": True}},
 ]
 

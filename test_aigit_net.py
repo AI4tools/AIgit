@@ -480,7 +480,16 @@ def b1():
     repo = make_repo("B1-work", remote=bare, commits=2)
     g = GitOps(repo, NetGate(OFF))
     ck_eq(len(g.list_remotes()["remotes"]), 1, "前置: 仓里应当配了 1 个远程")
-    ck(g.ahead_behind()["ahead"] == 2, "前置: 应当有 2 个待推提交")
+    ab0 = g.ahead_behind()
+    ck(ab0["ahead"] == 2, "前置: 应当有 2 个待推提交")
+    # 2026-10-06 补(由 find_test_gaps.py 报出「零提及」后加的):
+    # 从没推过 => 没有远程跟踪 ref => behind **必须**是 None, 不能是 0。
+    # 这正是 gitops.py:603-604 记的那个坑: 陈旧的跟踪 ref 会让 behind=0
+    # 看起来像「远程没新东西」, 而 None 才诚实地表示「没有基准可比」。
+    ck_eq(ab0["trackingRefExists"], False,
+          "还没推过, 不该已经有远程跟踪 ref —— 若为 True, behind 的语义就变了")
+    ck_eq(ab0["behind"], None,
+          "没有跟踪 ref 时 behind 必须是 None(不是 0) —— 0 会被误读成「远程没新东西」")
     before = bare_fingerprint(bare)
     res = []
     with Spy() as spy:
@@ -1046,6 +1055,12 @@ def e3():
     ck_eq(pl["requires_confirmation"], False, "fetch 不该要求确认")
     ck_eq(pl["safe"], True, "fetch 该标成 safe")
     ck("reset --hard" in pl["what"], "plan 该说清怎么撤销, 实际: %r" % pl["what"])
+    # 2026-10-21 补: aheadBehind 原先**零提及**(find_test_gaps 报 zero)。
+    # fetch 的预演要报出「会落后/领先多少」—— 没这个键, 前端只能自己再查一次。
+    # 值先量后写: 有上游跟踪 ref 时是 dict(ahead/behind/...), 没有时是 None。
+    ab = pl["aheadBehind"]
+    ck(ab is None or isinstance(ab, dict),
+       "aheadBehind 应为 dict 或 None, 实际 %r" % (ab,))
 
 
 @t("E", "write 级: plan_push 先报出将推哪几个提交, 再真推")
@@ -1062,6 +1077,13 @@ def e4():
     ck_eq(pl["requires_confirmation"], True, "push 该要求确认")
     ck_eq(pl["safe"], False, "push 不该标成 safe")
     ck(pl["warning"], "该有待推提交时必须给警告")
+    # 2026-10-21 补: revRange 原先**零提及**。预演要报出「推哪个区间」——
+    # 没有它, 客户端只能自己拼 origin/main..main。
+    # 值先量后写: 有上游 ref 时是 "origin/main..main", 没有时就是 "main";
+    # 两种都以分支名结尾, 所以判据用 endswith 而不是硬编码整个串。
+    rng = pl["revRange"]
+    ck(isinstance(rng, str) and rng.endswith("main"),
+       "revRange 应是字符串且以分支名结尾, 实际 %r" % (rng,))
 
     out = g.do_push(confirmed=True)
     ck_eq(out["ok"], True, "push 应成功")

@@ -24,6 +24,7 @@
 
 import argparse
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -346,6 +347,24 @@ def t_identify(v):
     ok(st["mergeHead"], "MERGE_HEAD 应可读")
     eq(1, st["remaining"], "应剩 1 个未解决文件")
 
+    # 2026-10-06 补: 下面这几个键原先**没有任何套件断言过**
+    # (find_test_gaps.py 报「零提及」: currentBranch / origHead / mergeMsgPath)。
+    # 值**先量后写** —— 量的脚本 D:\aigit_mut_tmp\measure_mergestate.py,
+    # 实测 currentBranch='main' / head==origHead / mergeMsgPath 以 MERGE_MSG 结尾。
+    eq("main", st["currentBranch"],
+       "currentBranch 是**并入方**的分支(被并入的记在 branches 里)")
+    ok(st["currentBranch"] not in st["branches"],
+       "并入方与被并入方不该是同一个分支, 实际 currentBranch=%r branches=%r"
+       % (st["currentBranch"], st["branches"]))
+    eq(st["head"], st["origHead"],
+       "冲突进行中 HEAD 还没动, ORIG_HEAD 就该是合并前的那个 HEAD")
+    ok(re.match(r"^[0-9a-f]{40}$", st["origHead"] or ""),
+       "origHead 应当是 40 位 sha, 实际 %r" % (st["origHead"],))
+    ok(str(st["mergeMsgPath"]).endswith("MERGE_MSG"),
+       "mergeMsgPath 应当指向 MERGE_MSG, 实际 %r" % (st["mergeMsgPath"],))
+    ok(os.path.exists(st["mergeMsgPath"]),
+       "mergeMsgPath 指向的文件应当真的存在: %r" % (st["mergeMsgPath"],))
+
     lst = r.list_conflicts()
     eq(1, lst["count"], "冲突文件数")
     eq(sc["files"][0], lst["files"][0]["path"], "冲突文件路径")
@@ -658,6 +677,148 @@ def t_resolve_sha(v):
     eq(False, res["stillUnmerged"], "对摘要应当写成")
     eq("对的版本\n", (root / rel).read_text(encoding="utf-8"), "落盘内容")
     v("对 sha256 正常写回: stillUnmerged=%s" % res["stillUnmerged"])
+
+
+@test("delete-sha: delete_file 的 expect_sha256 不匹配时拒绝删除(乐观并发)")
+def t_delete_sha(v):
+    # 2026-10-06 补: 这道守卫原先**零提及** —— 全仓没有任何测试给
+    # delete_file 传过 expect_sha256(resolve 那条有 t_resolve_sha, 这条没有)。
+    # 危害: 客户端状态过期时会**删掉它没见过的内容**。
+    root, _sc = fixture_gen_conflict()
+    rel = unmerged(root)[0]
+    r = ConflictResolver(root)
+    d = r.inspect(rel)
+    before = (root / rel).read_bytes()
+    reason = None
+    try:
+        r.delete_file(rel, expect_sha256="0" * 64)
+    except ConflictError as e:
+        reason = str(e)
+    else:
+        raise Fail("sha256 不匹配应当拒绝删除")
+    contains(reason, "拒绝删除", "拒绝理由")
+    eq(before, (root / rel).read_bytes(), "被拒后文件内容不能变")
+    eq([rel], unmerged(root), "被拒后仍是冲突态")
+    v("错 sha256 被拒: %s" % reason.split("。")[0])
+    # 对摘要就能真删
+    res = r.delete_file(rel, expect_sha256=d["worktree"]["sha256"])
+    eq(True, res["deleted"], "对摘要应当真删")
+    v("对 sha256 正常删除: deleted=%s" % res["deleted"])
+
+
+@test("unresolve-guard: 对还在冲突态的路径调 unresolve 被拒")
+def t_unresolve_guard(v):
+    # 2026-10-06 补: unresolve 这条路径**全仓零提及**(没有任何测试调过它)。
+    # 危害: 对未解决的路径调它, 下面那步 `git checkout --merge` 会把用户
+    # 刚解决好的内容冲掉。
+    root, _sc = fixture_gen_conflict()
+    rel = unmerged(root)[0]
+    r = ConflictResolver(root)
+    reason = None
+    try:
+        r.unresolve(rel)
+    except ConflictError as e:
+        reason = str(e)
+    else:
+        raise Fail("对未解决路径调 unresolve 应当被拒")
+    contains(reason, "还没解决", "拒绝理由")
+    eq([rel], unmerged(root), "被拒后仍应是冲突态(没被冲掉)")
+    v("未解决路径调 unresolve 被拒: %s" % reason.split("。")[0])
+
+
+@test("gen-nomain: 仓里没有 main 分支时 gen 拒绝生成")
+def t_gen_nomain(v):
+    # 2026-10-06 补: 这道守卫原先**零提及**。
+    # 危害: 在没有基准分支的仓上生成场景, 产出的分支/文件全是悬空的。
+    from gen import ScenarioGen, GenError
+    root = mk("gen_nomain")
+    write(root, "README.md", "# no main\n")
+    commit_all(root, "init")
+    g(root, "branch", "-m", "main", "other")     # 让 main 消失
+    reason = None
+    try:
+        ScenarioGen(root).generate("conflict", 1, seed=1)
+    except GenError as e:
+        reason = str(e)
+    else:
+        raise Fail("没有 main 分支应当拒绝生成")
+    contains(reason, "没有 main 分支", "拒绝理由")
+    v("无 main 被拒: %s" % reason.split("。")[0])
+
+
+@test("gen-dirty: 工作区不干净时 gen 拒绝生成")
+def t_gen_dirty(v):
+    # 2026-10-06 补: `_check_clean` 原先**全仓零提及**(测试和变异体都没有)。
+    # 危害: 在别人的工作区上叠随机内容, 事后分不清哪些改动是谁造的。
+    from gen import ScenarioGen, GenError
+    root = mk("gen_dirty")
+    write(root, "README.md", "# dirty fixture\n")
+    commit_all(root, "init")
+    write(root, "dirty.txt", "uncommitted\n")
+    ok(porcelain(root), "前置: 仓必须是脏的, 否则测的不是 _check_clean")
+    reason = None
+    try:
+        ScenarioGen(root).generate("conflict", 1, seed=1)
+    except GenError as e:
+        reason = str(e)
+    else:
+        raise Fail("工作区脏时应当拒绝生成")
+    contains(reason, "工作区不干净", "拒绝理由")
+    v("脏工作区被拒: %s" % reason.split("。")[0])
+
+
+@test("gen-clash: 同名分支已存在时 gen 拒绝生成(而不是覆盖)")
+def t_gen_branch_clash(v):
+    # 2026-10-06 补: 「以下分支已存在」零提及。危害: 反复 generate 互相踩,
+    # 半途 git 报错留下一个生成到一半的仓。
+    from gen import ScenarioGen, GenError
+    root = mk("gen_clash")
+    write(root, "README.md", "# clash fixture\n")
+    commit_all(root, "init")
+    sg = ScenarioGen(root)
+    sg.generate("conflict", 1, seed=7)
+    # gen 可能把产物直接提交在自己的分支上, 回到 main 时仓可能已经干净;
+    # 只有真脏才需要清 —— 否则 `git commit` 会因「没有东西可提交」而失败。
+    if porcelain(root):
+        commit_all(root, "after gen")
+    eq("", porcelain(root), "前置: 仓要干净, 否则拦下来的会是 _check_clean")
+    reason = None
+    try:
+        sg.generate("conflict", 1, seed=7)   # 同 seed -> 同名分支
+    except GenError as e:
+        reason = str(e)
+    else:
+        raise Fail("同名分支已存在时应当拒绝生成")
+    contains(reason, "以下分支已存在", "拒绝理由")
+    v("同名分支被拒: %s" % reason.split("。")[0])
+
+
+@test("guard-unavailable: 拿不到仓外联接防线时必须报 ConflictError")
+def t_guard_unavailable(v):
+    # 2026-10-06 补: 这条「防线不可用」分支零提及。判据形状是**归类** ——
+    # 调用方按 ConflictError 判「防不住 -> 拒绝」, 裸奔的 ImportError
+    # 会被当成 bug 而绕过拒绝逻辑。
+    import sys
+    import conflicts
+    saved = sys.modules.get("server")
+    sys.modules["server"] = None             # 让 `import server` 抛 ImportError
+    try:
+        reason = None
+        try:
+            conflicts._default_escaping_guard(".")
+        except ImportError as e:
+            raise Fail("裸奔成 ImportError, 没转成 ConflictError: %s" % e)
+        except conflicts.ConflictError as e:
+            reason = str(e)
+        else:
+            raise Fail("防线不可用时应当抛 ConflictError")
+        contains(reason, "仓外联接防线不可用", "拒绝理由")
+        v("防线不可用被拒: %s" % reason.split("，")[0])
+    finally:
+        if saved is None:
+            sys.modules.pop("server", None)
+        else:
+            sys.modules["server"] = saved
 
 
 # ---- 6. 完成合并 -------------------------------------------------------

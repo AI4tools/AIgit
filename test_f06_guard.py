@@ -355,20 +355,58 @@ def escaping_links(root):
     print("      判据自检: 复制版被判 %r, conflicts.py 判 None" % hit)
 
 
-@test("T3", "falsifiable-reverse", "反向对照: 关掉防线, 必须真的泄漏")
+@test("T3", "falsifiable-reverse", "反向对照: 拆掉逃逸闸后, 还有哪一道在挡")
 def t3_falsifiable():
-    """判据可证伪性。如果关掉防线 commit_merge 还是拒绝, 说明 T1 判据是空的。"""
+    """判据可证伪性: 证明 T1 的拒绝**确实**来自 `escaping_links` 这道闸。
+
+    ## ⚠ 2026-10-06 改判据(经用户授权)。原判据为何不成立
+
+    原来第二条断言是 `ck(lp and lc, "防线关掉后没有泄漏 —— T1 的 PASS 不可信")`,
+    即「把 `escaping_links` 换成 no-op 之后, 仓外内容**必须**泄漏」。
+    它**在本场景下永远不成立**, 2026-10-06 实测:
+
+        commit_merge 被拒 = False        (拒绝确实不来自这条闸 —— 第一个断言过)
+        提交成功           8d25c7e guard disabled on purpose, MERGE_HEAD 已清
+        ls-files 里 escape* = []        (空!)
+        status            = ?? escape/  (未跟踪, 进不了索引)
+        leaked()          = (False, False)
+
+    原因: `commit_merge` 里有**五道**防线, T3 只拆了第四道(`escaping_links`)。
+    第五道是作用域受限的显式 `add -- <路径>`, 只收 git「已跟踪」视图里的路径,
+    未跟踪的一律不进 —— 它**独立**挡住了泄漏。`conflicts.py` 里那段注释写得很
+    明确: 「两道挡的是不同东西, 不是重复」。
+
+    所以原判据量的不是「这道闸是否承重」, 而是「是否**只有**这一道防线」——
+    后者按设计就为假。拆 1 道防 5 道当然不漏, 再跑一万遍也不漏。
+
+    ## 改成了问什么
+
+    1. `not refused` —— 换 no-op 后**必须不再拒绝**。这一条原样保留, 它才是
+       「T1 的 PASS 不是空的」的真正证据(拒绝确实来自这条闸)。
+    2. `committed` —— 提交**必须真的成功**。少了这条, 第 3 条的「没泄漏」
+       可能是「什么都没发生」的空真。
+    3. `not (lp or lc)` —— 仓外路径既没进索引、内容也从 HEAD 读不出来,
+       即**第二道防线独立成立**。这不是恒真: 第 5 道一旦被拆, 它立刻变红
+       (下面的阳性对照就是量这个的)。
+
+    ## 阳性对照(就地做, 不靠外部脚本)
+
+    「没泄漏」这种断言最容易变成恒真 —— `leaked()` 万一坏了也返回 False。
+    所以本测试**自己**造一次真泄漏: 手动 `git add -A` + commit 绕过第 5 道,
+    然后要求 `leaked()` 必须变成 `(True, True)`。2026-10-06 实测
+    `(False, False) -> (True, True)`, 证明这把尺子会响。
+    """
     sb = Sandbox("t3")
     try:
         repo, _ = build_conflicted(sb)
-        prev = conflicts.install_escaping_guard(lambda root: [])   # 故意拆掉
+        prev = conflicts.install_escaping_guard(lambda root: [])   # 故意拆掉第四道
         try:
             cr = ConflictResolver(repo)
             cr.resolve("c00.txt", "resolved\n")
-            refused, err = False, ""
+            refused, committed, err = False, False, ""
             try:
                 cr.commit_merge("guard disabled on purpose")
-                refused = False
+                committed = True
             except ConflictError as e:
                 refused = True
                 err = str(e)
@@ -376,10 +414,29 @@ def t3_falsifiable():
             ck(not refused,
                "防线被换成 no-op 却仍然拒绝 —— 拒绝不是来自这条防线, "
                "T1/T3 的判据落空: %s" % err[:120])
-            ck(lp and lc,
-               "防线关掉后**没有**泄漏 —— 反向对照失败, T1 的 PASS 不可信 "
+            ck(committed,
+               "拆掉闸之后 commit_merge 报成功, 但其实没提交成功 —— "
+               "下面的「没泄漏」就成了空真, 这条判据不可信")
+            ck(not (lp or lc),
+               "第四道已拆, 仓外路径却还是进了索引或进了历史 —— "
+               "**第五道(作用域受限 add)没有独立挡住**, "
                "(leaked_path=%s leaked_content=%s)" % (lp, lc))
-            print("      反向对照成立: 防线=no-op 时仓外内容真的进了历史")
+            print("      反向对照成立: 第四道=no-op 时不再拒绝(拒绝确实来自它), "
+                  "提交成功, 且第五道独立挡住了泄漏")
+
+            # -- 阳性对照: 手动绕过第五道, 证明「没泄漏」这把尺子会响 --
+            r_add = git(repo, "add", "-A")
+            r_cmt = git(repo, "-c", "user.name=t3", "-c", "user.email=t3@x",
+                        "commit", "-q", "-m", "t3 positive control: manual leak")
+            pos = leaked(repo)
+            ck(r_add.returncode == 0 and r_cmt.returncode == 0,
+               "阳性对照自己没跑成: add rc=%d commit rc=%d —— "
+               "判据可证伪性无法自证" % (r_add.returncode, r_cmt.returncode))
+            ck(pos == (True, True),
+               "阳性对照失败: 手动 add -A + commit 之后 leaked() 仍是 %s —— "
+               "leaked() 本身坏了, 上面那条「没泄漏」是恒真, 不能采信" % (pos,))
+            print("      阳性对照咬住: 手动绕过第五道后 leaked() %s -> %s"
+                  % ((lp, lc), pos))
         finally:
             conflicts.install_escaping_guard(prev)
         return

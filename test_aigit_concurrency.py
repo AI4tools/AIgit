@@ -1097,6 +1097,44 @@ def fx_history(sb):
     return sb
 
 
+FX_DEEP_BASE = 6
+FX_DEEP_N = 24
+
+
+def fx_history_deep(sb, n=None):
+    """FX_DEEP_N 个提交, 分两段, 给三种操作各备一份互不干扰的 fodder。
+
+    n=None 时用 FX_DEEP_N(C4B 用); C4C 传更大的数, 因为它的 undo 次数更多。
+
+    第 1 段(`c1`..`cFX_DEEP_BASE`): 每个提交只动一个**专属**文件 `r/r0i.txt`。
+        这几个是 revert 的 fodder。专属文件不会被后续提交再改, 所以无论 HEAD
+        停在哪一格, revert 它的逆补丁都能干净贴上。
+    第 2 段: 循环动 `w/f00..07`, 只为给 undo 提供**深度**。
+
+    为什么不能用 `fx_history`(只有 2 个提交): undo 是 `reset --hard HEAD~1`,
+        一步一步往回走; 2 个提交的仓里第 3 次就 `fatal: ambiguous argument
+        'HEAD~1'`, 成功响应被压到 2 条 —— 分母 2 的判据什么都不能说明。
+
+    第一版 C4B 踩过的坑(记下来, 别再犯): 让 revert 去 revert 中段某条、而那个
+        文件**也被后续提交改过**。HEAD 被 undo 拉回那几格之后逆补丁贴不上 ->
+        冲突 -> `git revert` 失败并留下 REVERT_HEAD; 而 `do_revert` 失败时
+        **不清理**它, 于是 `plan_revert` 的 `dirty()["conflicted"]` 闸把**后面
+        全部** revert 一起拒掉: 实测 revert_ok 塌到 **3/16**。
+        那是夹具的毛病, 不是产品的事实 —— 要让判据的分母站得住, 先修夹具。
+    """
+    n = FX_DEEP_N if n is None else n
+    for i in range(N_W):
+        sb.write("w/f%02d.txt" % i, "v0\n")
+    sb.commit("c1: base")
+    for k in range(2, FX_DEEP_BASE + 1):
+        sb.write("r/r%02d.txt" % k, "r%d\n" % k)
+        sb.commit("c%d: revert fodder %d" % (k, k))
+    for k in range(FX_DEEP_BASE + 1, n + 1):
+        sb.write("w/f%02d.txt" % (k % N_W), "v%d\n" % k)
+        sb.commit("c%d: depth %d" % (k, k))
+    return sb
+
+
 def fx_escape(sb):
     """仓内放一个指向仓外的目录联接 —— E4/escaping_links 的威胁模型。"""
     sb.write("a.txt", "a\n")
@@ -1481,6 +1519,268 @@ def t_c2b_pin_vs_reset():
 
 # ════════════════════════════════════════════════════════ C4
 
+# ════════════════════════════════════════════════════════ C4 的请求级原子性判据
+#
+# ⚠ 这一段是 2026-10-05 新加的, 它接的是 C7 原来那条判据(见 C7 里的移交说明)。
+#
+# ## 判据落在哪
+# C7 原来用 `ck(not summ["requests_interleaved"])` 表达「操作不是原子的」, 实测
+# 恒红(72 个有资格的请求里 48 个被插过队), 但**那个数不携带任何信息**:
+# 锁是**每条 git 命令取一次**(server.py:497 的 _run_full), 一次请求的两次 git
+# 调用之间必然有缝, 而缝的宽度与并发度成正比。实测 836/836 个外来 span **全部**
+# 落在缝里, 真重叠 0。换成「真重叠 = 0」会把缺陷**洗成绿**, 因为本条真正
+# 要抓的损害**不需要真重叠**也能发生。
+#
+# ## 判据是什么(以及为什么只有一条)
+# `HistoryOps.do_amend`(history_ops.py:607-625)末尾是:
+#       rc, out = self._ok(["commit", "--amend", ...])
+#       new_sha = self.head_sha()                 # ← commit **之后**才读
+#       return {... "subject": self.subject_of(new_sha) ...}
+# 锁在 _run 里是**每条 git 命令取一次**, 所以在 `commit` 与 `head_sha()` 之间
+# 别的 amend 可以插进来把 HEAD 再改一次。于是 **本请求的响应里报出来的
+# new_sha / subject 是别人的提交**。2026-10-05 实测(6 线程 3 stage + 3 amend,
+# x8 轮, 夹具 fx_history, 共 24 条 amend): **16/24 = 66.7% 的响应 subject 不是
+# 自己提交的那条 message**(例: 线程 5 发 AM-t05-r00, 返回提交的 subject 是
+# AM-t04-r00)。同一跑里 amend 返回码全 200、git fsck rc=0、提交信息没有被拼接
+# —— 所以这是**归属/上报错**, 不是仓体损坏。
+#
+# ⚠⚠ **只断言这一条, 不断言「tree 守恒」** —— 这是刻意的, 不是漏写:
+#   同一跑里量到 tree(new_sha) != tree(old_sha) 有 **9/24 = 37.5%**, 差异确实是
+#   别的线程 stage 的文件。但 `do_amend` 的 docstring **明写**「刻意不传 -a:
+#   amend 的语义是『用当前 index 重写上次提交』」—— 所以「提交了当前 index 里的
+#   内容」是**文档写明的语义, 不是缺陷**。断言 tree 守恒 = 断言产品从未承诺过的
+#   契约 = **假判据**, 那正是「改判据 = 掩盖」的另一种形态。
+#   tree 那个数在 C4 的输出里以 `amend_tree_changed` **照记**, 但**不进判据**;
+#   真要把它变成红, 得先改产品(让请求整段持锁), 不是改判据。
+
+def amend_subject_violations(recs):
+    """响应里的 subject 不是我发的那条 message -> 违例。
+
+    返回 None 表示**测不到**(输入为空), 不表示「通过」。
+    """
+    if not recs:
+        return None
+    bad = []
+    for e in recs:
+        if e["code"] != 200 or not (e["body"] or {}).get("ok"):
+            continue                      # 请求失败的算另一条判据的事
+        got = (e["body"] or {}).get("subject")
+        if got != e["msg"]:
+            bad.append({"t": e["t"], "r": e["r"], "want": e["msg"], "got": got,
+                        "new": (e["body"] or {}).get("new_sha", "")[:12]})
+    return bad
+
+
+def amend_tree_changed(sb, recs):
+    """tree(new_sha) != tree(old_sha) 的条数 —— **只测量, 不判据**。
+
+    见上面那段注释为什么不能拿它当判据。返回 (条数, 分母)。
+    分母为 0 时返回 (0, 0) —— 调用方**必须**自己判分母, 别拿 0/0 当 0%。
+    """
+    n = den = 0
+    for e in recs:
+        if e["code"] != 200 or not (e["body"] or {}).get("ok"):
+            continue
+        b = e["body"]
+        old, new = b.get("old_sha"), b.get("new_sha")
+        if not old or not new:
+            continue
+        den += 1
+        t1 = sb.git("rev-parse", old + "^{tree}").stdout.strip()
+        t2 = sb.git("rev-parse", new + "^{tree}").stdout.strip()
+        if t1 != t2:
+            n += 1
+    return n, den
+
+
+# ═══════════════════════════════════════════ HEAD 归属: undo / revert / reflog
+#
+# 与 amend_subject_violations 同一类缺陷(响应报的 HEAD 是别人的)。判据按「能不能
+# 被独立证伪」分档, **每一条都写了它成立的理由, 以及被实测推翻过的候选**。
+#
+# ✅ 站得住的判据(现在就在断言):
+#   · reflog 恢复 —— **绝对**「head_now 必须 == restored.sha」。reset 的目标是从
+#     reflog 某一行读出来的 sha, 那行写下之后不再变(每次 HEAD 移动只是**追加**
+#     一条), 所以不管 plan 之后别人把 HEAD 挪到哪, 我的落点恒为它。
+#   · revert     —— **绝对必要条件**「new_head 必须是一个 revert 提交」
+#     (subject 以 `Revert "` 开头)。git 自己写的提交信息长这样; new_head 一旦被
+#     别人的提交顶替, subject 就是 `amend T3 r5` 这类东西。不依赖任何时序假设。
+#   · undo       —— **绝对**「head_now 必须是一个可解析的提交」(弱, 但成立);
+#     「互不相同」那条挪到 C4C 的 undo-only 负载里去判(见 C4C 的注释)。
+#
+# ✗ 被自己的阴性对照**证伪**的两条关系判据 —— 记下来, 免得下一个人再写一遍:
+#   第一版 C4B 对 undo 和 revert 都写了「两次成功响应不得报同一个 sha」。假的, 两条
+#   独立实验把它推翻(台账 §22.11 记了命令与数字):
+#   A. **单线程串行**(零并发, 任何时刻只有一个请求 -> 缝根本踩不到): 跑同一套
+#      undo+revert+reflog, undo 的 head_now 在 12 次响应里只有 **1 个**不同值,
+#      朴素撞车 **11 条**。原因: HEAD 在混编负载下**不是单调**的 ——
+#      reflog 恢复到 index 0 把 HEAD 放回 undo 刚访问过的提交, 下一个 undo 再退
+#      一格就合法地落回同一个提交。
+#   B. **同一 HEAD、同一秒**内 revert 同一条提交两次 => 两个 new_head 是**同一个
+#      sha**。git 的提交是「内容+元数据」寻址的: parent / tree / message /
+      #      author / committer 秒级时间戳全同, 就是同一个对象。
+#   ⇒ 关系判据只有在**该操作独占 HEAD 轨迹**的负载里才成立, 所以 undo 的那条搬去
+#     C4C(undo-only, HEAD 严格单调), 混编负载里只报不判。
+#
+# ⚠ 另外两个试过、同样不成立的口径:
+#   1. `head_now == parent(undone)` —— undone 是 `plan_undo_last_commit`
+#      **在锁外**读的(plan 与 reset 之间隔着两次取锁), 那期间 HEAD 可能已被别人
+#      改过, 于是**正确实现**下这个等式也会不成立。拿它当判据就是断言产品从没
+#      承诺过的契约 —— 假判据。
+#   2. `head_now` 必须是「请求前 HEAD」的祖先 —— 那个请求前 HEAD 是**测试侧**读的,
+#      夹在它和我的请求之间别的线程连着动两次 HEAD, 我的 undo 就会合法地落到那个
+#      HEAD 的**严格后代**上 -> 假阳性。
+def _ok_recs(recs):
+    return [e for e in recs if e["code"] == 200 and (e["body"] or {}).get("ok")]
+
+
+def fail_reasons(recs, limit=6):
+    """失败的响应按 (HTTP 码, 错误码) 归类 —— **分母为什么这么小**要能看见。
+
+    没有这个, 判据分母一旦塌掉(比如 revert_ok 从 16 掉到 4)就只能猜: 是产品
+    的问题还是夹具的问题。这两种必须分得开。
+    """
+    from collections import Counter
+    c = Counter()
+    for e in recs:
+        b = e["body"] or {}
+        if e["code"] == 200 and b.get("ok"):
+            c["ok"] += 1
+            continue
+        code = b.get("code") or b.get("error") or "(无 code)"
+        msg = str(b.get("message") or b.get("error") or "").splitlines()
+        head = msg[0][:70] if msg else ""
+        c["HTTP %s / %s / %s" % (e["code"], code, head)] += 1
+    return c.most_common(limit)
+
+
+def undo_mono_violations(recs):
+    """undo-**only** 负载下: 两次成功响应不得报同一个 head_now —— **硬判据**。
+
+    成立的前提由调用方保证、并在用例里断言: 本负载**只有 undo 会动 HEAD**,
+    于是每次成功都把 HEAD 严格往父提交退一格, 所有 head_now 必然互不相同。
+    混编负载里这条是**假判据**(已被单线程阴性对照证伪, 见 undo_head_report),
+    所以它只在本用例这种「独占 HEAD 轨迹」的形状下才成立。
+
+    返回 None 表示**测不到**(没有一条成功响应), 不表示「通过」。
+    """
+    ok = _ok_recs(recs)
+    if not ok:
+        return None
+    seen, bad = {}, []
+    for e in ok:
+        h = (e["body"] or {}).get("head_now")
+        if not h:
+            bad.append({"t": e["t"], "r": e["r"], "why": "响应里没有 head_now",
+                        "body_keys": sorted((e["body"] or {}).keys())})
+            continue
+        if h in seen:
+            bad.append({"t": e["t"], "r": e["r"], "other": list(seen[h]),
+                        "why": "与另一条成功响应报了同一个 head_now",
+                        "head_now": h[:12]})
+        else:
+            seen[h] = (e["t"], e["r"])
+    return bad
+
+
+def undo_head_report(sb, recs):
+    """undo 响应的 HEAD —— 混编负载里**只报不判**。返回 None 表示**测不到**。
+
+    返回 {"bad": [...], "collisions": n, "distinct": k, "den": n}:
+      · `bad`         —— 真违例, 只收「响应缺 head_now」与「head_now 解析不出提交」。
+                        这两条是绝对的: do_undo_last_commit 报的是 `self.head_sha()`,
+                        锁内取的, 必然是一个真提交。
+      · `collisions`  —— 「两条成功响应报了同一个 head_now」的条数。**混编负载里
+                        不断言**, 因为它已被实测证伪(见上面那段注释的实验 A/B),
+                        理由是 HEAD 在混编下非单调。undo-only 负载里它才是硬判据,
+                        由 C4C 去断言。
+
+    ⚠ 「只报不判」不是放过 —— 判据被证伪这件事本身是结论, 数字照样进台账,
+      而且 undo 的归属另有两道防线: C4C 的 undo-only 硬判据, 以及静态的
+      t112_seam_survey.py AST 普查(它对 do_undo_last_commit 是绿的)。
+    """
+    ok = _ok_recs(recs)
+    if not ok:
+        return None
+    heads, bad = [], []
+    for e in ok:
+        b = e["body"] or {}
+        h = b.get("head_now")
+        if not h:
+            bad.append({"t": e["t"], "r": e["r"], "why": "响应里没有 head_now",
+                        "body_keys": sorted(b.keys())})
+            continue
+        heads.append(h)
+        p = sb.git("cat-file", "-t", h)
+        if p.returncode != 0 or (p.stdout or "").strip() != "commit":
+            bad.append({"t": e["t"], "r": e["r"], "why": "head_now 不是一个提交对象",
+                        "head_now": h[:12],
+                        "git": (p.stderr or p.stdout or "").strip()[:70]})
+    return {"bad": bad, "collisions": len(heads) - len(set(heads)),
+            "distinct": len(set(heads)), "den": len(heads)}
+
+
+def revert_head_violations(sb, recs):
+    """revert 响应报的 new_head 必须是一个 **revert 提交**(绝对必要条件)。
+
+    为什么这条是硬的: `git revert` 的提交信息由 git 自己写, 形如
+    `Revert "<原 subject>"`。new_head 一旦被别人的提交顶替, 它的 subject 就是
+    `amend T3 r5` 这类东西 —— 不依赖任何时序假设。
+
+    ⚠ 第一版这里还带了「两次成功响应不得报同一个 new_head」, **已删**, 因为实测
+      证伪: 从**同一个 HEAD**、**同一秒**内 revert 同一条提交两次, 两个 new_head
+      是同一个 sha(提交是内容+元数据寻址的)。删掉的是一条假判据, 不是放过真缺陷。
+    返回 None 表示**测不到**(没有一条成功响应), 不表示「通过」。
+    """
+    ok = _ok_recs(recs)
+    if not ok:
+        return None
+    bad = []
+    for e in ok:
+        b = e["body"] or {}
+        h = b.get("new_head")
+        if not h:
+            bad.append({"t": e["t"], "r": e["r"], "why": "响应里没有 new_head",
+                        "body_keys": sorted(b.keys())})
+            continue
+        p = sb.git("show", "-s", "--format=%s", h)
+        subj = (p.stdout or "").strip()
+        if p.returncode != 0:
+            bad.append({"t": e["t"], "r": e["r"], "why": "new_head 解析不出提交",
+                        "new_head": h[:12],
+                        "git": (p.stderr or p.stdout or "").strip()[:70]})
+        elif not subj.startswith('Revert "'):
+            bad.append({"t": e["t"], "r": e["r"], "why": "new_head 不是 revert 提交",
+                        "new_head": h[:12], "subject": subj[:60]})
+    return bad
+
+
+def reflog_restore_head_violations(recs):
+    """reflog 恢复的响应: head_now 必须**等于** restored.sha(绝对判据)。
+
+    为什么这条是硬的: reset 的目标是 `plan_restore_from_reflog` 从 reflog **某一行**
+    读出来的 sha。那一行写下之后就不再变 —— 每次 HEAD 移动只是往 reflog **追加**
+    一条, 已有行的 sha 是历史事实。所以 plan 之后不管别的请求把 HEAD 挪到哪,
+    我的 reset 落点恒为 restored.sha, head_now 必须等于它。
+    """
+    ok = _ok_recs(recs)
+    if not ok:
+        return None
+    bad = []
+    for e in ok:
+        b = e["body"] or {}
+        want = (b.get("restored") or {}).get("sha")
+        got = b.get("head_now")
+        if not want or not got:
+            bad.append({"t": e["t"], "r": e["r"], "why": "响应缺 restored.sha 或 head_now",
+                        "body_keys": sorted(b.keys())})
+        elif want != got:
+            bad.append({"t": e["t"], "r": e["r"], "why": "head_now 不是 restored.sha",
+                        "want": want[:12], "got": got[:12], "mode": b.get("mode"),
+                        "restored_short": (b.get("restored") or {}).get("short")})
+    return bad
+
+
 @test("C4", "history-vs-stage", "history_ops 危险操作(amend/undo/revert)与 stage 并发")
 def t_c4_history_vs_stage():
     THR, RND = 6, 9
@@ -1497,12 +1797,19 @@ def t_c4_history_vs_stage():
         pr.install_lock(srv.mod.history_ops(), "_lock", "history")
         pr.install_request(S.Handler, "do_POST", _path_label)
         pr.install_request(S.Handler, "do_GET", _path_label)
+        amend_recs = []          # (t, r, 我发的 message, code, body) —— 归属判据要用
+        rec_lock = threading.Lock()
         try:
             def body(t, r):
                 k = t % 4
                 if k == 0:
-                    return srv.post("/api/history/amend",
-                                    {"message": "amend T%d r%d" % (t, r), "confirmed": True})
+                    msg = "amend T%d r%d" % (t, r)
+                    code, b = srv.post("/api/history/amend",
+                                       {"message": msg, "confirmed": True})
+                    with rec_lock:
+                        amend_recs.append({"t": t, "r": r, "msg": msg,
+                                           "code": code, "body": b})
+                    return code, b
                 if k == 1:
                     return srv.post("/api/history/undo-last-commit",
                                     {"drop_changes": False, "confirmed": True})
@@ -1540,6 +1847,448 @@ def t_c4_history_vs_stage():
        "两把锁各自都有效(同域重叠 repo=%d / history=%d), 但它们**不是同一把** —— "
        "于是 history_ops 的 git commit --amend 与 server 的 git add 能同时跑。"
        % (cross, per["repo"], per["history"]))
+
+    # ═══════════ 请求级原子性(2026-10-05 新增, 从 C7 移交过来) ═══════════
+    #
+    # 阳性对照先做: 检查器必须能把「故意不符」的一对判成违例, 必须把相符的判成
+    # 干净, 且**空输入必须判 None(测不到)而不是 0(通过)**。不先证明尺子会响,
+    # 下面那个 0/0 或者 0/N 就什么都不能说明。
+    _bad = amend_subject_violations(
+        [{"t": 0, "r": 0, "msg": "MINE", "code": 200,
+          "body": {"ok": True, "subject": "SOMEONE-ELSE"}}])
+    _okp = amend_subject_violations(
+        [{"t": 0, "r": 0, "msg": "MINE", "code": 200,
+          "body": {"ok": True, "subject": "MINE"}}])
+    _empty = amend_subject_violations([])
+    ck(_bad and not _okp,
+       "自检失败: 归属检查器坏了 —— 该抓的没抓(%r) 或 不该抓的抓了(%r)"
+       % (_bad, _okp))
+    ck(_empty is None,
+       "自检失败: 空输入被当成「通过」(%r) —— 空集必须判 None(测不到)" % (_empty,))
+
+    # 分母: 归属判据必须有**两条**非空自检, 否则下面的数是 0/0。
+    _ok_amends = [e for e in amend_recs
+                  if e["code"] == 200 and (e["body"] or {}).get("ok")]
+    ck(len(amend_recs) > 0,
+       "自检失败: 一条 amend 响应都没收到(负载有问题, 不是产品有问题)")
+    ck(len(_ok_amends) > 0,
+       "自检失败: %d 条 amend 响应里 0 条 ok=true —— 分母为 0, 这条判据测不到任何东西"
+       % len(amend_recs))
+    ck(all(e["msg"] for e in amend_recs),
+       "自检失败: 有 amend 记录的 msg 是空串 —— 归属比对会恒成立, 白判")
+
+    sub_bad = amend_subject_violations(_ok_amends)
+    # tree 那个数: **只测量, 不判据**(理由见本文件 amend_subject_violations
+    # 上方那段注释)。分母同样要写清, 不许出现没有分母的百分数。
+    tree_n, tree_den = amend_tree_changed(sb, _ok_amends)
+    RESULTS.append({"test": "C4-amend-ownership", "ops": len(_ok_amends),
+                    "detail": {"amend_requests": len(amend_recs),
+                               "amend_ok": len(_ok_amends),
+                               "subject_mismatch": len(sub_bad),
+                               "samples": sub_bad[:6],
+                               "tree_changed_measured_only": tree_n,
+                               "tree_changed_denominator": tree_den}})
+    say("  C4 amend 归属: 响应 subject 不符 %d/%d (%.1f%%) | "
+        "tree 变了 %d/%d (仅测量, 不判据)"
+        % (len(sub_bad), len(_ok_amends),
+           100.0 * len(sub_bad) / len(_ok_amends), tree_n, tree_den))
+
+    ck(not sub_bad,
+       "【响应归属错】%d/%d 条 ok 的 amend 响应, 它报的 subject 不是**本请求**"
+       "提交的 message。根因: do_amend 在 `git commit --amend` **之后**才读 "
+       "head_sha(), 而锁是每条 git 命令取一次(history_ops._run / server._run_full), "
+       "两者之间别的 amend 能插队把 HEAD 再改一次, 于是本请求报出去的是别人的提交。"
+       "样例(线程/轮次, 我发的, 实得): %r"
+       % (len(sub_bad), len(_ok_amends),
+          [(x["t"], x["r"], x["want"], x["got"]) for x in sub_bad[:5]]))
+
+    if cls["git_lock"] or cls["http5xx"]:
+        raise Flaky("git 锁 %d/%d, 5xx %d/%d"
+                    % (len(cls["git_lock"]), len(ops),
+                       len(cls["http5xx"]), len(ops)))
+    return None
+
+
+# ════════════════════════════════════════════════════════ C4B
+#
+# undo / revert / reflog 恢复三条响应的 HEAD 归属 —— 与 C4 的 amend 归属
+# **同一类缺陷**(响应报的 HEAD 是别人的), 但这三处 C4 一条判据都没有。
+#
+# 为什么单独一个用例而不在 C4 里加: C4 的负载是 `t % 4` 四分(amend/undo/
+# revert/stage), 加第五种操作就得改这个分派, 而 `10/18 -> 0/18` 那个已记录的
+# 数是**在 t%4 那套负载下量出来的** —— 改了负载, 台账里那条就不可复现了。
+# 这里是 `t % 3` 三分, 各自的分母独立报。
+#
+# 负载只用这三种 history 操作, 互不加 stage: 它们取的是**同一把**锁, 所以
+# 「reset 刚放锁 -> head_sha 还没取锁」这个窗口最紧, 命中率最高, 而分母不会被
+# stage 的失败(win32 共享冲突之类)搅浑。
+
+@test("C4B", "history-attribution",
+      "undo / revert / reflog 恢复三条响应的 HEAD 归属(与 C4 的 amend 归属同类)")
+def t_c4b_history_attribution():
+    # ── 尺子先证明自己会响 ──────────────────────────────────────────
+    # 用一个**独立的一次性仓**做, 不碰主夹具 —— 这样阳性对照的成败与负载跑出
+    # 什么数据无关(若拿主夹具的数据做对照, 修好之后就没有「脏」样本可喂了)。
+    rb = Sandbox("c4b-ruler")
+    rb.write("a.txt", "a\n")
+    rb.commit("c1: base")
+    r_base = rb.out("rev-list", "--max-count=1", "HEAD").strip()
+    # 必须先动一下文件: Sandbox.commit 是 `add -A` + `commit -m`, **不带
+    # --allow-empty**, 树没变时 git 直接拒绝空提交, 两次 rev-parse 会拿到同一个 sha。
+    rb.write("a.txt", "b\n")
+    rb.commit('Revert "selfcheck"')
+    r_rev = rb.out("rev-list", "--max-count=1", "HEAD").strip()
+    ck(r_base and r_rev and r_base != r_rev,
+       "尺子仓自检失败: base=%s rev=%s" % (r_base[:12], r_rev[:12]))
+
+    def _rec(t, r, **body):
+        return {"t": t, "r": r, "code": 200, "body": body}
+
+    # undo: 只剩「缺字段」和「不是提交对象」两条绝对判据。撞车那条**故意**喂一个
+    # 会撞的样本, 并断言它落在 `collisions` 计数里而 `bad` 为空 —— 这样「混编负载里
+    # 不断言撞车」是**被检查的行为**, 不是悄悄放过的。
+    _u_dup = undo_head_report(rb, [_rec(0, 0, ok=True, head_now=r_base),
+                                  _rec(1, 0, ok=True, head_now=r_base)])
+    _u_ok = undo_head_report(rb, [_rec(0, 0, ok=True, head_now=r_base),
+                                  _rec(1, 0, ok=True, head_now=r_rev)])
+    _u_empty = undo_head_report(rb, [])
+    _u_miss = undo_head_report(rb, [_rec(0, 0, ok=True)])
+    _u_junk = undo_head_report(rb, [_rec(0, 0, ok=True, head_now="de" + "ad" * 19)])
+    ck(_u_dup and not _u_dup["bad"] and _u_dup["collisions"] == 1
+       and _u_dup["den"] == 2,
+       "自检失败: undo 撞车样本必须**只**进 collisions, 不得进 bad —— 得 %r" % (_u_dup,))
+    ck(_u_ok and not _u_ok["bad"] and _u_ok["collisions"] == 0,
+       "自检失败: undo 不撞车样本应全清 —— 得 %r" % (_u_ok,))
+    ck(_u_junk and _u_junk["bad"], "自检失败: head_now 解析不出提交要抓到")
+    ck(_u_miss and _u_miss["bad"], "自检失败: 缺 head_now 要抓到")
+    ck(_u_empty is None,
+       "自检失败: undo 检查器把空输入判成「通过」(%r) —— 空集必须判 None(测不到)"
+       % (_u_empty,))
+
+    # revert: 非 revert 提交要抓到 / 解析不出要抓到 / 合法形态要放过 / 空判 None
+    _r_wrong = revert_head_violations(rb, [_rec(0, 0, ok=True, new_head=r_base)])
+    _r_junk = revert_head_violations(rb, [_rec(0, 0, ok=True, new_head="de" + "ad" * 19)])
+    _r_ok = revert_head_violations(rb, [_rec(0, 0, ok=True, new_head=r_rev)])
+    _r_empty = revert_head_violations(rb, [])
+    ck(_r_wrong and _r_junk and not _r_ok,
+       "自检失败: revert 检查器坏了 —— 非revert没抓=%r / 解析不出没抓=%r / 合法误抓=%r"
+       % (_r_wrong, _r_junk, _r_ok))
+    ck(_r_empty is None,
+       "自检失败: revert 检查器把空输入判成「通过」(%r)" % (_r_empty,))
+    say("  C4B 阳性对照: undo 缺字段/非提交/撞车只计数/空=%s/%s/%s/%s | "
+        "revert 非revert/解析不出/合法/空=%s/%s/%s/%s"
+        % (bool(_u_miss), bool(_u_junk), _u_dup["collisions"] == 1, _u_empty is None,
+           bool(_r_wrong), bool(_r_junk), not _r_ok, _r_empty is None))
+
+    # reflog 恢复: 不等要抓到 / 相等要放过 / 空判 None
+    _f_bad = reflog_restore_head_violations(
+        [_rec(0, 0, ok=True, mode="soft", head_now="b" * 40,
+              restored={"sha": "a" * 40, "short": "aaaaaaaa"})])
+    _f_ok = reflog_restore_head_violations(
+        [_rec(0, 0, ok=True, mode="soft", head_now="a" * 40,
+              restored={"sha": "a" * 40, "short": "aaaaaaaa"})])
+    _f_empty = reflog_restore_head_violations([])
+    ck(_f_bad and not _f_ok,
+       "自检失败: reflog 检查器坏了 —— 不等没抓=%r / 相等误抓=%r" % (_f_bad, _f_ok))
+    ck(_f_empty is None,
+       "自检失败: reflog 检查器把空输入判成「通过」(%r)" % (_f_empty,))
+
+    # ── 负载 ──────────────────────────────────────────────────────
+    THR, RND = 6, 8
+    sb = fx_history_deep(Sandbox("c4b"))
+    n_commit = sb.out("rev-list", "--count", "HEAD").strip()
+    ck(n_commit == str(FX_DEEP_N),
+       "夹具自检: 提交数 %s(应 %d)" % (n_commit, FX_DEEP_N))
+    # revert 目标 = `c3`(动的是**专属**文件 r/r03.txt, 后面没人再改它)。
+    # ⚠ 位置必须按**提交数**算: `rev-list` 是最新在前, `--skip=2` 取到的是第 3 个
+    #   **最新**的提交(c22, 属深度段), 不是第 3 旧的(c3, 属 fodder 段)。我第一版
+    #   就是这么写错的 —— 后果很安静: c22 动的是 w/f06, 而 c14 也动 w/f06,
+    #   HEAD 被 undo 退到 c14 之下时逆补丁贴不上 -> 冲突 -> revert_ok 塌到 2/16。
+    #   所以这里不只断言「取到了提交」, 还断言 **subject 正是我要的那一条**。
+    revert_target = sb.out("rev-list", "--max-count=1",
+                           "--skip=%d" % (FX_DEEP_N - 3), "HEAD").strip()
+    tgt_subject = sb.out("show", "-s", "--format=%s", revert_target).strip()
+    ck(tgt_subject == "c3: revert fodder 3",
+       "夹具自检: revert 目标取错了提交 —— 要 'c3: revert fodder 3', 实得 %r"
+       % tgt_subject[:60])
+
+    recs = {"undo": [], "revert": [], "reflog": []}
+    rec_lock = threading.Lock()
+
+    with Server(sb, "c4b") as srv:
+        pr = Probe()
+        import server as S, history_ops as H
+        pr.install_label(S.Repo, "_run_full")
+        pr.install_label(H.HistoryOps, "_run")
+        pr.install_lock(srv.mod.REPO, "_lock", "repo")
+        pr.install_lock(srv.mod.history_ops(), "_lock", "history")
+        pr.install_request(S.Handler, "do_POST", _path_label)
+        pr.install_request(S.Handler, "do_GET", _path_label)
+
+        def keep(kind, t, r, code, b):
+            with rec_lock:
+                recs[kind].append({"t": t, "r": r, "code": code, "body": b})
+
+        try:
+            def body(t, r):
+                k = t % 3
+                if k == 0:
+                    # drop_changes=True -> `reset --hard HEAD~1`: 硬复位把工作区收干净,
+                    # 否则软复位留下的 staged 改动会让后面的 `git revert` 拒绝执行
+                    # (「local changes would be overwritten」), 分母就被自己的夹具掐死。
+                    code, b = srv.post("/api/history/undo-last-commit",
+                                       {"drop_changes": True, "confirmed": True})
+                    keep("undo", t, r, code, b)
+                    return code, b
+                if k == 1:
+                    code, b = srv.post("/api/history/revert",
+                                       {"sha": revert_target, "no_edit": True})
+                    keep("revert", t, r, code, b)
+                    return code, b
+                # index 0 = reflog 最新一行 = 此刻的 HEAD, 于是 reset 落点恒为它,
+                # head_now 必须等于 restored.sha —— 绝对判据成立的前提。
+                # mode=hard: 软复位只挪 HEAD 不动索引, 于是并发 undo 之后索引与
+                # HEAD 不一致, 后续 `git revert` 会以「local changes would be
+                # overwritten」拒绝执行 —— 分母被自己的复位方式掐死。硬复位把
+                # 索引收干净。仓里没有未提交内容, 丢不掉东西。
+                code, b = srv.post("/api/history/reflog/restore",
+                                   {"index": 0, "mode": "hard", "confirmed": True})
+                keep("reflog", t, r, code, b)
+                return code, b
+
+            ops, el, slow = run_ops(THR, RND, body, "history")
+        finally:
+            pr.remove()
+        cls = report("C4B", ops, extra={"elapsed_s": round(el, 1),
+                                         "git_calls": pr.n(),
+                                         "revert_target": revert_target[:12]})
+
+    fs = fsck_errors(sb)
+    ck(fs is None, "git fsck 报对象库不一致: %s" % fs)
+    ck(not cls["client_exc"], "客户端侧异常: %r" % cls["client_exc"][:2])
+    ck(not cls["traceback"], "响应里带 traceback: %r" % cls["traceback"][:3])
+    ck(not cls["http5xx"], "有 %d/%d 次 5xx, 例 %r"
+       % (len(cls["http5xx"]), len(ops), cls["http5xx"][:3]))
+    ck(not cls["git_lock"],
+       "【锁域不一致】%d/%d 次请求的失败原因是 git 锁文件被占, 例 %r"
+       % (len(cls["git_lock"]), len(ops), [x[2] for x in cls["git_lock"][:3]]))
+
+    # ── 分母必须非空, 否则下面每一个数都是 0/0 ──────────────────────
+    for kind in ("undo", "revert", "reflog"):
+        ck(len(recs[kind]) > 0,
+           "自检失败: %s 一条响应都没收到(负载有问题, 不是产品有问题)" % kind)
+        ck(len(_ok_recs(recs[kind])) > 0,
+           "自检失败: %d 条 %s 响应里 0 条 ok=true —— 分母为 0, 判据测不到任何东西"
+           % (len(recs[kind]), kind))
+
+    u_rep = undo_head_report(sb, recs["undo"])
+    r_bad = revert_head_violations(sb, recs["revert"])
+    f_bad = reflog_restore_head_violations(recs["reflog"])
+    RESULTS.append({"test": "C4B-attribution",
+                    "detail": {"undo_requests": len(recs["undo"]),
+                               "undo_ok": len(_ok_recs(recs["undo"])),
+                               "undo_bad": len(u_rep["bad"]),
+                               "undo_collisions_measured": u_rep["collisions"],
+                               "undo_distinct": u_rep["distinct"],
+                               "undo_samples": u_rep["bad"][:6],
+                               "revert_requests": len(recs["revert"]),
+                               "revert_ok": len(_ok_recs(recs["revert"])),
+                               "revert_violations": len(r_bad),
+                               "revert_samples": r_bad[:6],
+                               "reflog_requests": len(recs["reflog"]),
+                               "reflog_ok": len(_ok_recs(recs["reflog"])),
+                               "reflog_violations": len(f_bad),
+                               "reflog_samples": f_bad[:6]}})
+    say("  C4B HEAD 归属(判据): revert 越界 %d/%d | reflog 不等 %d/%d | "
+        "undo 坏值 %d/%d" % (len(r_bad), len(_ok_recs(recs["revert"])),
+                            len(f_bad), len(_ok_recs(recs["reflog"])),
+                            len(u_rep["bad"]), u_rep["den"]))
+    say("  C4B undo 撞车 %d/%d (distinct %d) —— **只测量不断言**, 该口径已被"
+        "单线程阴性对照证伪(见 undo_head_report 的注释)"
+        % (u_rep["collisions"], u_rep["den"], u_rep["distinct"]))
+    # 违例**为什么**是违例必须打出来。只打计数的话, 剩下几条违例时只能猜:
+    # 是没修干净, 还是**判据本身站不住** —— 这两者的处置完全相反(前者继续修,
+    # 后者要改判据并说明为什么原判据不成立)。改判据 = 掩盖, 所以先拿事实。
+    from collections import Counter as _Ct
+    for _tag, _bad in (("undo", u_rep["bad"]), ("revert", r_bad), ("reflog", f_bad)):
+        if _bad:
+            say("  C4B %-7s 违例构成: %s" % (_tag, dict(_Ct(x["why"] for x in _bad))))
+            for _x in _bad[:5]:
+                say("           %r" % (_x,))
+    for kind in ("undo", "revert", "reflog"):
+        rs = fail_reasons(recs[kind])
+        say("  C4B %-7s 响应构成(成功 %d / 共 %d): %s"
+            % (kind, len(_ok_recs(recs[kind])), len(recs[kind]),
+               " | ".join("%s x%d" % (k, v) for k, v in rs)))
+
+    ck(not u_rep["bad"],
+       "【undo 响应坏值】%d/%d 条成功的 undo 响应, head_now 缺失或不是一个提交对象。"
+       "do_undo_last_commit 报的是**锁内**取的 self.head_sha(), 必然是真提交。"
+       "样例: %r" % (len(u_rep["bad"]), u_rep["den"], u_rep["bad"][:5]))
+
+    ck(not r_bad,
+       "【revert 响应归属错】%d/%d 条成功的 revert 响应, new_head 不是一个 revert "
+       "提交。根因同 C4: do_revert 在 `git revert` **之后**才读 head_sha(), 中间别的 "
+       "revert / reset 能插队, 于是报出去的是别人的提交 —— 而 git 自己写的 revert "
+       "提交信息必以 `Revert \"` 开头, 顶包的提交藏不住。样例: %r"
+       % (len(r_bad), len(_ok_recs(recs["revert"])),
+          [(x["t"], x["r"], x["why"], x.get("subject", "")) for x in r_bad[:5]]))
+
+    ck(not f_bad,
+       "【reflog 恢复响应归属错】%d/%d 条成功的 reflog 恢复响应, head_now 不等于 "
+       "restored.sha。reset 的目标是从 reflog 某一行读出来的 sha, 那行写下后不再变, "
+       "所以 head_now 恒等于它。根因同 C4: do_restore_from_reflog 在 `git reset` "
+       "**之后**才读 head_sha()。样例(我发/实得/short): %r"
+       % (len(f_bad), len(_ok_recs(recs["reflog"])),
+          [(x["t"], x["r"], x.get("want", ""), x.get("got", ""),
+            x.get("restored_short", "")) for x in f_bad[:5]]))
+
+    if cls["git_lock"] or cls["http5xx"]:
+        raise Flaky("git 锁 %d/%d, 5xx %d/%d"
+                    % (len(cls["git_lock"]), len(ops),
+                       len(cls["http5xx"]), len(ops)))
+    return None
+
+
+# ════════════════════════════════════════════════════════ C4C
+#
+# undo 的响应归属 —— **undo-only** 负载。
+#
+# 为什么单独开一个用例: C4B 是 undo+revert+reflog 混编, 那条 HEAD 轨迹**不是单调**
+# 的(实测见 undo_head_report 的注释), 于是「两次成功响应不得报同一个 head_now」
+# 是假判据, 在混编里只能**只报不判**。本用例把负载收窄成**只有 undo 会动 HEAD**,
+# 于是每次成功都把 HEAD 严格往父提交退一格, 所有 head_now 必然互不相同 ——
+# 这时「互不相同」才是硬判据, 才真的能判 do_undo_last_commit 的归属。
+#
+# ⚠ 判据成立的前提是「只有 undo 动 HEAD」。这个前提**必须由用例自己断言**, 不能
+#   靠注释: 以后有人往本用例的负载里加一个 revert / reflog 恢复, 判据立刻变假而
+#   没人会知道。所以下面 `ck(OP_KINDS == ("undo",), ...)` 那条不许删。
+
+C4C_TH, C4C_RND, C4C_N = 6, 6, 44
+
+
+@test("C4C", "undo-attribution",
+      "undo-only 负载下 undo 响应的 head_now 归属(混编负载里这条判据是假的)")
+def t_c4c_undo_attribution():
+    # ── 尺子先证明自己会响 ──────────────────────────────────────────
+    rb = Sandbox("c4c-ruler")
+    rb.write("a.txt", "a\n")
+    rb.commit("c1: base")
+    r1 = rb.out("rev-list", "--max-count=1", "HEAD").strip()
+    rb.write("a.txt", "b\n")
+    rb.commit("c2: second")
+    r2 = rb.out("rev-list", "--max-count=1", "HEAD").strip()
+    ck(r1 and r2 and r1 != r2, "尺子仓自检失败")
+
+    def _rec(t, r, **body):
+        return {"t": t, "r": r, "code": 200, "body": body}
+
+    _dup = undo_mono_violations([_rec(0, 0, ok=True, head_now=r1),
+                                 _rec(1, 0, ok=True, head_now=r1)])
+    _ok = undo_mono_violations([_rec(0, 0, ok=True, head_now=r1),
+                                _rec(1, 0, ok=True, head_now=r2)])
+    _miss = undo_mono_violations([_rec(0, 0, ok=True)])
+    ck(_dup and _miss, "自检失败: undo-mono 检查器坏了 —— 撞车没抓=%r / 缺字段没抓=%r"
+       % (_dup, _miss))
+    ck(not _ok, "自检失败: 不撞车被误抓=%r" % (_ok,))
+    ck(undo_mono_violations([]) is None,
+       "自检失败: undo-mono 把空输入判成「通过」—— 空集必须判 None(测不到)")
+    say("  C4C 阳性对照: 撞车/合法/缺字段/空=%s/%s/%s/%s"
+        % (bool(_dup), not _ok, bool(_miss), undo_mono_violations([]) is None))
+
+    # ── 判据自身的阴性对照: 单线程 undo-only 必须**零撞车** ──────────
+    # 单线程下根本没有缝可踩(任何时刻只有一个请求), 所以这里若响, 就是判据在
+    # 这个负载形状下不成立, 而不是产品有缺陷。混编那条口径就是因为少了这一步,
+    # 才被当成判据写进 C4B —— 这一段不能省。
+    sb_s = fx_history_deep(Sandbox("c4c-serial"), n=C4C_N)
+    s_recs = []
+    s_lock = threading.Lock()
+    with Server(sb_s, "c4c-serial") as srv:
+        def s_body(t, r):
+            code, b = srv.post("/api/history/undo-last-commit",
+                               {"drop_changes": True, "confirmed": True})
+            with s_lock:
+                s_recs.append({"t": t, "r": r, "code": code, "body": b})
+            return code, b
+        s_ops, s_el, _ = run_ops(1, C4C_RND, s_body, "undo-serial",
+                                  barrier_each_round=False)
+    s_bad = undo_mono_violations(s_recs)
+    ck(s_bad is not None, "自检失败: 单线程对照分母为 0(%d 条响应)" % len(s_recs))
+    ck(not s_bad,
+       "【判据不成立】单线程 undo-only(%d 次成功响应, %.1fs) 里就撞车了 %d 条 —— "
+       "说明「互不相同」在 undo-only 形状下也不是硬判据, 本用例的判据必须重做。"
+       "样例: %r" % (len(_ok_recs(s_recs)), s_el, len(s_bad), s_bad[:5]))
+    say("  C4C 阴性对照(单线程 undo-only): 成功 %d 条, 撞车 %d 条 -> 判据成立"
+        % (len(_ok_recs(s_recs)), len(s_bad)))
+
+    # ── 负载 ──────────────────────────────────────────────────────
+    sb = fx_history_deep(Sandbox("c4c"), n=C4C_N)
+    n_commit = sb.out("rev-list", "--count", "HEAD").strip()
+    ck(n_commit == str(C4C_N), "夹具自检: 提交数 %s(应 %d)" % (n_commit, C4C_N))
+    ck(C4C_TH * C4C_RND < C4C_N,
+       "负载自检: %d 次 undo 需要超过 %d 层历史, 否则分母会被「HEAD~1 不存在」掐死"
+       % (C4C_TH * C4C_RND, C4C_N))
+
+    OP_KINDS = ("undo",)          # 判据成立的前提, 见上面那段注释
+    ck(OP_KINDS == ("undo",),
+       "本用例的判据要求「只有 undo 动 HEAD」, 而负载里出现了 %r —— "
+       "往里加 revert / reflog 恢复会让判据变假" % (OP_KINDS,))
+
+    recs = []
+    rec_lock = threading.Lock()
+    with Server(sb, "c4c") as srv:
+        pr = Probe()
+        import server as S, history_ops as H
+        pr.install_label(S.Repo, "_run_full")
+        pr.install_label(H.HistoryOps, "_run")
+        pr.install_lock(srv.mod.REPO, "_lock", "repo")
+        pr.install_lock(srv.mod.history_ops(), "_lock", "history")
+        pr.install_request(S.Handler, "do_POST", _path_label)
+        pr.install_request(S.Handler, "do_GET", _path_label)
+        try:
+            def body(t, r):
+                code, b = srv.post("/api/history/undo-last-commit",
+                                   {"drop_changes": True, "confirmed": True})
+                with rec_lock:
+                    recs.append({"t": t, "r": r, "code": code, "body": b})
+                return code, b
+            ops, el, slow = run_ops(C4C_TH, C4C_RND, body, "undo")
+        finally:
+            pr.remove()
+        cls = report("C4C", ops, extra={"elapsed_s": round(el, 1),
+                                         "git_calls": pr.n()})
+
+    fs = fsck_errors(sb)
+    ck(fs is None, "git fsck 报对象库不一致: %s" % fs)
+    ck(not cls["client_exc"], "客户端侧异常: %r" % cls["client_exc"][:2])
+    ck(not cls["traceback"], "响应里带 traceback: %r" % cls["traceback"][:3])
+    ck(not cls["http5xx"], "有 %d/%d 次 5xx, 例 %r"
+       % (len(cls["http5xx"]), len(ops), cls["http5xx"][:3]))
+    ck(not cls["git_lock"],
+       "【锁域不一致】%d/%d 次请求的失败原因是 git 锁文件被占, 例 %r"
+       % (len(cls["git_lock"]), len(ops), [x[2] for x in cls["git_lock"][:3]]))
+
+    bad = undo_mono_violations(recs)
+    RESULTS.append({"test": "C4C-attribution",
+                    "detail": {"requests": len(recs),
+                               "ok": len(_ok_recs(recs)),
+                               "violations": len(bad),
+                               "samples": bad[:6]}})
+    say("  C4C undo 归属: 撞车 %d/%d | 响应构成: %s"
+        % (len(bad), len(_ok_recs(recs)),
+           " | ".join("%s x%d" % (k, v) for k, v in fail_reasons(recs))))
+    ck(bad is not None and len(_ok_recs(recs)) >= C4C_TH * C4C_RND // 2,
+       "自检失败: %d 条成功响应 / %d 条请求 —— 分母太小, 判据说明不了问题"
+       % (len(_ok_recs(recs)), len(recs)))
+    ck(not bad,
+       "【undo 响应归属错】%d/%d 条成功的 undo 响应报了**同一个** head_now —— 本用例"
+       "里只有 undo 会动 HEAD, 每次成功都严格退一格, 落点必然互不相同。根因: "
+       "do_undo_last_commit 在 `git reset --hard HEAD~1` **之后**才读 head_sha(), "
+       "而锁是每条 git 命令各取一次(history_ops._run), 中间别的 undo 能插队再退一格, "
+       "于是本请求报出去的是**别人的**落点。样例(线程/轮次): %r"
+       % (len(bad), len(_ok_recs(recs)),
+          [(x["t"], x["r"], x.get("head_now", "")) for x in bad[:5]]))
+
     if cls["git_lock"] or cls["http5xx"]:
         raise Flaky("git 锁 %d/%d, 5xx %d/%d"
                     % (len(cls["git_lock"]), len(ops),
@@ -1570,13 +2319,14 @@ def t_c4_history_vs_stage():
 
 # ════════════════════════════════════════════════════════ C7
 #
-# 三条通路的锁状况, 用**测量**说清, 不靠运气:
-#   * repo 域     —— server.Repo._run_full, 锁 = Repo._lock(每实例 RLock)
-#   * history 域  —— history_ops.HistoryOps._run, 锁 = HistoryOps._lock(每实例 Lock)
-#   * conflicts 域—— conflicts.Git.run, 锁 = repo_git_lock(root)(按 realpath **共享** RLock)
-#   三把都**有锁**, 但**不是同一把** —— 这才是本条判的东西。
-# 判据: 同一域内不允许有重叠(产品原样应当是 0); 不同域之间同时跑 git
-#       **不允许** —— 重叠数就是「锁不是同一把」的直接证据, 非 0 即红。
+# ⚠ 这一段原本是 C7 的「三条通路的锁状况」说明, 但它是**过时的副本**:
+#   它写着三把锁「不是同一把 —— 这才是本条判的东西」, 还说 Repo._lock 是
+#   「每实例 RLock」、HistoryOps._lock 是「每实例 Lock」。这三句都已被实测推翻
+#   (三把是**同一把**, 且是**按 root 共享**、不是每实例一把)。
+#   权威版本在本文件 C7 段的头注释(搜 `@test("C7"` 上方那一整块), 那里逐行给出了
+#   conflicts.py:229 / server.py:484 / history_ops.py:158 三处接线与实测 id。
+#   2026-10-05 把这份副本删掉, 只留指针 —— 两份说明各说各话, 下一个人读哪份
+#   全看运气, 而两份结论**相反**。
 
 # ════════════════════════════════════════════════════════ C8
 
@@ -2207,13 +2957,31 @@ def t_c6_escape():
 # ════════════════════════════════════════════════════════ C7
 #
 # 三条通路的锁状况, 用**测量**说清, 不靠运气:
-#   * repo 域     —— server.Repo._run_full, 锁 = Repo._lock(每实例 RLock)
-#   * history 域  —— history_ops.HistoryOps._run, 锁 = HistoryOps._lock(每实例 Lock)
-#   * conflicts 域—— conflicts.Git.run, 锁 = repo_git_lock(root)(按 realpath **共享** RLock)
-#   三把都**有锁**, 但**不是同一把** —— 这才是本条判的东西。
-# 判据: 同一域内不允许有重叠(产品原样应当是 0); 不同域之间同时跑 git
-#       **不允许** —— 重叠数**就是**「锁不是同一把」的直接证据, 非 0 即红,
-#       报出来的数字就是统一三锁要降到几的目标。
+#   * repo 域     —— server.Repo._run_full, 锁 = Repo._lock
+#   * history 域  —— history_ops.HistoryOps._run, 锁 = HistoryOps._lock
+#   * conflicts 域—— conflicts.Git.run, 锁 = conflicts.Git._lock
+#
+# ⚠⚠ **2026-10-05 就地改正**: 原来这里写的是「Repo._lock(**每实例** RLock)、
+#   HistoryOps._lock(**每实例** Lock)」和「三把都**有锁**, 但**不是同一把**
+#   —— **这才是本条判的东西**」。这三句**已被实测推翻**, 而且与**同一块下面
+#   十几行**(「三条通路现在**共用同一个函数、同一个字典**」)**自相矛盾** ——
+#   读的人读到上半段和读到下半段会得到相反的结论。
+#   2026-10-05 重新实测(不引用任何既有注释的说法; 阳性对照: 两把新建锁 id 不同、
+#   同一把取两次 id 相同, 先证明「id 比较」这把尺子能分辨):
+#     server.Repo._lock / HistoryOps._lock / conflicts.Git._lock
+#         三者 `id()` **完全相同**, 类型都是 **RLock**(可重入);
+#     repolock.repo_git_lock(root) 与上面三者**同一个对象**;传 Path(root) /
+#         新建的 Path(root) / str(root) 都返回同一把;
+#     取到的 4 个实例(Repo / HistoryOps / conflicts.Git / repo_git_lock)
+#         唯一 id 数 = **1**;
+#     **另建一个 Repo(root) 实例, 它的 _lock 仍是同一把**
+#         —— 所以是「**按 root 共享**」, **不是「每实例一把」**。
+#   ⇒ 「三把锁不是同一把」这条**已经修好了**(repolock.py; 接线见下面三行),
+#     它**不再是本条判的东西**。本条现在判的是: 同域重叠必须 0(锁有效 + 探针自检),
+#     跨域重叠必须 0。
+#     ⚠ 跨域这一条**在锁统一之后不再是独立信号** —— 三个域共用一把锁时,
+#       「跨域不重叠」几乎由「同域不重叠」推出。它仍值得留着, 但它红了**不能**
+#       直接读成「锁不是同一把」, 必须重新实测原因(见下面那句「本条若仍红」)。
 #
 # ⚠⚠ **本文件里不许再用「无锁」这个词**, 它的歧义已经造成过两次实害:
 #   一次是注释里的「无锁」= 不与 Repo._lock 互斥, 而输出里的「无锁」= 没有锁,
@@ -2344,14 +3112,37 @@ def t_c7_lock_domains():
        "样例(域,git 子命令)x(域,git 子命令): %r"
        % (cross, "同域 conflicts 重叠 %d 次(锁有效)。" % per["conflicts"],
           per["repo"], per["history"], per["conflicts"], xsamp[:4]))
+    # ⚠⚠⚠ **2026-10-05 移交**: 原来这里有一条
+    #     ck(not summ["requests_interleaved"], "【操作不是原子的】...")
+    #     **删掉了**, 不是因为它变绿了, 而是因为它在**这个负载上根本测不到**它要抓的
+    #     东西, 恒红且零信息量。两个实测理由:
+    #
+    #   (1) **本条的 history 腿是空跑**。夹具 fx_merge_conflict_n(sb, 12) 把仓留在
+    #       **合并态**(实测 index 未合并路径 36 条), 而 git 拒绝在合并态 amend:
+    #         实测 24/24 条 amend 全部 HTTP 400,
+    #         "git commit --amend 失败:fatal: You are in the middle of a merge
+    #          -- cannot amend."(code=amend_failed)
+    #       ⇒ history 域一次 amend 都没真跑成; requests_interleaved 里它的贡献
+    #         只是「插了队但什么也没干」。**分母为 0 的量不进判据。**
+    #
+    #   (2) **那个数不携带信息**。锁是每条 git 命令取一次, 一次请求的两次 git 调用
+    #       之间必然有缝, 缝宽与并发度成正比。实测 836/836 个外来 span **全部**落在
+    #       缝里, **真重叠 0**。改成「真重叠 = 0」能把这条洗成绿 —— 但本条要抓的
+    #       损害**不需要真重叠**也能发生, 所以那样改就是掩盖。
+    #
+    #   ⇒ 请求级原子性改由 **C4** 断言(它本来的声明用途就是「history_ops 危险操作
+    #     (amend/undo/revert)与 stage 并发」, 夹具是 fx_history, **amend 真跑得成**)。
+    #     C4 现在断言: 响应的 subject 必须是自己提交的那条 message
+    #     (2026-10-05 实测 16/24 = 66.7% 不符, 是真缺陷)。
+    #     tree 变化那个数(实测 9/24 = 37.5%)在 C4 里**只测量不判据** ——
+    #     `do_amend` 的 docstring 明写它「用当前 index 重写上次提交」, 那是文档写明的
+    #     语义, 断言它就是假判据。
+    #
+    # ⚠ requests_interleaved / requests_interleavable **仍然照记**在上面的
+    #   report(... "requests": summ) 与 RESULTS 里 —— 它们是诊断量, 不是判据。
     ck(summ["requests_interleavable"] > 0,
        "自检失败: requests_interleavable=0 —— 没有请求发过 2 条以上 git, "
        "该量恒 0 是**没测到**。%r" % summ)
-    ck(not summ["requests_interleaved"],
-       "【操作不是原子的】%d/%d 个**有资格**的请求(own>=2)在自己的首尾两条临界区"
-       "之间被别的请求插过队(全部请求 %d 个, git 条数分布 %r)"
-       % (summ["requests_interleaved"], summ["requests_interleavable"],
-          summ["requests"], summ["git_call_histogram"]))
     return None
 
 

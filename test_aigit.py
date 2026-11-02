@@ -2289,11 +2289,21 @@ def t_n2(ctx):
         ck_eq(code, 200, "%s 应 200" % path)
         if key:
             ck(j.get(key), "%s 没返回 %r" % (path, key))
+    # 2026-10-21 补: legacy_op 原先**零提及**。有些 plan 函数的内部 op 名与
+    # URL 段不同(branch-rename 内部叫 rename-branch); 服务端把 op 归一到 URL 段,
+    # 旧值留在 legacy_op 里 —— 没有它, 改语义时就是**静默**改。
+    # 值先量后写: 沙盒实测 op='branch-rename' / legacy_op='rename-branch'。
+    code, j = ctx.srv.jget("/api/history/plan/branch-rename?old=main&new=renamed")
+    ck_eq(code, 200, "branch-rename 预演应 200")
+    ck_eq(j.get("op"), "branch-rename", "op 应归一到 URL 段")
+    ck_eq(j.get("legacy_op"), "rename-branch", "legacy_op 应保留内部旧名")
+
     # 分支不存在 -> 400: 预演也照样有用法护栏, 不是「一律返回 200 的空壳」
     code, _ = ctx.srv.jget("/api/history/plan/branch-delete?name=no-such-branch")
     ck_eq(code, 400, "预演删除一个不存在的分支期望 400")
-    ck(isinstance(ctx.srv.jget("/api/history/reflog")[1], list),
-       "reflog 应回一个数组")
+    _rl = ctx.srv.jget("/api/history/reflog")[1]
+    ck(isinstance(_rl, dict) and isinstance(_rl.get("reflog"), list),
+       "reflog 应回 {ok, reflog:[...]}（2026-11-02 形状统一）")
 
     for path in ("/api/history/blame?file=h.txt",
                  "/api/history/file?file=h.txt"):
@@ -2335,7 +2345,8 @@ def t_n2(ctx):
                             {"name": "v1", "message": "m"})
     ck_eq(code, 200, "建 tag 应 200")
     ck(any(x.get("name") == "v1"
-           for x in ctx.srv.jget("/api/history/tags")[1]), "tag 列表里没有 v1")
+           for x in ctx.srv.jget("/api/history/tags")[1]["tags"]),
+       "tag 列表里没有 v1")
     code, _ = ctx.srv.jpost("/api/history/tag/create", {"name": "-x"})
     ck_eq(code, 400, "以 - 开头的 tag 名期望 400")
 

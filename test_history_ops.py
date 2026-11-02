@@ -521,6 +521,13 @@ def t_C2():
     ck_eq(sorted(info["dirty"]["unstaged"]), ["b.txt"], "dirty 段要准确")
     ck_eq(sorted(info["dirty"]["staged"]), ["a.txt"], "staged 段要准确")
     ck_eq(info["old_sha"], r.out("rev-parse", "HEAD").strip(), "old_sha 要准")
+    # 2026-10-21 补: 下面 4 个键原先**零提及**(find_test_gaps 报 zero)。
+    # 值先量后写 —— 沙盒实测: old_short = old_sha[:8]、old_subject = HEAD 的标题、
+    # 传了 message 则 new_message=该串 / message_changes=True。
+    ck_eq(info["old_short"], info["old_sha"][:8], "old_short 应是 old_sha 前 8 位")
+    ck_eq(info["old_subject"], "chore: first", "old_subject 应是 HEAD 的标题")
+    ck_eq(info["new_message"], "new msg", "new_message 应是传入的新信息")
+    ck_eq(info["message_changes"], True, "传了 message -> message_changes 应为 True")
 
     # 没有暂存内容时,提示的是另一件事
     r2 = TestRepo("c02b")
@@ -531,6 +538,11 @@ def t_C2():
     ck_in("没有已暂存", info2["warning"], "没暂存内容时要提示只能改信息")
     ck_in("未跟踪", info2["warning"], "未跟踪文件要单独提示")
     ck_eq(info2["dirty"]["untracked"], ["z.txt"], "未跟踪段要准确")
+    # 2026-10-21 补: 不传 message 时的另外半边 —— new_message 应为 None,
+    # message_changes 应为 False(不是「空串」也不是「没这个键」)。
+    ck_eq(info2["new_message"], None, "没传 message -> new_message 应为 None")
+    ck_eq(info2["message_changes"], False,
+          "没传 message -> message_changes 应为 False")
 
 
 @test("C", "amend on a repo with no commits is refused")
@@ -1043,6 +1055,10 @@ def t_H1():
 
     hist = r.ops.file_history("new.txt", follow=True)
     ck_eq(hist["ok"], True, "查询应成功")
+    # 2026-10-20 补: exists_in_worktree 原先**零提及**(find_test_gaps.py 报 zero)。
+    # 值先量后写 —— 沙盒实测: 已跟踪且在盘上的文件 = True。
+    ck_eq(hist["exists_in_worktree"], True, "已跟踪且在盘上的文件应为 True")
+    ck_eq(hist["tracked"], True, "tracked 应为 True")
     ck(hist["count"] >= 5, "应能看到全部 5 个提交(含重命名前的),实际 %d"
        % hist["count"])
     shas = [c["sha"] for c in hist["commits"]]
@@ -1095,6 +1111,10 @@ def t_H2():
     ck_eq(res["count"], 3, "3 行文件应返回 3 条")
     ck_eq(res["total_lines"], 3, "总行数")
     ck_eq(res["truncated"], False, "3 行不该被截断")
+    # 2026-10-20 补: 这两个键原先**零提及**。值先量后写 ——
+    # 沙盒实测 3 行文件、不传 start/end 时 requested_first=1 / requested_end=3。
+    ck_eq(res["requested_first"], 1, "requested_first 应是本次请求的起始行")
+    ck_eq(res["requested_end"], 3, "requested_end 应是本次请求的结束行")
     ck_eq([l["line"] for l in res["lines"]], [1, 2, 3], "行号应连续")
     ck_eq([l["content"] for l in res["lines"]],
            ["alpha", "BETA touched", "gamma"], "内容应对得上")
@@ -1313,6 +1333,13 @@ def main():
     if not a.keep:
         # 清场失败也要变成可见的事实,不能被一个"全绿"盖过去:
         # 残留的仓会让**下一轮**建在脏目录上,那才是真正会误导人的地方。
+        # ⚠ 2026-10-27: 常驻 `cat-file` 进程按仓持有句柄, Windows 上会让 rmtree
+        #   失败(WinError 32)。清场前必须先关掉它 —— 见 doc §12.15。
+        try:
+            import gitcat
+            gitcat.close_all()
+        except Exception:
+            pass
         try:
             cleanup()
         except RuntimeError as e:
