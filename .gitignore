@@ -12,3 +12,6 @@ build/
 # 本地测试残留
 /tmp/
 /sandbox/
+
+# C 版构建产物
+c/build/

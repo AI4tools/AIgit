@@ -22,3 +22,8 @@
 *.txt  text eol=lf
 *.ps1  text eol=crlf
 *.bat  text eol=crlf
+
+# C 版（2026-11-03 新增）：与 .py/.md 一样钉 LF
+*.c      text eol=lf
+*.h      text eol=lf
+Makefile text eol=lf
