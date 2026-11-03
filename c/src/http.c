@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <windows.h>
 #include <ws2tcpip.h>
 
@@ -163,6 +164,23 @@ static void route(SOCKET s, const char *method, const char *path, const char *qu
     }
 }
 
+/* 在请求头里找 Content-Length（不区分大小写）。找不到返回 -1。 */
+static long long header_content_length(const char *h, size_t n) {
+    static const char key[] = "content-length:";
+    for (size_t i = 0; i + sizeof(key) - 1 < n; i++) {
+        size_t k = 0;
+        while (k < sizeof(key) - 1 && tolower((unsigned char)h[i + k]) == key[k]) k++;
+        if (k == sizeof(key) - 1) {
+            const char *p = h + i + k;
+            while (*p == ' ' || *p == '\t') p++;
+            char *end = NULL;
+            long long v = strtoll(p, &end, 10);
+            return end == p ? -1 : v;
+        }
+    }
+    return -1;
+}
+
 static void handle_conn(SOCKET s) {
     buf req;
     buf_init(&req);
@@ -189,13 +207,50 @@ static void handle_conn(SOCKET s) {
         buf_free(&req);
         return;
     }
-    /* 第一行：METHOD SP TARGET SP VERSION */
+    /* 第一行：METHOD SP TARGET SP VERSION
+     * 目标串不再拷进固定 2048 缓冲（那会把长路径静默截断，Python 版没有这个上限）。 */
+    char method[16] = {0};
+    char *target = NULL;
     char *line_end = strstr(req.p, "\r\n");
-    char method[16] = {0}, target[2048] = {0};
     if (line_end) {
         *line_end = 0;
-        sscanf(req.p, "%15s %2047s", method, target);
+        char *sp1 = strchr(req.p, ' ');
+        if (sp1) {
+            size_t mlen = (size_t)(sp1 - req.p);
+            if (mlen >= sizeof(method)) mlen = sizeof(method) - 1;
+            memcpy(method, req.p, mlen);
+            method[mlen] = 0;
+            target = sp1 + 1;
+            while (*target == ' ') target++;
+            char *sp2 = strchr(target, ' ');
+            if (sp2) *sp2 = 0;
+        }
     }
+    if (!method[0] || !target || !*target) {
+        http_send_err(s, 400, "请求行不完整", "bad_request");
+        buf_free(&req);
+        return;
+    }
+
+    /* 先把请求体从内核缓冲读走再响应。否则端点回 404 后直接 closesocket，
+     * 对端还有未读数据，Windows 会发 RST —— 客户端看到的是
+     * ConnectionResetError，而不是那个 404（实测确实踩到）。 */
+    {
+        long long clen = header_content_length(req.p, header_end);
+        if (clen > 0) {
+            size_t need = (size_t)clen;
+            size_t have = req.n > header_end ? req.n - header_end : 0;
+            if (have > need) have = need;
+            DWORD tv = 2000;
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+            while (have < need) {
+                int got = recv(s, tmp, sizeof(tmp), 0);
+                if (got <= 0) break;
+                have += (size_t)got;
+            }
+        }
+    }
+
     /* 去掉 query */
     char *qm = strchr(target, '?');
     const char *query = "";

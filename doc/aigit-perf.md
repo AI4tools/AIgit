@@ -1562,7 +1562,69 @@ Windows-only、P4 句柄）。它取代「口头交接」。
 
 ---
 
+## 12.23 C 版 M1 读面的实测账（当轮二十，[实测]）
+
+**被测对象**：`D:\project\aigit\c\build\aigit.exe`（MinGW-W64 16.2.0 UCRT，静态链接，
+741,715 字节）。参考对象是同一仓、同一请求序列下的 `server.py`。
+
+**方法**（`D:\aigit_mut_tmp\bench_read.py`，不在仓库内）：
+同一 fixture 仓（400 个文件、2 个提交、5 个注解标签、1 个 stash、1 个脏文件）分别起
+Python / C 服务，每个端点 3 轮热身 + 30 次采样，取 **p50**；同时读
+`X-aigit-git-calls` 确认 spawn 次数。窗口内无其它负载。
+
+| 端点 | Python p50 | C p50 | C/Python | spawn（Py → C） |
+|---|---:|---:|---:|---:|
+| `/api/status` | 54.9ms | 63.1ms | 1.15× | 1 → 1 |
+| `/api/branches` | 6.7ms | 1.0ms | **0.15×** | 0 → 0 |
+| `/api/log?limit=50` | 51.5ms | 57.5ms | 1.12× | 1 → 1 |
+| `/api/file?file=f100.txt` | 2.3ms | 1.3ms | **0.59×** | 0 → 0 |
+| `/api/diff` | 1.0ms | 0.5ms | **0.53×** | 0 → 0 |
+| `/api/history/file?file=f100.txt&limit=20` | 135.5ms | 172.6ms | 1.27× | 3 → 3 |
+| `/api/history/blame?file=f100.txt&start=1&end=40` | 48.4ms | 62.2ms | 1.29× | 1 → 1 |
+| `/api/history/tags?limit=50` | 1.4ms | 1.0ms | **0.69×** | 0 → 0 |
+| `/api/history/reflog?limit=20` | 2.9ms | 2.1ms | **0.73×** | 0 → 0 |
+| `/api/history/stashes?limit=20` | 1.7ms | 5.4ms | **3.11×** | 0 → 0 |
+| `/api/conflict/state` | 2.9ms | 1.0ms | **0.33×** | 0 → 0 |
+| `/api/remote/list` | 50.0ms | 55.8ms | 1.11× | 1 → 1 |
+
+**直读快路径的第一版对照**（同一脚本，改快路径前）：
+
+| 端点 | 改前 C p50 | 改后 C p50 | 改前/改后 |
+|---|---:|---:|---:|
+| `/api/history/tags` | 63.4ms | 1.0ms | **63×** |
+| `/api/history/reflog` | 57.5ms | 2.1ms | **27×** |
+| `/api/history/stashes` | 57.6ms | 5.4ms | **11×** |
+
+改前这三个端点各 spawn 1 次 git；改后 0 次（直读 `.git/logs/*`、`.git/refs/tags*`、
+`.git/packed-refs`、`.git/config`，对象内容走常驻 `git cat-file --batch`，与 Python
+`gitcat.py` 一样不计入调用数）。
+
+**结论与边界**：
+
+- 读面里所有**已经 0 spawn** 的端点，C 都不慢于 Python（0.15×–0.73×）。
+- 仍然 1–3 spawn 的端点（status / log / history-file / blame / remote-list），C 比 Python
+  慢 11%–29%；差异全部落在 git 子进程的启动/管道开销上，不是解析。这一档属于 M3
+  性能线，尚未开刀。
+- `/api/history/stashes` 虽然也是 0 spawn，仍比 Python 慢 3.1×（5.4ms vs 1.7ms）；
+  绝对差 3.7ms，未定位（待测：怀疑是每条 stash 多一次文件打开）。
+- **本表只代表这一台机器、这一个 fixture**；没有做冷启动/大仓/并发下的对比，
+  这些数字不能外推。C 版并发面尚未测。
+
+本次判据（同一构建）：
+
+| 判据 | 结果 |
+|---|---|
+| `c/tests/run_conformance.py`（5 片） | **5/5 通过，395 项全过，100.7s** |
+| `cmp_vs_git_c.py` 275 项读面差分（服务端切 C） | **275 项，失败 0**（symlink 场景 SKIP：本机无符号链接权限） |
+
+---
+
 ## 13. 变更记录
+
+- **v23（2026-11-03 当轮二十，C 版 M1 读面性能实测）**：新增 §12.23。C 版 17 个读端点
+  与 Python 版逐项相等（conformance 395 项 + 275 项 git 差分）；直读快路径让
+  tags/reflog/stashes 从 57–63ms 降到 1–5ms。剩余 1–3 spawn 的端点慢 11%–29%，
+  归 M3。数字只代表本机 + 400 文件 fixture。
 
 - **v22（2026-11-02 当轮十九，写响应可选省略 status）**：新增 §12.22。
   ① UI 的六个写入口后面都紧跟 `refresh()`（它自己发 `GET /api/status`），所以写响应
