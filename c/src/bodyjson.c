@@ -42,7 +42,8 @@ static void set_err(jp *p, const char *kind, size_t at) {
     p->err[p->errsz - 1] = 0;
 }
 
-static int utf8_valid(const char *s, size_t n) {
+static int utf8_error(const char *s, size_t n, size_t *pos, int *kind) {
+    /* kind: 0=invalid start byte, 1=unexpected end of data, 2=invalid continuation byte */
     size_t i = 0;
     while (i < n) {
         unsigned char c = (unsigned char)s[i];
@@ -52,15 +53,18 @@ static int utf8_valid(const char *s, size_t n) {
         if (c >= 0xc2 && c <= 0xdf) { need = 1; cp = c & 0x1f; }
         else if (c >= 0xe0 && c <= 0xef) { need = 2; cp = c & 0x0f; }
         else if (c >= 0xf0 && c <= 0xf4) { need = 3; cp = c & 0x07; }
-        else return 0;
-        if (i + (size_t)need >= n) return 0;
+        else { *pos = i; *kind = 0; return 0; }
+        if (i + (size_t)need >= n) { *pos = i; *kind = 1; return 0; }
         for (int k = 1; k <= need; k++) {
             unsigned char cc = (unsigned char)s[i + (size_t)k];
-            if ((cc & 0xc0) != 0x80) return 0;
+            if ((cc & 0xc0) != 0x80) { *pos = i + (size_t)k; *kind = 2; return 0; }
             cp = (cp << 6) | (cc & 0x3f);
         }
         if ((need == 2 && cp < 0x800) || (need == 3 && cp < 0x10000) ||
-            (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) return 0;
+            (cp >= 0xd800 && cp <= 0xdfff) || cp > 0x10ffff) {
+            *pos = i; *kind = 2;
+            return 0;
+        }
         i += (size_t)need + 1;
     }
     return 1;
@@ -331,6 +335,23 @@ static jnode *parse_value(jp *p) {
     if (c == 't' && match_lit(p, "true")) { jnode *v = jnew(BJ_BOOL); v->b = 1; return v; }
     if (c == 'f' && match_lit(p, "false")) { jnode *v = jnew(BJ_BOOL); v->b = 0; return v; }
     if (c == 'n' && match_lit(p, "null")) return jnew(BJ_NULL);
+    /* Python 的 json.loads 默认接受 NaN / Infinity / -Infinity */
+    if (c == 'N' && match_lit(p, "NaN")) {
+        jnode *v = jnew(BJ_FLOAT);
+        v->f = NAN;
+        return v;
+    }
+    if (c == 'I' && match_lit(p, "Infinity")) {
+        jnode *v = jnew(BJ_FLOAT);
+        v->f = INFINITY;
+        return v;
+    }
+    if (c == '-' && p->i + 9 <= p->n && !memcmp(p->s + p->i, "-Infinity", 9)) {
+        p->i += 9;
+        jnode *v = jnew(BJ_FLOAT);
+        v->f = -INFINITY;
+        return v;
+    }
     if (c == '-' || (c >= '0' && c <= '9')) return parse_number(p);
     set_err(p, "Expecting value", p->i);
     return NULL;
@@ -339,12 +360,22 @@ static jnode *parse_value(jp *p) {
 jnode *jparse(const char *s, size_t n, char *err, size_t errsz) {
     if (err && errsz) err[0] = 0;
     if (!s) s = "";
-    if (!utf8_valid(s, n)) {
-        if (err && errsz) {
-            _snprintf(err, errsz, "'utf-8' codec can't decode byte: invalid data");
-            err[errsz - 1] = 0;
+    {
+        size_t bad_pos = 0;
+        int kind = 0;
+        if (!utf8_error(s, n, &bad_pos, &kind)) {
+            if (err && errsz) {
+                unsigned char bad = (unsigned char)s[bad_pos < n ? bad_pos : 0];
+                const char *why = kind == 0 ? "invalid start byte"
+                                : kind == 1 ? "unexpected end of data"
+                                            : "invalid continuation byte";
+                _snprintf(err, errsz,
+                          "'utf-8' codec can't decode byte 0x%02x in position %zu: %s",
+                          (unsigned)bad, bad_pos, why);
+                err[errsz - 1] = 0;
+            }
+            return NULL;
         }
-        return NULL;
     }
     jp p;
     memset(&p, 0, sizeof(p));

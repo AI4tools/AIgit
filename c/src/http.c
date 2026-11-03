@@ -147,6 +147,9 @@ static void route(SOCKET s, const char *method, const char *path, const char *qu
         if (write_basic_post(path, query, body, body_len, s)) return;
         if (write_more_post(path, query, body, body_len, s)) return;
         if (write_conflict_post(path, query, body, body_len, s)) return;
+        if (write_history_post(path, query, body, body_len, s)) return;
+        if (write_refs_post(path, query, body, body_len, s)) return;
+        if (write_stash_post(path, query, body, body_len, s)) return;
         /* Python 的 do_POST 先 _body() 再分派：未知路径 + 坏 JSON 也是 400，
          * 不是 404。这里照同序补上（空 body 视作 {}）。 */
         {

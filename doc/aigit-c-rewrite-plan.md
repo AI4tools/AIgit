@@ -137,8 +137,8 @@ cmake -S c -B c\build-msvc -G Ninja && ninja -C c\build-msvc
 | M0 | **完成** | `conformance_m0.py` 9/9；`c/build/aigit.exe` 静态单文件 |
 | M1（读面） | **完成** | Python `do_GET` 的 21 组路由全部接上；`cmp_vs_git_c.py` **275/275**；8 片一致性 **2,442 项全过** |
 | M1.5（直读快路径） | **完成（读面）** | branches/file/diff/conflict/tags/reflog/stashes 均 0 spawn；tags 63.4→1.0ms、reflog 57.5→2.1ms、stashes 57.6→5.4ms（详见 `doc/aigit-perf.md` §12.23） |
-| M2（写面） | **核心完成** | `cmp_write_vs_git_c.py` **12/12 场景**；3 片写面一致性（stage/unstage/discard/commit 122 项；checkout/branch/merge/reset 93 步 + 28 状态；conflict/* 221 步 + 44 状态） |
-| M3（冲突/历史写） | **冲突写完成，历史写未接** | conflict/{resolve,choose,delete,commit,abort} 已接；`/api/history/*` 的 amend/revert/stash/branch/tag/reflog 等 13 个 POST 仍未接 |
+| M2（写面） | **完成** | `cmp_write_vs_git_c.py` **12/12 场景**；3 片写面一致性（stage/unstage/discard/commit 122 项；checkout/branch/merge/reset 93 步 + 28 状态；conflict/* 221 步 + 44 状态） |
+| M3（冲突/历史写） | **完成** | `/api/history/*` 13 个写路由已接：amend/undo/reflog restore 93 次 POST；revert/branch/tag 154 步 + 466 fuzz；stash 103 次 POST，全部 0 失败 |
 | M4（安全面） | 部分 | `paths.c` 已有越界/`.git`/真实路径复查；符号链接受限（本机 WinError 1314），未做句柄级全量对拍 |
 | M5（并发/打包） | 部分 | 并发冒烟 12×25=300 请求 0 不一致；性能预算 28 项尚未挂到 C；打包仅静态 exe |
 

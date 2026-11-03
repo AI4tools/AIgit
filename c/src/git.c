@@ -132,6 +132,12 @@ static void cmdline_add(buf *b, const wchar_t *arg, int first) {
     for (const wchar_t *p = arg; *p; p++)
         if (*p == L' ' || *p == L'\t' || *p == L'"') { need = 1; break; }
     if (!first) buf_append(b, L" ", sizeof(wchar_t));
+    if (!arg[0]) {
+        /* 空参数必须写成 ""；什么都不写等于把参数吞掉（实测 `-m ""` 会变成裸
+         * `-m`，git 报 "switch 'm' requires a value"）。 */
+        buf_append(b, L"\"\"", 2 * sizeof(wchar_t));
+        return;
+    }
     if (!need) {
         buf_append(b, arg, wcslen(arg) * sizeof(wchar_t));
         return;

@@ -1,5 +1,6 @@
 #include "writeutil.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,12 +44,28 @@ jnode *wbody_parse(SOCKET s, const char *body, size_t len) {
     return v;
 }
 
+static void repr_float(double d, buf *out) {
+    if (isnan(d)) { buf_puts(out, "nan"); return; }
+    if (isinf(d)) { buf_puts(out, d > 0 ? "inf" : "-inf"); return; }
+    char t[64];
+    for (int p = 1; p <= 17; p++) {
+        snprintf(t, sizeof(t), "%.*g", p, d);
+        if (strtod(t, NULL) == d) break;
+    }
+    /* Python 的 repr 对整数值浮点保留 .0；指数形式保持 %g 的 e+XX */
+    if (!strchr(t, '.') && !strchr(t, 'e') && !strchr(t, 'E')) {
+        size_t n = strlen(t);
+        if (n + 3 < sizeof(t)) { t[n] = '.'; t[n + 1] = '0'; t[n + 2] = 0; }
+    }
+    buf_puts(out, t);
+}
+
 void w_repr(const jnode *v, buf *out) {
     switch (bjtype(v)) {
     case BJ_NULL: buf_puts(out, "None"); break;
     case BJ_BOOL: buf_puts(out, jbool(v) ? "True" : "False"); break;
     case BJ_INT: buf_printf(out, "%lld", jint(v)); break;
-    case BJ_FLOAT: buf_printf(out, "%g", jfloat(v)); break;
+    case BJ_FLOAT: repr_float(jfloat(v), out); break;
     case BJ_STR: {
         buf_putc(out, '\'');
         const unsigned char *p = (const unsigned char *)jstr(v);

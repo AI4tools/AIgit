@@ -42,4 +42,16 @@ int write_more_post(const char *path, const char *query, const char *body,
 int write_conflict_post(const char *path, const char *query, const char *body,
                         size_t body_len, SOCKET s);
 
+/* 历史写：history/{amend,undo-last-commit,reflog/restore} */
+int write_history_post(const char *path, const char *query, const char *body,
+                       size_t body_len, SOCKET s);
+
+/* 引用/历史写：revert、branch rename/delete、tag create/delete */
+int write_refs_post(const char *path, const char *query, const char *body,
+                    size_t body_len, SOCKET s);
+
+/* stash 写：history/stash、stash apply/pop/drop */
+int write_stash_post(const char *path, const char *query, const char *body,
+                     size_t body_len, SOCKET s);
+
 #endif

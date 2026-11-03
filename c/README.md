@@ -33,24 +33,25 @@ Python 版 `do_GET` 里的 21 组路由已经**全部**接上：
 | 冲突/远程 | `/api/conflict/state`、`/api/conflict/list`、`/api/conflict/inspect`、`/api/remote/capability`、`/api/remote/list`、`/api/remote/heads`、`/api/remote/ahead-behind`、`/api/remote/plan/<op>` |
 | 预演 | `/api/reset/plan`、`/api/discard/plan` |
 
-写面（M2）已经接上 27 个 POST 路由里的 14 个：
+写面（M2/M3）已经接上 27 个 POST 路由里的 **全部 27 个**：
 
 | 组 | 端点 |
 |---|---|
 | 基础写 | `/api/stage`、`/api/unstage`、`/api/discard`、`/api/commit` |
 | 分支/合并 | `/api/checkout`、`/api/branch`、`/api/merge`、`/api/merge-abort`、`/api/reset` |
 | 冲突 | `/api/conflict/resolve`、`/api/conflict/choose`、`/api/conflict/delete`、`/api/conflict/commit`、`/api/conflict/abort` |
+| 历史写 | `/api/history/amend`、`/api/history/undo-last-commit`、`/api/history/reflog/restore` |
+| 引用写 | `/api/history/revert`、`/api/history/revert/abort`、`/api/history/branch/rename`、`/api/history/branch/delete`、`/api/history/tag/create`、`/api/history/tag/delete` |
+| stash 写 | `/api/history/stash`、`/api/history/stash/apply`、`/api/history/stash/pop`、`/api/history/stash/drop` |
 
-v1 明确不做：`/api/gen`、`/api/remote/{fetch,pull,push}`、以及历史写操作
-（`/api/history/*` 的 amend/revert/stash/stash apply/drop/pop/branch rename/delete/
-tag create/delete/reflog restore 等，属 M3）。对这些路径返回 404，与 Python 版
-「没有这个接口」一致。远程能力闸（NetGate）默认关闭，`/api/remote/heads` 在关闭时与
-Python 一样回 400 `net_disabled`（连 `X-aigit-git-calls` 也一并对齐）。
+v1 明确不做：`/api/gen`、`/api/remote/{fetch,pull,push}`。对这些路径返回 404，与
+Python 版「没有这个接口」一致。远程能力闸（NetGate）默认关闭，`/api/remote/heads`
+在关闭时与 Python 一样回 400 `net_disabled`（连 `X-aigit-git-calls` 也一并对齐）。
 
 ## 判据
 
 ```powershell
-python -X utf8 c\tests\run_conformance.py          # 11 片
+python -X utf8 c\tests\run_conformance.py          # 14 片
 python -X utf8 c\tests\concurrency_c.py 12 25     # 并发冒烟，300 请求
 ```
 
@@ -68,6 +69,9 @@ HTTP 码 + JSON 深比较」（读面分片还比 `X-aigit-git-calls`/`cmds`）�
 - `conformance_write_basic.py` —— stage/unstage/discard/commit（122 项，含与真 git 的对照）
 - `conformance_write_more.py` —— checkout/branch/merge/merge-abort/reset（93 个 POST 步骤 + 28 个最终状态）
 - `conformance_write_conflict.py` —— conflict/{resolve,choose,delete,commit,abort}（221 个 POST 步骤 + 44 个最终状态）
+- `conformance_write_history.py` —— amend/undo-last-commit/reflog restore（93 次 POST + 32 个最终状态）
+- `conformance_write_refs.py` —— revert/revert-abort/branch rename|delete/tag create|delete（154 步 + 466 条 fuzz）
+- `conformance_write_stash.py` —— stash/stash apply|pop|drop（103 次 POST + 32 个最终状态）
 
 写面退出判据是 12 个「与真 git 同操作」的场景（`cmp_write_vs_git_c.py`，在
 `D:\aigit_mut_tmp`，不在仓库内）：
@@ -112,6 +116,11 @@ python -X utf8 D:\aigit_mut_tmp\cmp_vs_git_c.py
     （单请求语义已对上，并发写属未测范围）。
 12. 仓内「符号链接→目录」C 一律跳过（Python 当文件链接收下）；目录联接已验证一致，
     真 symlink 因本机权限（WinError 1314）未验证。
+13. `--root` 指向**非仓库目录**时，Python 启动会自动 `git init` 并造一个 sandbox 提交；
+    C 不做这一步（`/api/health` 报 `isRepo:false`，写端点返回 not_a_repo）。指向真实
+    仓库时无差异。
+14. 历史写（amend/revert/branch/tag/stash）的 spawn 数可能比 Python 多：Python 有
+    refs/reflog 文件快路径，C 走 git 命令；响应与副作用已逐项对齐。
 
 ## 目录
 
@@ -126,6 +135,8 @@ c/src/
   paths.c      请求路径 → 仓内相对路径（安全关键）
   status.c     porcelain v2 解析与 JSON
   catfile.c    常驻 git cat-file --batch（不计数，带状态查询）
+  bodyjson.c   请求体 JSON 解析（Python json.loads 口径）
+  writeutil.c  写端点共用：body 取值 / 统一成功响应（含 status opt-out、E3 兜底）
   read_basic.c       branches/log/file/diff
   read_history.c     history/file、history/blame
   read_history_list.c history/tags、reflog、stashes（直读 .git）
@@ -133,5 +144,11 @@ c/src/
   read_plan.c        reset/plan、discard/plan
   read_histplan.c    history/stash、history/plan/<op>
   read_remoteplan.c  remote/heads、remote/plan/<op>
-  routes.h     读模块的分派约定
+  write_basic.c      stage/unstage/discard/commit
+  write_more.c       checkout/branch/merge/merge-abort/reset
+  write_conflict.c   conflict/{resolve,choose,delete,commit,abort}
+  write_history.c    amend/undo-last-commit/reflog restore
+  write_refs.c       revert/revert-abort/branch rename|delete/tag create|delete
+  write_stash.c      stash/stash apply|pop|drop
+  routes.h     各模块的分派约定
 ```
