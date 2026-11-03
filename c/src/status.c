@@ -146,8 +146,8 @@ static void items_json(buf *o, const sitem *arr, size_t n, int staged_side) {
     buf_putc(o, ']');
 }
 
-void status_json(buf *o, const status_t *st, const char *root_u8) {
-    buf_puts(o, "{\"ok\":true,\"branch\":");
+void status_json_fields(buf *o, const status_t *st, const char *root_u8) {
+    buf_puts(o, "\"branch\":");
     json_str(o, st->branch ? st->branch : "");
     buf_puts(o, ",\"root\":");
     json_str(o, root_u8);
@@ -164,5 +164,11 @@ void status_json(buf *o, const status_t *st, const char *root_u8) {
         buf_puts(o, ",\"status\":\"U\"}");
     }
     buf_puts(o, "]");
-    buf_printf(o, ",\"hasStaged\":%s}", st->ns ? "true" : "false");
+    buf_printf(o, ",\"hasStaged\":%s", st->ns ? "true" : "false");
+}
+
+void status_json(buf *o, const status_t *st, const char *root_u8) {
+    buf_puts(o, "{\"ok\":true,");
+    status_json_fields(o, st, root_u8);
+    buf_putc(o, '}');
 }

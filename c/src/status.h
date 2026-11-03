@@ -26,4 +26,9 @@ void status_free(status_t *st);
 /* 渲染成 {ok,branch,root,staged,unstaged,conflicted,hasStaged} */
 void status_json(buf *o, const status_t *st, const char *root_u8);
 
+/* 只输出 status 的字段（"branch":...,"root":...,"hasStaged":...），不带外层
+ * {"ok":true,...}。写端点的响应要把 output 之类的 extra 放在 ok 之后、
+ * status 字段之前，所以需要这一段可复用。 */
+void status_json_fields(buf *o, const status_t *st, const char *root_u8);
+
 #endif

@@ -92,7 +92,8 @@ static int path_eq(const char *path, const char *want) {
     return !strcmp(path, want);
 }
 
-static void route(SOCKET s, const char *method, const char *path, const char *query) {
+static void route(SOCKET s, const char *method, const char *path, const char *query,
+                  const char *body, size_t body_len) {
     if (!strcmp(method, "GET")) {
         if (path_eq(path, "/api/health")) {
             buf o;
@@ -141,6 +142,10 @@ static void route(SOCKET s, const char *method, const char *path, const char *qu
         return;
     }
     if (!strcmp(method, "POST")) {
+        /* 写端点 */
+        if (write_basic_post(path, query, body, body_len, s)) return;
+        if (write_more_post(path, query, body, body_len, s)) return;
+        if (write_conflict_post(path, query, body, body_len, s)) return;
         /* 读端点只认 GET（与 Python 版一致：POST 到只读路径 → 404，不是 405） */
         http_send_err(s, 404, "没有这个接口", NULL);
         return;
@@ -235,21 +240,32 @@ static void handle_conn(SOCKET s) {
         return;
     }
 
-    /* 先把请求体从内核缓冲读走再响应。否则端点回 404 后直接 closesocket，
-     * 对端还有未读数据，Windows 会发 RST —— 客户端看到的是
-     * ConnectionResetError，而不是那个 404（实测确实踩到）。 */
+    /* 先把请求体读进内存再响应。写端点要解析 body；只读端点也要读走，
+     * 否则端点回 404 后直接 closesocket，对端还有未读数据，Windows 会发 RST ——
+     * 客户端看到的是 ConnectionResetError，而不是那个 404（实测确实踩到）。 */
+    buf body;
+    buf_init(&body);
     {
         long long clen = header_content_length(req.p, header_end);
         if (clen > 0) {
             size_t need = (size_t)clen;
+            if (need > (size_t)64 * 1024 * 1024) {
+                http_send_err(s, 400, "请求体过大", "bad_request");
+                buf_free(&body);
+                buf_free(&req);
+                return;
+            }
             size_t have = req.n > header_end ? req.n - header_end : 0;
             if (have > need) have = need;
+            if (have) buf_append(&body, req.p + header_end, have);
             DWORD tv = 2000;
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
-            while (have < need) {
+            while (body.n < need) {
                 int got = recv(s, tmp, sizeof(tmp), 0);
                 if (got <= 0) break;
-                have += (size_t)got;
+                size_t take = (size_t)got;
+                if (take > need - body.n) take = need - body.n;
+                buf_append(&body, tmp, take);
             }
         }
     }
@@ -260,7 +276,8 @@ static void handle_conn(SOCKET s) {
     if (qm) { *qm = 0; query = qm + 1; }
 
     git_count_reset();
-    route(s, method, target, query);
+    route(s, method, target, query, body.p ? body.p : "", body.n);
+    buf_free(&body);
     buf_free(&req);
 }
 

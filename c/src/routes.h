@@ -30,4 +30,16 @@ int read_remoteplan_get(const char *path, const char *query, SOCKET s);
 /* 冲突/远程读：conflict/{state,list,inspect} / remote/{capability,list,ahead-behind} */
 int read_conflict_get(const char *path, const char *query, SOCKET s);
 
+/* 写面：stage/unstage/discard/commit */
+int write_basic_post(const char *path, const char *query, const char *body,
+                     size_t body_len, SOCKET s);
+
+/* 写面：checkout/branch/merge/merge-abort/reset */
+int write_more_post(const char *path, const char *query, const char *body,
+                    size_t body_len, SOCKET s);
+
+/* 写面：conflict/{resolve,choose,delete,commit,abort} */
+int write_conflict_post(const char *path, const char *query, const char *body,
+                        size_t body_len, SOCKET s);
+
 #endif
