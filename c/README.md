@@ -33,14 +33,24 @@ Python 版 `do_GET` 里的 21 组路由已经**全部**接上：
 | 冲突/远程 | `/api/conflict/state`、`/api/conflict/list`、`/api/conflict/inspect`、`/api/remote/capability`、`/api/remote/list`、`/api/remote/heads`、`/api/remote/ahead-behind`、`/api/remote/plan/<op>` |
 | 预演 | `/api/reset/plan`、`/api/discard/plan` |
 
-v1 明确不做：写操作（M2，POST 面）与 `/api/gen`。对这些路径返回 404，与 Python 版
+写面（M2）已经接上 27 个 POST 路由里的 14 个：
+
+| 组 | 端点 |
+|---|---|
+| 基础写 | `/api/stage`、`/api/unstage`、`/api/discard`、`/api/commit` |
+| 分支/合并 | `/api/checkout`、`/api/branch`、`/api/merge`、`/api/merge-abort`、`/api/reset` |
+| 冲突 | `/api/conflict/resolve`、`/api/conflict/choose`、`/api/conflict/delete`、`/api/conflict/commit`、`/api/conflict/abort` |
+
+v1 明确不做：`/api/gen`、`/api/remote/{fetch,pull,push}`、以及历史写操作
+（`/api/history/*` 的 amend/revert/stash/stash apply/drop/pop/branch rename/delete/
+tag create/delete/reflog restore 等，属 M3）。对这些路径返回 404，与 Python 版
 「没有这个接口」一致。远程能力闸（NetGate）默认关闭，`/api/remote/heads` 在关闭时与
 Python 一样回 400 `net_disabled`（连 `X-aigit-git-calls` 也一并对齐）。
 
 ## 判据
 
 ```powershell
-python -X utf8 c\tests\run_conformance.py          # 8 片，2,442 项
+python -X utf8 c\tests\run_conformance.py          # 11 片
 python -X utf8 c\tests\concurrency_c.py 12 25     # 并发冒烟，300 请求
 ```
 
@@ -55,6 +65,19 @@ HTTP 码 + JSON 深比较」（读面分片还比 `X-aigit-git-calls`/`cmds`）�
 - `conformance_plan.py` —— reset/plan、discard/plan（92 项）
 - `conformance_histplan.py` —— history/stash、history/plan/<op>（185 项）
 - `conformance_remoteplan.py` —— remote/heads、remote/plan/<op>（1,820 项，含 5 档能力闸）
+- `conformance_write_basic.py` —— stage/unstage/discard/commit（122 项，含与真 git 的对照）
+- `conformance_write_more.py` —— checkout/branch/merge/merge-abort/reset（93 个 POST 步骤 + 28 个最终状态）
+- `conformance_write_conflict.py` —— conflict/{resolve,choose,delete,commit,abort}（221 个 POST 步骤 + 44 个最终状态）
+
+写面退出判据是 12 个「与真 git 同操作」的场景（`cmp_write_vs_git_c.py`，在
+`D:\aigit_mut_tmp`，不在仓库内）：
+
+```powershell
+$env:AIGIT_SERVER_CMD='D:\project\aigit\c\build\aigit.exe'
+python -X utf8 D:\aigit_mut_tmp\cmp_write_vs_git_c.py
+# 失败 0 / 12 场景（stage/unstage/commit/discard/checkout/commit_crlf/merge_ff/
+# conflict_resolve/commit_large/commit_binary/commit_submodule/commit_mode_bit）
+```
 
 读面退出判据是 275 项「与 git 直接比对」的差分（`cmp_vs_git_c.py`，在
 `D:\aigit_mut_tmp`，不在仓库内）：
@@ -80,6 +103,15 @@ python -X utf8 D:\aigit_mut_tmp\cmp_vs_git_c.py
 6. 符号链接语义未验证：本机建链接需要开发者模式/管理员权限（WinError 1314）。
 7. `net_enabled` 时 C 的 guard 仍塞 `credential.helper=""`/`core.sshCommand=""`，
    接真 https/ssh 远程会拿不到用户凭据（本地路径 remote 无差异）。
+8. 写面 `stage/unstage` 的 spawn 数可能比 Python 多 1（Python 直读 `.git/index`，
+   C 走 `git ls-files`）；响应与副作用相同。
+9. Python 在文件系统异常（unlink/rmdir/listdir 失败）或 body 非法 UTF-8 时可能抛
+   500；C 按「不许 500」一律回 400。未构造稳定 fixture。
+10. commit 失败文案 Python 按**字符**截 400，C 按**字节**截（非 ASCII git 输出时可见）。
+11. **写面无仓锁**：Python 有 per-repo RLock，C 的 HTTP 是多线程；并发写不保证串行
+    （单请求语义已对上，并发写属未测范围）。
+12. 仓内「符号链接→目录」C 一律跳过（Python 当文件链接收下）；目录联接已验证一致，
+    真 symlink 因本机权限（WinError 1314）未验证。
 
 ## 目录
 
