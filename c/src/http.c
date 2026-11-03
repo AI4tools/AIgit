@@ -93,6 +93,57 @@ static int path_eq(const char *path, const char *want) {
     return !strcmp(path, want);
 }
 
+/* 写请求全局串行：Python 的 Repo 有 per-repo RLock（写操作互斥）。
+ * C 按 POST 粒度加锁即可覆盖「写 vs 写」；读请求仍然并发。 */
+static CRITICAL_SECTION g_post_cs;
+static INIT_ONCE g_post_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK post_init_cb(PINIT_ONCE once, PVOID p, PVOID *c) {
+    (void)once; (void)p; (void)c;
+    InitializeCriticalSection(&g_post_cs);
+    return TRUE;
+}
+
+static void route_post(SOCKET s, const char *path, const char *query,
+                       const char *body, size_t body_len) {
+    /* 写端点 */
+    if (write_basic_post(path, query, body, body_len, s)) return;
+    if (write_more_post(path, query, body, body_len, s)) return;
+    if (write_conflict_post(path, query, body, body_len, s)) return;
+    if (write_history_post(path, query, body, body_len, s)) return;
+    if (write_refs_post(path, query, body, body_len, s)) return;
+    if (write_stash_post(path, query, body, body_len, s)) return;
+    /* Python 的 do_POST 先 _body() 再分派：未知路径 + 坏 JSON 也是 400，
+     * 不是 404。这里照同序补上（空 body 视作 {}）。 */
+    {
+        char jerr[256];
+        jnode *b = jparse(body_len ? body : "{}", body_len ? body_len : 2,
+                          jerr, sizeof(jerr));
+        if (!b) {
+            buf m;
+            buf_init(&m);
+            buf_puts(&m, "请求参数不合法:");
+            buf_puts(&m, jerr);
+            http_send_err(s, 400, buf_cstr(&m), NULL);
+            buf_free(&m);
+            return;
+        }
+        if (bjtype(b) != BJ_OBJ) {
+            buf m;
+            buf_init(&m);
+            buf_puts(&m, "请求体必须是 JSON 对象,收到 ");
+            buf_puts(&m, jtype_name(b));
+            http_send_err(s, 400, buf_cstr(&m), NULL);
+            buf_free(&m);
+            jfree(b);
+            return;
+        }
+        jfree(b);
+    }
+    /* 读端点只认 GET（与 Python 版一致：POST 到只读路径 → 404，不是 405） */
+    http_send_err(s, 404, "没有这个接口", NULL);
+}
+
 static void route(SOCKET s, const char *method, const char *path, const char *query,
                   const char *body, size_t body_len) {
     if (!strcmp(method, "GET")) {
@@ -143,42 +194,10 @@ static void route(SOCKET s, const char *method, const char *path, const char *qu
         return;
     }
     if (!strcmp(method, "POST")) {
-        /* 写端点 */
-        if (write_basic_post(path, query, body, body_len, s)) return;
-        if (write_more_post(path, query, body, body_len, s)) return;
-        if (write_conflict_post(path, query, body, body_len, s)) return;
-        if (write_history_post(path, query, body, body_len, s)) return;
-        if (write_refs_post(path, query, body, body_len, s)) return;
-        if (write_stash_post(path, query, body, body_len, s)) return;
-        /* Python 的 do_POST 先 _body() 再分派：未知路径 + 坏 JSON 也是 400，
-         * 不是 404。这里照同序补上（空 body 视作 {}）。 */
-        {
-            char jerr[256];
-            jnode *b = jparse(body_len ? body : "{}", body_len ? body_len : 2,
-                              jerr, sizeof(jerr));
-            if (!b) {
-                buf m;
-                buf_init(&m);
-                buf_puts(&m, "请求参数不合法:");
-                buf_puts(&m, jerr);
-                http_send_err(s, 400, buf_cstr(&m), NULL);
-                buf_free(&m);
-                return;
-            }
-            if (bjtype(b) != BJ_OBJ) {
-                buf m;
-                buf_init(&m);
-                buf_puts(&m, "请求体必须是 JSON 对象,收到 ");
-                buf_puts(&m, jtype_name(b));
-                http_send_err(s, 400, buf_cstr(&m), NULL);
-                buf_free(&m);
-                jfree(b);
-                return;
-            }
-            jfree(b);
-        }
-        /* 读端点只认 GET（与 Python 版一致：POST 到只读路径 → 404，不是 405） */
-        http_send_err(s, 404, "没有这个接口", NULL);
+        InitOnceExecuteOnce(&g_post_once, post_init_cb, NULL, NULL);
+        EnterCriticalSection(&g_post_cs);
+        route_post(s, path, query, body, body_len);
+        LeaveCriticalSection(&g_post_cs);
         return;
     }
     /* PUT / DELETE / PATCH / 其它：405 + Allow（与 Python 版契约一致） */

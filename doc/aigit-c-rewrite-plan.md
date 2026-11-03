@@ -140,7 +140,7 @@ cmake -S c -B c\build-msvc -G Ninja && ninja -C c\build-msvc
 | M2（写面） | **完成** | `cmp_write_vs_git_c.py` **12/12 场景**；3 片写面一致性（stage/unstage/discard/commit 122 项；checkout/branch/merge/reset 93 步 + 28 状态；conflict/* 221 步 + 44 状态） |
 | M3（冲突/历史写） | **完成** | `/api/history/*` 13 个写路由已接：amend/undo/reflog restore 93 次 POST；revert/branch/tag 154 步 + 466 fuzz；stash 103 次 POST，全部 0 失败 |
 | M4（安全面） | 部分 | `paths.c` 已有越界/`.git`/真实路径复查；符号链接受限（本机 WinError 1314），未做句柄级全量对拍 |
-| M5（并发/打包） | **性能预算完成，并发部分** | 28 项预算对 C **28/28 全过**（§12.24）；并发冒烟 12×25=300 请求 0 不一致；并发写仍无仓锁（Python 有 RLock） |
+| M5（并发/打包） | **性能预算完成，并发部分** | 28 项预算对 C **28/28 全过**（§12.24）；POST 全局串行化（并发 8 commit 实测 1×200+7×400，无 5xx）；并发读冒烟 12×25=300 请求 0 不一致 |
 
 读面已完成的边界（与 Python 版仍不同的点）登记在 `c/README.md`「已知差异」，
 主要包括：非 ASCII 数字、超 2^126 饱和、Unicode `strip`/`\w` 近似、非法 UTF-8

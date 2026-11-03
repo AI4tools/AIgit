@@ -115,8 +115,10 @@ python -X utf8 D:\aigit_mut_tmp\cmp_vs_git_c.py
 9. Python 在文件系统异常（unlink/rmdir/listdir 失败）或 body 非法 UTF-8 时可能抛
    500；C 按「不许 500」一律回 400。未构造稳定 fixture。
 10. commit 失败文案 Python 按**字符**截 400，C 按**字节**截（非 ASCII git 输出时可见）。
-11. **写面无仓锁**：Python 有 per-repo RLock，C 的 HTTP 是多线程；并发写不保证串行
-    （单请求语义已对上，并发写属未测范围）。
+11. 写面互斥：C 用一把全局 CRITICAL_SECTION 把 **POST 请求**串行化（覆盖「写 vs 写」）；
+    Python 是 per-repo RLock、锁在方法粒度。单请求语义一致；锁粒度与跨端点的交错
+    顺序不保证完全相同。实测并发 8 次 commit：1×200 + 7×400（nothing to commit），
+    无 5xx、无 index.lock。
 12. 仓内「符号链接→目录」C 一律跳过（Python 当文件链接收下）；目录联接已验证一致，
     真 symlink 因本机权限（WinError 1314）未验证。
 13. `--root` 指向**非仓库目录**时，Python 启动会自动 `git init` 并造一个 sandbox 提交；
