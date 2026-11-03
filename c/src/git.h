@@ -29,6 +29,8 @@ int git_run(const char *const args[], const char *stdin_data, size_t stdin_len,
 
 /* 每请求清零；读计数与子命令串（逗号分隔，顺序同调用顺序）。 */
 void  git_count_reset(void);
+/* 只记一笔调用、不 spawn（能力闸在 fork 之前就记账的路径用）。 */
+void  git_count_note(const char *cmd);
 int   git_calls(void);
 const char *git_cmds(void);
 

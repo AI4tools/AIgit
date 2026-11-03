@@ -134,6 +134,9 @@ static void route(SOCKET s, const char *method, const char *path, const char *qu
         if (read_history_get(path, query, s)) return;
         if (read_history_list_get(path, query, s)) return;
         if (read_conflict_get(path, query, s)) return;
+        if (read_plan_get(path, query, s)) return;
+        if (read_histplan_get(path, query, s)) return;
+        if (read_remoteplan_get(path, query, s)) return;
         http_send_err(s, 404, "没有这个接口", NULL);
         return;
     }

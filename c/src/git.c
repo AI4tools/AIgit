@@ -179,7 +179,7 @@ static DWORD WINAPI reader_thread(LPVOID param) {
 
 static void make_empty_dir(wchar_t *dst, size_t n) {
     wchar_t tmp[MAX_PATH];
-    DWORD len = GetTempPathW(MAX_PATH, tmp);
+    GetTempPathW(MAX_PATH, tmp);
     _snwprintf(dst, n, L"%lsaigit-c-guard-%lu\\hooks", tmp, (unsigned long)GetCurrentProcessId());
     wchar_t parent[MAX_PATH];
     _snwprintf(parent, MAX_PATH, L"%lsaigit-c-guard-%lu", tmp, (unsigned long)GetCurrentProcessId());
@@ -189,7 +189,7 @@ static void make_empty_dir(wchar_t *dst, size_t n) {
 
 static void make_empty_file(wchar_t *dst, size_t n) {
     wchar_t tmp[MAX_PATH];
-    DWORD len = GetTempPathW(MAX_PATH, tmp);
+    GetTempPathW(MAX_PATH, tmp);
     _snwprintf(dst, n, L"%lsaigit-c-guard-%lu\\attributes", tmp, (unsigned long)GetCurrentProcessId());
     HANDLE h = CreateFileW(dst, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, NULL);
@@ -295,6 +295,16 @@ void git_init(const wchar_t *root) {
     if (dbg()) fputs("[c] git_init: guard dirs ok\n", stderr);
     load_semantic();
     if (dbg()) fprintf(stderr, "[c] git_init: semantic keys=%zu\n", g_sem_n);
+}
+
+/* 只记一笔调用、不 spawn —— 与 Python 在能力闸**之前**就记 COUNT_HOOK 的行为对齐。 */
+void git_count_note(const char *cmd) {
+    if (cmd && cmd[0] != '-') {
+        if (!g_cmds_init) { buf_init(&g_cmds); g_cmds_init = 1; }
+        if (g_cmds.n) buf_putc(&g_cmds, ',');
+        buf_puts(&g_cmds, cmd);
+    }
+    g_calls++;
 }
 
 /* ---------------------------------------------------------------- 运行 */

@@ -19,6 +19,14 @@ int read_history_get(const char *path, const char *query, SOCKET s);
 /* 历史清单读：history/{tags,reflog,stashes} */
 int read_history_list_get(const char *path, const char *query, SOCKET s);
 
+/* 计划面：reset/plan、discard/plan */
+int read_plan_get(const char *path, const char *query, SOCKET s);
+
+/* 历史计划：history/stash、history/plan/<mode> */
+int read_histplan_get(const char *path, const char *query, SOCKET s);
+
+/* 远程计划：remote/heads、remote/plan/<mode> */
+int read_remoteplan_get(const char *path, const char *query, SOCKET s);
 /* 冲突/远程读：conflict/{state,list,inspect} / remote/{capability,list,ahead-behind} */
 int read_conflict_get(const char *path, const char *query, SOCKET s);
 

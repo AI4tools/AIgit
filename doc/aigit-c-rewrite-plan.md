@@ -130,6 +130,22 @@ cmake -S c -B c\build-msvc -G Ninja && ninja -C c\build-msvc
 **建议先做 M0+M1**：读面差分是现成的 275 项，能在两周内给出「C 版可信不可信」的硬答案；
 写面和安全面再投入。
 
+### 5.1 实际进度（2026-11-03，[实测]）
+
+| 阶段 | 状态 | 实测依据 |
+|---|---|---|
+| M0 | **完成** | `conformance_m0.py` 9/9；`c/build/aigit.exe` 静态单文件 |
+| M1（读面） | **完成** | Python `do_GET` 的 21 组路由全部接上；`cmp_vs_git_c.py` **275/275**；8 片一致性 **2,442 项全过** |
+| M1.5（直读快路径） | **完成（读面）** | branches/file/diff/conflict/tags/reflog/stashes 均 0 spawn；tags 63.4→1.0ms、reflog 57.5→2.1ms、stashes 57.6→5.4ms（详见 `doc/aigit-perf.md` §12.23） |
+| M2（写面） | 未开始 | 12 场景 / 119 例判据尚未对 C 跑 |
+| M3（冲突/历史写） | 未开始 | 读面已覆盖；写侧 `conflict/{resolve,choose,delete,commit,abort}` 未接 |
+| M4（安全面） | 部分 | `paths.c` 已有越界/`.git`/真实路径复查；符号链接受限（本机 WinError 1314），未做句柄级全量对拍 |
+| M5（并发/打包） | 部分 | 并发冒烟 12×25=300 请求 0 不一致；性能预算 28 项尚未挂到 C；打包仅静态 exe |
+
+读面已完成的边界（与 Python 版仍不同的点）登记在 `c/README.md`「已知差异」，
+主要包括：非 ASCII 数字、超 2^126 饱和、Unicode `strip`/`\w` 近似、非法 UTF-8
+输出透传、以及无符号链接权限导致的未验证项。
+
 ## 6. 风险与取舍（不粉饰）
 
 1. **安全面是最大风险**：Python 版有约 2k 行守卫（路径解析、联接、作用域、索引哨兵）。
