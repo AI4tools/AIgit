@@ -54,6 +54,21 @@ static int env_drop(const wchar_t *entry, size_t keylen) {
     return 0;
 }
 
+/* guarded 模式下我们要自己设的键：父环境里的同名项必须先删掉。
+ * Windows 环境块里同名键并存时子进程取哪个不保证（实测取到父环境那个），
+ * 那会让 GIT_CONFIG_GLOBAL 隔离整个失效。 */
+static int env_overridden(const wchar_t *entry, size_t keylen) {
+    static const wchar_t *own[] = {
+        L"GIT_CONFIG_NOSYSTEM", L"GIT_CONFIG_GLOBAL",
+        L"GIT_TERMINAL_PROMPT", L"GIT_PAGER", L"GIT_EDITOR",
+        L"GIT_SEQUENCE_EDITOR", L"GIT_MERGE_AUTOEDIT",
+        NULL
+    };
+    for (int i = 0; own[i]; i++)
+        if (keylen == wcslen(own[i]) && !_wcsnicmp(entry, own[i], keylen)) return 1;
+    return 0;
+}
+
 /* 构造环境块：父环境（过滤）+ 我们的固定项 + 语义配置 */
 static wchar_t *build_env(int guarded) {
     buf out;                       /* 存 wchar_t，末尾双 NUL */
@@ -65,6 +80,7 @@ static wchar_t *build_env(int guarded) {
         size_t keylen = (size_t)(eq - p);
         if (keylen == 0) continue;                 /* =C:=... 这种伪条目 */
         if (env_drop(p, keylen)) continue;
+        if (guarded && env_overridden(p, keylen)) continue;
         buf_append(&out, p, (wcslen(p) + 1) * sizeof(wchar_t));
     }
     if (parent) FreeEnvironmentStringsW(parent);
@@ -219,19 +235,14 @@ static void load_semantic(void) {
                            CREATE_UNICODE_ENVIRONMENT, env, g_root,
                            &si, &pi)) {
             CloseHandle(wr);
-            wchar_t wtmp[4096];
+            /* git 输出的是 **UTF-8 字节流**，不是 UTF-16。原实现把 got 字节当
+             * wchar_t 数（got/sizeof(wchar_t)）再转 UTF-8，等于把 UTF-8 当 UTF-16，
+             * 结果 semantic keys 永远为 0 —— global/system 里的 core.autocrlf 会丢。
+             * 这里直接按字节累积（下游解析只认 ASCII 的 "key value" 行）。 */
+            char cbuf[4096];
             DWORD got = 0;
-            while (ReadFile(rd, wtmp, sizeof(wtmp), &got, NULL) && got > 0) {
-                int need = WideCharToMultiByte(CP_UTF8, 0, wtmp, (int)(got / sizeof(wchar_t)),
-                                               NULL, 0, NULL, NULL);
-                if (need > 0) {
-                    char *u = xmalloc((size_t)need + 1);
-                    WideCharToMultiByte(CP_UTF8, 0, wtmp, (int)(got / sizeof(wchar_t)),
-                                        u, need, NULL, NULL);
-                    buf_append(&out, u, (size_t)need);
-                    free(u);
-                }
-            }
+            while (ReadFile(rd, cbuf, sizeof(cbuf), &got, NULL) && got > 0)
+                buf_append(&out, cbuf, got);
             WaitForSingleObject(pi.hProcess, 30000);
             DWORD code = 0;
             GetExitCodeProcess(pi.hProcess, &code);

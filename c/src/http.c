@@ -9,6 +9,7 @@
 
 #include "git.h"
 #include "json.h"
+#include "routes.h"
 #include "status.h"
 
 int g_count_on = 0;
@@ -90,7 +91,7 @@ static int path_eq(const char *path, const char *want) {
     return !strcmp(path, want);
 }
 
-static void route(SOCKET s, const char *method, const char *path) {
+static void route(SOCKET s, const char *method, const char *path, const char *query) {
     if (!strcmp(method, "GET")) {
         if (path_eq(path, "/api/health")) {
             buf o;
@@ -128,10 +129,15 @@ static void route(SOCKET s, const char *method, const char *path) {
             buf_free(&o);
             return;
         }
+        if (read_basic_get(path, query, s)) return;
+        if (read_history_get(path, query, s)) return;
+        if (read_history_list_get(path, query, s)) return;
+        if (read_conflict_get(path, query, s)) return;
         http_send_err(s, 404, "没有这个接口", NULL);
         return;
     }
     if (!strcmp(method, "POST")) {
+        /* 读端点只认 GET（与 Python 版一致：POST 到只读路径 → 404，不是 405） */
         http_send_err(s, 404, "没有这个接口", NULL);
         return;
     }
@@ -192,10 +198,11 @@ static void handle_conn(SOCKET s) {
     }
     /* 去掉 query */
     char *qm = strchr(target, '?');
-    if (qm) *qm = 0;
+    const char *query = "";
+    if (qm) { *qm = 0; query = qm + 1; }
 
     git_count_reset();
-    route(s, method, target);
+    route(s, method, target, query);
     buf_free(&req);
 }
 
