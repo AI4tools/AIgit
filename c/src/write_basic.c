@@ -31,6 +31,7 @@
 #include "bodyjson.h"
 #include "git.h"
 #include "http.h"
+#include "indexfile.h"
 #include "json.h"
 #include "paths.h"
 #include "status.h"
@@ -500,8 +501,21 @@ static int run_paths(const char *const head[], const slist *rels, buf *out, buf 
     return rc;
 }
 
-/* Python 的 _tracked_set()：只许问 git。 */
+/* Python 的 _tracked_for_filter()：先读 .git/index；不认识才 spawn ls-files。 */
 static void tracked_set(skset *set, slist *ordered) {
+    idx_names ix;
+    if (idx_read(&ix)) {
+        for (size_t i = 0; i < ix.n; i++) {
+            char *cp = xstrdup(ix.paths[i]);
+            if (ss_add(set, cp)) {
+                if (ordered) sl_push(ordered, xstrdup(cp));
+            } else {
+                free(cp);
+            }
+        }
+        idx_free(&ix);
+        return;
+    }
     const char *args[] = { "ls-files", "-z", NULL };
     buf out, er;
     buf_init(&out);

@@ -1619,7 +1619,73 @@ Python / C 服务，每个端点 3 轮热身 + 30 次采样，取 **p50**；同�
 
 ---
 
+## 12.24 C 版 M2/M3 写面：28 项性能预算实测（当轮二十一，[实测]）
+
+**被测对象**：同一 `aigit.exe`（含 M2/M3 写面）。**方法**：`tools/perf-budget.py`
+的同一 28 项、同一 fixture，只把服务端换成 C（`D:\aigit_mut_tmp\perf_budget_c.py`，
+`AIGIT_SERVER_CMD`）。阈值用的就是本文 §8.1 的既有预算，没有为 C 放宽。
+
+| 操作 | ms | spawn | spawn 预算 | ms 预算 | 结果 |
+|---|---:|---:|---:|---:|---|
+| GET /api/status | 62.2 | 1 | 1 | 100 | ok |
+| GET /api/log | 61.3 | 1 | 1 | 100 | ok |
+| GET /api/branches | 1.2 | 0 | 0 | 100 | ok |
+| GET /api/history/tags | 0.9 | 0 | 0 | 100 | ok |
+| GET /api/history/stashes | 0.7 | 0 | 0 | 100 | ok |
+| GET /api/history/reflog | 11.3 | 0 | 0 | 100 | ok |
+| GET /api/diff | 58.3 | 1 | 1 | 100 | ok |
+| GET /api/file | 2.9 | 0 | 0 | 100 | ok |
+| GET /api/history/blame | 87.0 | 1 | 1 | 100 | ok |
+| GET /api/conflict/state | 0.8 | 0 | 0 | 100 | ok |
+| GET /api/conflict/list | 10.3 | 0 | 0 | 100 | ok |
+| GET /api/remote/capability | 0.5 | 0 | 0 | 100 | ok |
+| GET /api/health | 0.6 | 0 | 0 | 100 | ok |
+| POST /api/stage | 166.9 | 2 | 2 | 170 | ok |
+| POST /api/stage (dirty big) | 135.9 | 2 | 2 | 170 | ok |
+| POST /api/stage (second round) | 122.5 | 2 | 2 | 170 | ok |
+| POST /api/unstage | 143.2 | 2 | 2 | 170 | ok |
+| POST /api/checkout | 143.5 | 2 | 2 | 170 | ok |
+| POST /api/branch | 138.9 | 2 | 2 | 170 | ok |
+| POST /api/merge | 133.3 | 2 | 2 | 170 | ok |
+| POST /api/discard | 68.2 | 1 | 3 | 170 | ok |
+| POST /api/commit | 644.5 | 8 | 8 | 650 | ok |
+| POST /api/stage (no-status) | 105.2 | 1 | 1 | 140 | ok |
+| POST /api/unstage (no-status) | 68.0 | 1 | 1 | 140 | ok |
+| POST /api/checkout (no-status) | 74.3 | 1 | 2 | 140 | ok |
+| POST /api/branch (no-status) | 77.6 | 1 | 1 | 140 | ok |
+| POST /api/discard (no-status) | 70.7 | 1 | 2 | 140 | ok |
+| POST /api/commit (no-status) | 496.1 | 7 | 7 | 600 | ok |
+
+**结果：28/28 在预算内。**
+
+**补快路径前**是 **7 项超**，全部是 spawn 数：
+
+| 项 | 补前 | 补后 |
+|---|---|---|
+| `GET /api/conflict/list`（空清单） | 1 spawn（>0） | **0** |
+| `POST /api/stage` | 3 spawn（>2） | **2** |
+| `POST /api/unstage` | 3 spawn（>2） | **2** |
+| `POST /api/stage (no-status)` | 2 spawn（>1） | **1** |
+| `POST /api/unstage (no-status)` | 2 spawn（>1） | **1** |
+
+做法：新增 `c/src/indexfile.c` 直读 `.git/index`（v2/v3，含 stage 位；v4 /
+split-index / reftable 一律回退），`stage/unstage` 的 tracked 集合不再跑
+`git ls-files`，`conflict/list` 在「索引里没有 stage≠0」时直接返回空清单。
+**补的过程中真踩到一个双重释放**：`ss_add()` 接管字符串所有权，最初把 index
+缓冲区里的指针直接传进去、随后又 `idx_free()` —— 150 个写面用例里 63 个
+`ConnectionReset`。改成传副本后 122/122 恢复。
+
+**边界**：`commit` 644.5ms 距 650ms 预算只剩 5.5ms（8 spawn 的固定成本）；
+预算本身是 Python 版定的，C 版「过预算」只说明没有回退，不代表比 Python 快。
+这些数字同样只代表这台机器与这套 fixture。
+
+---
+
 ## 13. 变更记录
+
+- **v24（2026-11-03 当轮二十一，C 版写面性能预算）**：新增 §12.24。28 项预算对 C 全过；
+  补 `.git/index` 直读后 7 项 spawn 超支归零（stage/unstage 3→2、conflict/list 1→0）。
+  登记补快路径时引入并修复的双重释放。
 
 - **v23（2026-11-03 当轮二十，C 版 M1 读面性能实测）**：新增 §12.23。C 版 17 个读端点
   与 Python 版逐项相等（conformance 395 项 + 275 项 git 差分）；直读快路径让

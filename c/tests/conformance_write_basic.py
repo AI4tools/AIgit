@@ -637,7 +637,8 @@ def run_scenario(name, fixture, steps, git_ops, hook=None):
     sa, sb = state(py), state(cc)
     bad = diff_states(sa, sb)
     raw_only = False
-    if bad == ["index_raw"] and sa["index_norm"] == sb["index_norm"]:
+    # git racily-clean 会把 size 临时抹 0：raw/norm 都可能变，语义相同就不算差异。
+    if set(bad) <= {"index_raw", "index_norm"} and sa["index_sem"] == sb["index_sem"]:
         raw_only = True
         bad = []
     if bad:
@@ -655,7 +656,7 @@ def run_scenario(name, fixture, steps, git_ops, hook=None):
         sg = state(gg)
         bad = diff_states(sa, sg)
         raw_only = False
-        if bad == ["index_raw"] and sa["index_norm"] == sg["index_norm"]:
+        if set(bad) <= {"index_raw", "index_norm"} and sa["index_sem"] == sg["index_sem"]:
             raw_only = True
             bad = []
         if bad:

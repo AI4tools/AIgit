@@ -37,6 +37,7 @@
 
 #include "git.h"
 #include "http.h"
+#include "indexfile.h"
 #include "json.h"
 #include "params.h"
 #include "paths.h"
@@ -1716,6 +1717,15 @@ static int build_file_detail(const char *rel, stpath *st, buf *out, int full) {
 static void conflict_files_json(buf *out, long *count) {
     *count = 0;
     buf_puts(out, "[");
+    /* Python 的空清单快路径：索引里没有 stage≠0 就是空，0 spawn。 */
+    {
+        idx_names ix;
+        if (idx_read(&ix)) {
+            int any = ix.has_unmerged;
+            idx_free(&ix);
+            if (!any) { buf_puts(out, "]"); return; }
+        }
+    }
     size_t nst = 0;
     stpath *st = ls_files_unmerged(NULL, &nst);
     if (nst == 0) {

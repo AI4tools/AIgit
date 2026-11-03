@@ -83,6 +83,9 @@ python -X utf8 D:\aigit_mut_tmp\cmp_write_vs_git_c.py
 # conflict_resolve/commit_large/commit_binary/commit_submodule/commit_mode_bit）
 ```
 
+性能预算 28 项也用同一套阈值跑 C（`perf_budget_c.py`）：**28/28 在预算内**，
+明细见 `doc/aigit-perf.md` §12.24。
+
 读面退出判据是 275 项「与 git 直接比对」的差分（`cmp_vs_git_c.py`，在
 `D:\aigit_mut_tmp`，不在仓库内）：
 
@@ -107,8 +110,8 @@ python -X utf8 D:\aigit_mut_tmp\cmp_vs_git_c.py
 6. 符号链接语义未验证：本机建链接需要开发者模式/管理员权限（WinError 1314）。
 7. `net_enabled` 时 C 的 guard 仍塞 `credential.helper=""`/`core.sshCommand=""`，
    接真 https/ssh 远程会拿不到用户凭据（本地路径 remote 无差异）。
-8. 写面 `stage/unstage` 的 spawn 数可能比 Python 多 1（Python 直读 `.git/index`，
-   C 走 `git ls-files`）；响应与副作用相同。
+8. 性能预算 28 项对 C 全过（`doc/aigit-perf.md` §12.24）；`commit` 距预算上限只剩
+   约 5ms，属于**擦线通过**，不是「比 Python 快」。
 9. Python 在文件系统异常（unlink/rmdir/listdir 失败）或 body 非法 UTF-8 时可能抛
    500；C 按「不许 500」一律回 400。未构造稳定 fixture。
 10. commit 失败文案 Python 按**字符**截 400，C 按**字节**截（非 ASCII git 输出时可见）。
@@ -137,6 +140,7 @@ c/src/
   catfile.c    常驻 git cat-file --batch（不计数，带状态查询）
   bodyjson.c   请求体 JSON 解析（Python json.loads 口径）
   writeutil.c  写端点共用：body 取值 / 统一成功响应（含 status opt-out、E3 兜底）
+  indexfile.c  `.git/index` 直读（tracked 集合、未合并条目判定）
   read_basic.c       branches/log/file/diff
   read_history.c     history/file、history/blame
   read_history_list.c history/tags、reflog、stashes（直读 .git）
