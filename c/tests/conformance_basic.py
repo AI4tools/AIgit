@@ -30,8 +30,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 C_ROOT = os.path.dirname(HERE)                 # ...\c_agent_basic\c
 EXE = os.path.join(C_ROOT, "build", "aigit.exe")
 # Python 参考版：优先找同级仓（...\aigit），否则用绝对路径
-_PY_SIBLING = os.path.join(os.path.dirname(C_ROOT), "server.py")
-PY_ROOT = os.path.dirname(_PY_SIBLING) if os.path.isfile(_PY_SIBLING) else r"D:\project\aigit"
+_PY_SIBLING = os.path.join(os.path.dirname(C_ROOT), "python-ref", "server.py")
+PY_ROOT = os.path.dirname(_PY_SIBLING) if os.path.isfile(_PY_SIBLING) else r"D:\project\aigit\python-ref"
 BASE = os.path.join(os.environ["TEMP"], "aigit_c_basic_%d" % (os.getpid() % 100000))
 
 
@@ -102,6 +102,8 @@ def fx_dirty():
     write(os.path.join(d, "a.txt"), b"a3\nb\n")
     # 未跟踪
     write(os.path.join(d, "u.txt"), b"u\n")
+    # 未跟踪 + 名字带空格：porcelain v2 的 `?` 记录路径必须取到行尾
+    write(os.path.join(d, "untracked space.txt"), b"s\n")
     # 已暂存改名
     must(d, "mv", "sub/b.txt", "sub/c.txt")
     # 工作区删除（索引/HEAD 里还在）

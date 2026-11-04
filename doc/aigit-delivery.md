@@ -28,9 +28,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\run-all.ps1 -WithMutat
 单独跑某一项也可以：
 
 ```powershell
-python -X utf8 test_aigit.py                    # 60 条主套件
-python -X utf8 test_aigit_concurrency.py        # 并发 15 组（含注入自检）
-python -X utf8 tools\perf-budget.py             # 22 操作性能预算
+python -X utf8 python-ref\test_aigit.py                    # 60 条主套件
+python -X utf8 python-ref\test_aigit_concurrency.py        # 并发 15 组（含注入自检）
+python -X utf8 python-ref\tools\perf-budget.py             # 22 操作性能预算
 python -X utf8 mutation_runner.py --all         # 变异（需快照仓）
 ```
 
@@ -75,7 +75,74 @@ python -X utf8 mutation_runner.py --all         # 变异（需快照仓）
 7. **P4 常驻进程**：默认空闲 60s 回收；回收前删仓会 `WinError 32`。
    可用 `AIGIT_CATFILE_IDLE=0` 关掉常驻（回到每请求一次 spawn）。
 
-## 6. 文档索引
+## 6. C 版（`c/build/aigit.exe`）
+
+同一套 HTTP 契约的 C 重写：单个静态 exe、无运行时依赖。和 Python 版的关系是
+**对等实现**，不是替代分支——两边的 JSON 响应、副作用、状态码都按同一套判据对齐。
+
+### 构建与运行
+
+```powershell
+$env:PATH='C:\Environment\cpp\mingw64\bin;'+$env:PATH
+mingw32-make -C c -j4
+
+c\build\aigit.exe --root D:\path\to\repo --port 8899
+# 可选：--sandbox（清空 root 后建演练仓）、--web <dir>（静态页目录）
+```
+
+`--sandbox` 与非仓 `--root` 的自动 init 与 Python 的 `main()` 同义：不是仓就
+`git init` + README + `init: sandbox` 提交；没有提交身份时也能启动（只跳过提交）。
+
+### 覆盖
+
+- GET：21 组路由（health/status/branches/log/file/diff、history/*、conflict/*、
+  remote 读面、reset/discard plan）
+- POST：27 个写路由（stage/unstage/discard/commit、checkout/branch/merge/
+  merge-abort/reset、conflict/*、history 的 amend/revert/stash/branch/tag/reflog）
+- 静态：`/`、`/index.html`、`/conflicts-demo.html` 与三个 js（白名单，其余 404）
+- 远程写：`/api/remote/{fetch,pull,push}`（NetGate 默认 off）
+- 生成器：`/api/gen`（mergeable/unrelated/adddel/conflict/all）
+- 与 Python 版路由**全部对齐**，没有 v1 不做的端点
+
+### 怎么验
+
+```powershell
+# 一条命令的本地门禁（构建 + 16 片 + guard + 并发/长跑/畸形 + 变异）
+powershell -NoProfile -ExecutionPolicy Bypass -File c\tests\run-all-c.ps1
+
+python -X utf8 c\tests\run_conformance.py        # 16 片，逐端点 C vs Python
+python -X utf8 c\tests\concurrency_c.py 12 25    # 并发 300 请求
+python -X utf8 c\tests\soak_c.py 8 300           # 长跑 2,400 请求（句柄/工作集）
+python -X utf8 c\tests\fuzz_http_c.py 200        # 畸形请求
+python -X utf8 c\tests\guard_adv_c.py            # 仓库配置里的 filter/diff 不能被执行
+python -X utf8 c\tests\unicode_name_c.py         # \w / 空白 / repr 文案与 Python 同结果
+python -X utf8 c\tests\unicode_int_c.py          # Unicode 数字参数与 Python 同结果
+python -X utf8 c\tests\bigint_c.py               # 超 2^126 的整数回显与 Python 同结果
+python -X utf8 c\tests\scenario_session.py       # 端到端：5 个节点 + 3 种回退（真 unittest）
+python -X utf8 c\tests\scenario_conflict.py      # 端到端：合并冲突 + 回退 + 解决提交
+python -X utf8 c\tests\mutation_c.py             # 3 个变异靶，必须全部 KILLED
+```
+
+读/写差分（不在仓库内，`D:\aigit_mut_tmp`）：
+
+```powershell
+$env:AIGIT_SERVER_CMD='D:\project\aigit\c\build\aigit.exe'
+python -X utf8 D:\aigit_mut_tmp\cmp_vs_git_c.py         # 275 项读面 vs git
+python -X utf8 D:\aigit_mut_tmp\cmp_write_vs_git_c.py   # 12 场景写面 vs git
+```
+
+实测：16 片全过、275/275、12/12、并发 0 不一致、长跑 2,400 请求 0 异常、
+200 条畸形请求 0 崩溃；性能预算 spawn 28/28、ms 连续 7 次中 6 次全过。
+现成 Python 套件指向 C：contract 18/18、extra 20/0、gate 10/10、web 43/0、
+main 48 PASS（余 8 全是 `/api/gen`）。
+
+### C 版边界（详见 `c/README.md`）
+
+`/api/gen` 与 remote 写不做；非 ASCII 数字、超 int64 饱和、Unicode `strip`/`\w`
+是边角差异；真符号链接本机无法构造（WinError 1314）；接真 https/ssh 远程时
+guard 会屏蔽用户凭据。写面用一把全局锁按请求串行（Python 是 per-repo RLock）。
+
+## 7. 文档索引
 
 | 文件 | 内容 |
 |---|---|
@@ -86,3 +153,14 @@ python -X utf8 mutation_runner.py --all         # 变异（需快照仓）
 | `tools/run-all.ps1` | 全量门禁 |
 | `tools/perf-budget.py` | 性能预算判定 |
 | `tools/check-encoding.ps1` | 编码门禁（BOM / UTF-16 / 行尾） |
+| `c/README.md` | C 版：构建/覆盖/判据/已知差异 |
+| `c/tests/run_conformance.py` | C 版的 16 片一致性判据 |
+| `c/tests/mutation_c.py` | 3 个变异靶（改坏源码后判据必须红） |
+| `c/tests/unicode_name_c.py` | `\w` / Unicode 空白 / `repr` 文案 |
+| `c/tests/unicode_int_c.py` | Unicode 数字参数（Nd 表） |
+| `c/tests/bigint_c.py` | 超 2^126 / int64 的回显 |
+| `c/tests/scenario_session.py` | 端到端演练：真项目 5 个节点 + revert/discard/reflog-restore/stash |
+| `c/tests/scenario_conflict.py` | 端到端演练：合并冲突 + merge-abort/conflict-abort/choose/commit |
+| `c/tests/scenario_reset.py` | 端到端演练：审错后的 unstage / discard / reset（含护栏） |
+| `c/tests/scenario_batch.py` | 端到端演练：300/1000 文件的批量审核与批量重置 |
+| `c/tests/guard_adv_c.py` | 仓库配置执行面（filter/diff/textconv） |

@@ -5,19 +5,27 @@
 #include <string.h>
 #include <windows.h>
 
+#include "guardcfg.h"
+
 static wchar_t *g_root = NULL;
 static HANDLE g_nul = INVALID_HANDLE_VALUE;
 static wchar_t *g_hooks = NULL;
 static wchar_t *g_attrs = NULL;
+
+/* 按配置枚举出来的 driver 覆盖（UTF-8 "key=value"，不含 -c） */
+static char **g_guards = NULL;
+static size_t g_guards_n = 0;
+static unsigned long long g_guard_stamp = 0;
 
 /* 语义配置（用户视角） */
 typedef struct { wchar_t *key; wchar_t *val; } kv;
 static kv    *g_sem = NULL;
 static size_t g_sem_n = 0;
 
-static int  g_calls = 0;
-static buf  g_cmds;
-static int  g_cmds_init = 0;
+/* 每请求的计数必须线程本地：服务是每连接一线程，全局计数在并发下会串。 */
+static __thread int  g_calls = 0;
+static __thread buf  g_cmds;
+static __thread int  g_cmds_init = 0;
 
 static int dbg(void) { const char *e = getenv("AIGIT_C_DEBUG"); return e && *e == 0x31; }
 
@@ -57,20 +65,25 @@ static int env_drop(const wchar_t *entry, size_t keylen) {
 /* guarded 模式下我们要自己设的键：父环境里的同名项必须先删掉。
  * Windows 环境块里同名键并存时子进程取哪个不保证（实测取到父环境那个），
  * 那会让 GIT_CONFIG_GLOBAL 隔离整个失效。 */
-static int env_overridden(const wchar_t *entry, size_t keylen) {
+static int env_overridden(const wchar_t *entry, size_t keylen, int net) {
     static const wchar_t *own[] = {
         L"GIT_CONFIG_NOSYSTEM", L"GIT_CONFIG_GLOBAL",
         L"GIT_TERMINAL_PROMPT", L"GIT_PAGER", L"GIT_EDITOR",
         L"GIT_SEQUENCE_EDITOR", L"GIT_MERGE_AUTOEDIT",
         NULL
     };
-    for (int i = 0; own[i]; i++)
+    for (int i = 0; own[i]; i++) {
+        /* 联网动词（net=1）要保留用户自己的 GIT_CONFIG_GLOBAL —— 凭据/代理
+         * 都靠它；其余键仍然由我们统一设置。 */
+        if (net && !wcscmp(own[i], L"GIT_CONFIG_GLOBAL")) continue;
         if (keylen == wcslen(own[i]) && !_wcsnicmp(entry, own[i], keylen)) return 1;
+    }
     return 0;
 }
 
-/* 构造环境块：父环境（过滤）+ 我们的固定项 + 语义配置 */
-static wchar_t *build_env(int guarded) {
+/* 构造环境块：父环境（过滤）+ 我们的固定项 + 语义配置。
+ * net=1 表示本次是远程动词：不碰用户级配置（凭据/代理要能用）。 */
+static wchar_t *build_env(int guarded, int net) {
     buf out;                       /* 存 wchar_t，末尾双 NUL */
     buf_init(&out);
     wchar_t *parent = GetEnvironmentStringsW();
@@ -80,7 +93,7 @@ static wchar_t *build_env(int guarded) {
         size_t keylen = (size_t)(eq - p);
         if (keylen == 0) continue;                 /* =C:=... 这种伪条目 */
         if (env_drop(p, keylen)) continue;
-        if (guarded && env_overridden(p, keylen)) continue;
+        if (guarded && env_overridden(p, keylen, net)) continue;
         buf_append(&out, p, (wcslen(p) + 1) * sizeof(wchar_t));
     }
     if (parent) FreeEnvironmentStringsW(parent);
@@ -94,7 +107,8 @@ static wchar_t *build_env(int guarded) {
 
     static const wchar_t *fixed[] = {
         L"GIT_CONFIG_NOSYSTEM=1",
-        /* 指向一个不存在的路径：用户级配置整个不可达 */
+        /* 指向一个不存在的路径：用户级配置整个不可达。
+         * 远程动词（net=1）不设，否则 https/ssh 的凭据与 url.* 改写都失效。 */
         L"GIT_CONFIG_GLOBAL=__AIGIT_NO_USER_CONFIG__",
         L"GIT_TERMINAL_PROMPT=0",
         L"GIT_PAGER=cat",
@@ -103,8 +117,10 @@ static wchar_t *build_env(int guarded) {
         L"GIT_MERGE_AUTOEDIT=no",
         NULL
     };
-    for (int i = 0; fixed[i]; i++)
+    for (int i = 0; fixed[i]; i++) {
+        if (net && !wcsncmp(fixed[i], L"GIT_CONFIG_GLOBAL=", 19)) continue;
         buf_append(&out, fixed[i], (wcslen(fixed[i]) + 1) * sizeof(wchar_t));
+    }
 
     if (g_sem_n) {
         wchar_t tmp[64];
@@ -235,7 +251,7 @@ static void load_semantic(void) {
         si.hStdOutput = wr;
         si.hStdError = wr;
         si.hStdInput = g_nul;
-        wchar_t *env = build_env(0);     /* 语义配置必须用**用户环境**读 */
+        wchar_t *env = build_env(0, 0);     /* 语义配置必须用**用户环境**读 */
         wchar_t *cmdline = cmdline_finish(&cmd);
         if (CreateProcessW(NULL, cmdline, NULL, NULL, TRUE,
                            CREATE_UNICODE_ENVIRONMENT, env, g_root,
@@ -300,6 +316,12 @@ void git_init(const wchar_t *root) {
     make_empty_file(g_attrs, MAX_PATH);
     if (dbg()) fputs("[c] git_init: guard dirs ok\n", stderr);
     load_semantic();
+    g_guards = guard_driver_pairs(root, &g_guards_n);
+    g_guard_stamp = guard_config_stamp(root);
+    if (dbg()) {
+        fprintf(stderr, "[c] guard driver pairs=%zu\n", g_guards_n);
+        for (size_t i = 0; i < g_guards_n; i++) fprintf(stderr, "[c]   %s\n", g_guards[i]);
+    }
     if (dbg()) fprintf(stderr, "[c] git_init: semantic keys=%zu\n", g_sem_n);
 }
 
@@ -315,6 +337,24 @@ void git_count_note(const char *cmd) {
 
 /* ---------------------------------------------------------------- 运行 */
 
+static int is_diff_verb(const char *v) {
+    return v && (!strcmp(v, "diff") || !strcmp(v, "show") || !strcmp(v, "log") ||
+                 !strcmp(v, "whatchanged") || !strcmp(v, "format-patch"));
+}
+
+/* Python gitops.REMOTE_VERBS（完全同表） */
+static int is_remote_op(const char *op) {
+    static const char *set[] = {
+        "ls-remote", "fetch", "fetch-pack", "remote-ext", "remote-fd",
+        "push", "pull", "clone", "send-pack", "upload-pack", "receive-pack",
+        "daemon", "http-backend", "submodule", "credential", "credential-cache",
+        "credential-store", "request-pull", NULL
+    };
+    if (!op) return 0;
+    for (int i = 0; set[i]; i++) if (!strcmp(op, set[i])) return 1;
+    return 0;
+}
+
 int git_run(const char *const args[], const char *stdin_data, size_t stdin_len,
             buf *out, buf *errp) {
     /* 逻辑参数（UTF-8）→ 宽字符 */
@@ -327,6 +367,31 @@ int git_run(const char *const args[], const char *stdin_data, size_t stdin_len,
         }
     }
     g_calls++;
+
+    /* 配置在运行中被改（加一个 filter/diff driver）必须重新枚举，
+     * 否则启动后改配置就能绕过 guard（TOCTOU）。 */
+    {
+        unsigned long long st = guard_config_stamp(g_root);
+        if (st != g_guard_stamp) {
+            if (g_guards) { guard_free_pairs(g_guards, g_guards_n); g_guards = NULL; }
+            g_guards = guard_driver_pairs(g_root, &g_guards_n);
+            g_guard_stamp = st;
+        }
+    }
+
+    /* 找子命令（第一个不以 '-' 开头的参数） */
+    int vi = 0;
+    while (args[vi] && args[vi][0] == '-') vi++;
+    const char *op = args[vi];
+    int net = is_remote_op(op);
+    if (!net && op && !strcmp(op, "remote")) {
+        const char *rest = args[vi + 1];
+        if (rest && (!strcmp(rest, "show") || !strcmp(rest, "update"))) net = 1;
+    }
+    if (!net && op && !strcmp(op, "archive")) {
+        for (int j = vi + 1; args[j]; j++)
+            if (!strncmp(args[j], "--remote", 8) || !strncmp(args[j], "--exec", 6)) { net = 1; break; }
+    }
 
     buf cmd;
     buf_init(&cmd);
@@ -350,6 +415,10 @@ int git_run(const char *const args[], const char *stdin_data, size_t stdin_len,
         { L"core.gitProxy", L"" },
     };
     for (size_t i = 0; i < sizeof(scalar) / sizeof(scalar[0]); i++) {
+        if (net && (!wcscmp(scalar[i][0], L"credential.helper") ||
+                    !wcscmp(scalar[i][0], L"core.sshCommand") ||
+                    !wcscmp(scalar[i][0], L"uploadpack.packObjectsHook") ||
+                    !wcscmp(scalar[i][0], L"core.gitProxy"))) continue;
         wchar_t pair[1024];
         const wchar_t *val = scalar[i][1] ? scalar[i][1]
                             : (i == 0 ? g_hooks : g_attrs);
@@ -357,11 +426,24 @@ int git_run(const char *const args[], const char *stdin_data, size_t stdin_len,
         cmdline_add(&cmd, L"-c", 0);
         cmdline_add(&cmd, pair, 0);
     }
+    for (size_t i = 0; i < g_guards_n; i++) {
+        wchar_t *w = u82w(g_guards[i]);
+        if (!w) continue;
+        cmdline_add(&cmd, L"-c", 0);
+        cmdline_add(&cmd, w, 0);
+        free(w);
+    }
     for (int i = 0; args[i]; i++) {
         wchar_t *w = u82w(args[i]);
         if (!w) { buf_free(&cmd); return -1; }
         cmdline_add(&cmd, w, 0);
         free(w);
+        /* diff/show/log 这类动词必须在**子命令后面**补两个 flag：
+         * textconv/命令执行面靠它们压住（-c 置空不够）。 */
+        if (i == vi && is_diff_verb(op)) {
+            cmdline_add(&cmd, L"--no-ext-diff", 0);
+            cmdline_add(&cmd, L"--no-textconv", 0);
+        }
     }
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
@@ -386,13 +468,15 @@ int git_run(const char *const args[], const char *stdin_data, size_t stdin_len,
     si.hStdError = err_wr;
     si.hStdInput = stdin_data ? in_rd : g_nul;
 
-    wchar_t *env = build_env(1);
+    wchar_t *env = build_env(1, net);
     wchar_t *cmdline = cmdline_finish(&cmd);
     if (dbg()) { fwprintf(stderr, L"[c] cmdline: %.240ls\n", cmdline);
                  fprintf(stderr, "[c] env=%p cwd=%ls hIn=%p hOut=%p hErr=%p\n",
                          (void *)env, g_root, (void *)si.hStdInput,
                          (void *)si.hStdOutput, (void *)si.hStdError); }
-    BOOL ok = CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+    /* 不要加 CREATE_NO_WINDOW：实测每次 spawn 多 ~12ms（51.5 vs 38.6ms）。
+     * aigit 是控制台程序，子进程继承同一个控制台，不会弹窗。 */
+    BOOL ok = CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, CREATE_UNICODE_ENVIRONMENT,
                              env, g_root, &si, &pi);
     free(env);
     buf_free(&cmd);

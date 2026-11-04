@@ -42,6 +42,8 @@ int         jbool(const jnode *v);
 int         jis_int(const jnode *v);
 int         jis_float(const jnode *v);
 long long   jint(const jnode *v);
+    /* 超出 int64 时保留的原始字面量；正常范围内返回 NULL。 */
+    const char *jint_lit(const jnode *v);
 double      jfloat(const jnode *v);
 
 size_t      jlen(const jnode *v);          /* arr/obj 的元素数；其它 0 */

@@ -226,8 +226,10 @@ if ($PortNumber -lt 1 -or $PortNumber -gt 65535) {
     )
 }
 
-$server = Join-Path $script:HERE 'server.py'
-if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
+$server = Join-Path $script:HERE 'python-ref\server.py'
+$cserver = Join-Path $script:HERE 'c\build\aigit.exe'
+$useC = Test-Path -LiteralPath $cserver -PathType Leaf
+if (-not $useC -and -not (Test-Path -LiteralPath $server -PathType Leaf)) {
     Stop-Aigit -Title 'server.py not found' -Lines @(
         ("It should be at: {0}" -f $server),
         'Keep aigit.ps1 and server.py in the same folder.'
@@ -237,6 +239,7 @@ if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
 # --------------------------------------------------------------------------- find Python
 
 $pyCmd = @()
+if (-not $useC) {
 if (-not [string]::IsNullOrWhiteSpace($Python)) {
     $p = $Python.Trim()
     if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
@@ -299,6 +302,7 @@ if (-not [string]::IsNullOrWhiteSpace($Python)) {
             )
         )
     }
+}
 }
 
 # --------------------------------------------------------------------------- find git
@@ -410,7 +414,8 @@ if ($pyCmd.Count -gt 1) { $pre = @($pyCmd[1..($pyCmd.Count - 1)]) }
 Write-Host ''
 Write-Host ('-' * 64) -ForegroundColor DarkGray
 Write-Host '  aigit'
-Say-Note ("python    {0}" -f ($pyCmd -join ' '))
+if ($useC) { Say-Note ("server    {0}" -f $cserver) }
+else { Say-Note ("python    {0}" -f ($pyCmd -join ' ')) }
 Say-Note ("repo      {0}" -f $Repo)
 if ($Sandbox) { Say-Note 'mode      sandbox (wiped and rebuilt)' }
 else { Say-Note 'mode      existing repo (mind the Discard button)' }
@@ -420,7 +425,11 @@ Say-Note 'note      no browser is opened; copy the URL above yourself'
 Write-Host ('-' * 64) -ForegroundColor DarkGray
 Write-Host ''
 
-& $exe @pre $server --root $Repo --port $PortNumber @sandboxArg @ServerArgs
+if ($useC) {
+    & $cserver --root $Repo --port $PortNumber @sandboxArg @ServerArgs
+} else {
+    & $exe @pre $server --root $Repo --port $PortNumber @sandboxArg @ServerArgs
+}
 $rc = $LASTEXITCODE
 
 if ($rc -eq 0) {
@@ -431,7 +440,7 @@ if ($rc -eq 0) {
 }
 
 Write-Host ''
-Write-Host ("[error] server.py exited with code {0}." -f $rc) -ForegroundColor Red
+Write-Host ("[error] server exited with code {0}." -f $rc) -ForegroundColor Red
 if ($rc -eq 1) {
     Say-Note 'If the traceback above mentions "Address already in use" or'
     Say-Note '"WinError 10048", the port was taken between the check and the bind.'

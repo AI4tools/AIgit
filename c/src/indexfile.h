@@ -21,4 +21,9 @@ int  idx_read(idx_names *out);
 void idx_free(idx_names *out);
 int  idx_has(const idx_names *ix, const char *path);
 
+/* 直读 .git/HEAD 拿当前 commit sha（不 spawn）。只处理「root/.git 是目录、
+ * 非 reftable、没有 GIT_DIR 改写、ref 是 loose 文件」这几种情况；其余返回
+ * NULL，调用方回退 `git rev-parse HEAD`。 */
+char *head_sha_direct(void);
+
 #endif

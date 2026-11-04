@@ -1,0 +1,8 @@
+# aigit 静态资源白名单（C 版读取；Python 参考版仍用内置表）。
+# 每行：URL <TAB> Content-Type <TAB> 文件名（文件名只能是 web/ 下的单层文件）
+/	text/html; charset=utf-8	index.html
+/index.html	text/html; charset=utf-8	index.html
+/conflicts-demo.html	text/html; charset=utf-8	conflicts-demo.html
+/virtuallist.js	application/javascript; charset=utf-8	virtuallist.js
+/history-panel.js	application/javascript; charset=utf-8	history-panel.js
+/conflicts-panel.js	application/javascript; charset=utf-8	conflicts-panel.js

@@ -32,6 +32,7 @@
  *   * revert 成功响应里的 `mainline` 是**请求体里的原值**（None 或合法 int）。
  */
 #include "routes.h"
+#include "params.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,7 @@
 
 #include "bodyjson.h"
 #include "git.h"
+#include "indexfile.h"
 #include "http.h"
 #include "json.h"
 #include "util.h"
@@ -55,10 +57,6 @@
     "这是仓库里唯一的分支,删掉之后 HEAD 就没有落脚点了。git 本身也会拒绝。"
 
 /* ---------------------------------------------------------------- 响应 */
-
-static void send_400(SOCKET s, const char *msg) {
-    http_send_err(s, 400, msg, NULL);
-}
 
 /* json_str 的「只写转义后的内容、不带引号」版本，且按长度写（错误文案里可能
  * 回显带 NUL 的 sha —— Python 那边 str 能装 NUL，json.dumps 会写成 \u0000）。 */
@@ -143,94 +141,17 @@ static char *py_text(const char *p, size_t n) {
 }
 
 /* 就地 strip（前后都去），返回同一个指针。 */
-static char *py_strip(char *s) {
-    size_t n = strlen(s);
-    size_t a = 0;
-    while (a < n && py_space((unsigned char)s[a])) a++;
-    if (a) memmove(s, s + a, n - a + 1);
-    n -= a;
-    while (n > 0 && py_space((unsigned char)s[n - 1])) s[--n] = 0;
-    return s;
-}
-
 /* UTF-8 解一个码点。非法序列返回 0（Python 侧是 U+FFFD，同样不是 \w）。 */
-static int next_cp(const unsigned char *s, size_t n, size_t *i, unsigned *cp) {
-    unsigned char c = s[*i];
-    if (c < 0x80) { *cp = c; (*i)++; return 1; }
-    int need;
-    unsigned v;
-    if (c >= 0xc2 && c <= 0xdf) { need = 1; v = c & 0x1fu; }
-    else if (c >= 0xe0 && c <= 0xef) { need = 2; v = c & 0x0fu; }
-    else if (c >= 0xf0 && c <= 0xf4) { need = 3; v = c & 0x07u; }
-    else { (*i)++; return 0; }
-    if (*i + (size_t)need >= n) { (*i)++; return 0; }
-    for (int k = 1; k <= need; k++) {
-        unsigned char cc = s[*i + (size_t)k];
-        if ((cc & 0xc0) != 0x80) { (*i)++; return 0; }
-        v = (v << 6) | (cc & 0x3fu);
-    }
-    if ((need == 2 && v < 0x800) || (need == 3 && v < 0x10000) ||
-        (v >= 0xd800 && v <= 0xdfff) || v > 0x10ffff) { (*i)++; return 0; }
-    *i += (size_t)need + 1;
-    *cp = v;
-    return 1;
-}
-
 /* Python 的 `\w`（str 模式，Unicode）：字母/数字/下划线。 */
-static int word_cp(unsigned cp) {
-    if (cp < 0x80)
-        return (cp >= '0' && cp <= '9') || (cp >= 'a' && cp <= 'z') ||
-               (cp >= 'A' && cp <= 'Z') || cp == '_';
-    wchar_t w[2];
-    int n = 0;
-    if (cp <= 0xffff) {
-        w[n++] = (wchar_t)cp;
-    } else {
-        unsigned v = cp - 0x10000;
-        w[n++] = (wchar_t)(0xd800 + (v >> 10));
-        w[n++] = (wchar_t)(0xdc00 + (v & 0x3ff));
-    }
-    WORD t[2] = {0, 0};
-    if (!GetStringTypeW(CT_CTYPE1, w, n, t)) return 0;
-    for (int i = 0; i < n; i++)
-        if (t[i] & (C1_ALPHA | C1_DIGIT)) return 1;
-    return 0;
-}
-
 /* Python `str.strip()` 的空白判定，含非 ASCII 空白（U+00A0 / U+3000 …）。 */
-static int py_space_cp(unsigned cp) {
-    if (cp < 0x80) return py_space((unsigned char)cp);
-    return cp == 0x85 || cp == 0xa0 || cp == 0x1680 ||
-           (cp >= 0x2000 && cp <= 0x200a) || cp == 0x2028 || cp == 0x2029 ||
-           cp == 0x202f || cp == 0x205f || cp == 0x3000;
-}
-
 /* `str.strip()`：按码点去前后空白。返回 malloc 的串，*outn 是长度（可能含 NUL）。 */
-static char *strip_utf8(const char *s, size_t n, size_t *outn) {
-    size_t i = 0, start = 0, end = 0;
-    int seen = 0;
-    while (i < n) {
-        size_t j = i;
-        unsigned cp = 0;
-        if (!next_cp((const unsigned char *)s, n, &j, &cp)) { j = i + 1; cp = 0xfffd; }
-        if (!py_space_cp(cp)) {
-            if (!seen) { start = i; seen = 1; }
-            end = j;
-        }
-        i = j;
-    }
-    if (!seen) { *outn = 0; return xstrdup(""); }
-    *outn = end - start;
-    return xstrndup(s + start, end - start);
-}
-
 /* Python `s[:maxcp]`（按码点截断）。 */
 static char *cut_cp(const char *s, size_t n, size_t maxcp) {
     size_t i = 0, count = 0, end = 0;
     while (i < n && count < maxcp) {
         size_t j = i;
         unsigned cp = 0;
-        if (!next_cp((const unsigned char *)s, n, &j, &cp)) j = i + 1;
+        if (!py_utf8_step((const unsigned char *)s, n, &j, &cp)) j = i + 1;
         i = j;
         count++;
         end = j;
@@ -244,7 +165,7 @@ static size_t cp_count(const char *s, size_t n) {
     while (i < n) {
         size_t j = i;
         unsigned cp = 0;
-        if (!next_cp((const unsigned char *)s, n, &j, &cp)) j = i + 1;
+        if (!py_utf8_step((const unsigned char *)s, n, &j, &cp)) j = i + 1;
         i = j;
         c++;
     }
@@ -253,35 +174,9 @@ static size_t cp_count(const char *s, size_t n) {
 
 /* Python repr 的常用子集（错误文案里的 `%r` 用）。float 单独处理：w_repr 的
  * `%g` 会把 5.0 打成 "5"，而 Python repr 是 "5.0"。 */
-static void repr_value(const jnode *v, buf *o) {
-    if (!v) { buf_puts(o, "None"); return; }
-    if (bjtype(v) == BJ_FLOAT) {
-        double d = jfloat(v);
-        long long ll = (long long)d;
-        if ((double)ll == d && d > -1e16 && d < 1e16) buf_printf(o, "%lld.0", ll);
-        else buf_printf(o, "%g", d);
-        return;
-    }
-    w_repr(v, o);
-}
-
 /* server.py::_bb —— 只认真 bool，其余 400。**不用 writeutil 的 wbody_bool**：
  * 那条对 float 用 w_repr 的 `%g`，`"confirmed": 1.0` 会回 "收到 1"，
  * 而 Python 是 "收到 1.0"。这里按 repr_value 的 float 口径重做一遍。 */
-static int ref_bool(SOCKET s, const jnode *b, const char *key, int dflt, int *out) {
-    const jnode *v = jget(b, key);
-    if (!v) { *out = dflt; return 1; }
-    if (jis_bool(v)) { *out = jbool(v); return 1; }
-    buf m;
-    buf_init(&m);
-    buf_puts(&m, key);
-    buf_puts(&m, " 必须是 true 或 false,收到 ");
-    repr_value(v, &m);
-    send_400(s, buf_cstr(&m));
-    buf_free(&m);
-    return 0;
-}
-
 /* ---------------------------------------------------------------- git 封装 */
 
 /* Python `_out(args, check=False)`：返回 stdout（universal newlines，不 strip）。 */
@@ -468,26 +363,6 @@ static char *subject_of(const char *rev) {
 }
 
 /* parents_of(rev)：`show -s --format=%P` 按空白切。 */
-static char **parents_of(const char *rev, size_t *np) {
-    const char *args[] = { "show", "-s", "--format=%P", rev, NULL };
-    int rc = 0;
-    char *o = run_out(args, &rc);
-    char **v = NULL;
-    size_t n = 0, i = 0, len = strlen(o);
-    while (i < len) {
-        while (i < len && py_space((unsigned char)o[i])) i++;
-        size_t a = i;
-        while (i < len && !py_space((unsigned char)o[i])) i++;
-        if (i > a) {
-            v = xrealloc(v, (n + 1) * sizeof(*v));
-            v[n++] = xstrndup(o + a, i - a);
-        }
-    }
-    free(o);
-    *np = n;
-    return v;
-}
-
 typedef struct {
     char *sha;
     char *author;
@@ -708,7 +583,7 @@ static char *validate_ref_name(SOCKET s, const jnode *v, const char *what) {
         return NULL;
     }
     size_t n = 0;
-    char *name = strip_utf8(jstr(v), jstrlen(v), &n);
+    char *name = py_strip_dup_n(jstr(v), jstrlen(v), &n);
     buf m;
     buf_init(&m);
 
@@ -728,8 +603,8 @@ static char *validate_ref_name(SOCKET s, const jnode *v, const char *what) {
         while (i < n) {
             unsigned cp = 0;
             size_t j = i;
-            if (!next_cp((const unsigned char *)name, n, &j, &cp)) goto regex_bad;
-            if (!(word_cp(cp) || cp == '.' || cp == '/' || cp == '-'))
+            if (!py_utf8_step((const unsigned char *)name, n, &j, &cp)) goto regex_bad;
+            if (!(py_is_word(cp) || cp == '.' || cp == '/' || cp == '-'))
                 goto regex_bad;
             if (++count > 100) goto regex_bad;
             i = j;
@@ -806,10 +681,12 @@ bad:
 }
 
 /* `_check_sha(rev, what)`。成功返回 malloc 的规范化 sha。 */
-static char *check_sha_str(SOCKET s, const char *src, size_t srclen,
-                           const char *what) {
+/* 文本校验（空 / 前导 - / 字符集）。成功返回 malloc 的 rev（调用方 free）；
+ * 失败时已经发过响应，返回 NULL。 */
+static char *sha_trim_validate(SOCKET s, const char *src, size_t srclen,
+                               const char *what) {
     size_t n = 0;
-    char *rev = strip_utf8(src, srclen, &n);
+    char *rev = py_strip_dup_n(src, srclen, &n);
     buf m;
     buf_init(&m);
 
@@ -846,35 +723,112 @@ static char *check_sha_str(SOCKET s, const char *src, size_t srclen,
             return NULL;
         }
     }
-    {
-        buf spec;
-        buf_init(&spec);
-        buf_append(&spec, rev, n);
-        buf_puts(&spec, "^{commit}");
-        char *sha = rev_parse(buf_cstr(&spec));
-        buf_free(&spec);
-        if (!sha) {
-            buf pre;
-            buf_init(&pre);
-            buf_puts(&pre, "解析不了这个");
-            buf_puts(&pre, what);
-            buf_puts(&pre, ":");
-            send_hist3(s, buf_cstr(&pre), rev, n, "", "bad_rev");
-            buf_free(&pre);
-            buf_free(&m);
-            free(rev);
-            return NULL;
-        }
-        buf_free(&m);
-        free(rev);
-        return sha;
-    }
+    buf_free(&m);
+    return rev;
 
 bad:
     send_hist(s, buf_cstr(&m), "bad_rev", NULL);
     buf_free(&m);
     free(rev);
     return NULL;
+}
+
+/* 「解析不了这个 ref」的统一文案。 */
+static void send_bad_parse(SOCKET s, const char *rev, const char *what) {
+    buf pre;
+    buf_init(&pre);
+    buf_puts(&pre, "解析不了这个");
+    buf_puts(&pre, what);
+    buf_puts(&pre, ":");
+    send_hist3(s, buf_cstr(&pre), rev, strlen(rev), "", "bad_rev");
+    buf_free(&pre);
+}
+
+static char *check_sha_str(SOCKET s, const char *src, size_t srclen,
+                           const char *what) {
+    char *rev = sha_trim_validate(s, src, srclen, what);
+    if (!rev) return NULL;
+    buf spec;
+    buf_init(&spec);
+    buf_append(&spec, rev, strlen(rev));
+    buf_puts(&spec, "^{commit}");
+    char *sha = rev_parse(buf_cstr(&spec));
+    buf_free(&spec);
+    if (!sha) {
+        send_bad_parse(s, rev, what);
+        free(rev);
+        return NULL;
+    }
+    free(rev);
+    return sha;
+}
+
+/* revert 专用：一次 `git show -s --format=%H %P <rev>^{commit}` 同时拿完整 sha
+ * 与父提交（省掉一次 spawn）。错误文案与 check_sha_str 逐字相同。 */
+static char *check_sha_and_parents(SOCKET s, const jnode *v, const char *what,
+                                   char ***pars_out, size_t *npar_out) {
+    *pars_out = NULL;
+    *npar_out = 0;
+    if (!v || !jis_str(v)) {
+        buf m;
+        buf_init(&m);
+        buf_puts(&m, what);
+        buf_puts(&m, "不能为空");
+        send_hist(s, buf_cstr(&m), "bad_rev", NULL);
+        buf_free(&m);
+        return NULL;
+    }
+    char *rev = sha_trim_validate(s, jstr(v), jstrlen(v), what);
+    if (!rev) return NULL;
+
+    buf spec;
+    buf_init(&spec);
+    buf_append(&spec, rev, strlen(rev));
+    buf_puts(&spec, "^{commit}");
+    const char *args[] = { "show", "-s", "--format=%H %P", buf_cstr(&spec), NULL };
+    int rc = 0;
+    char *o = run_out(args, &rc);
+    buf_free(&spec);
+    if (rc != 0) {
+        free(o);
+        send_bad_parse(s, rev, what);
+        free(rev);
+        return NULL;
+    }
+    py_strip(o);
+
+    char *full = NULL;
+    char **pars = NULL;
+    size_t npar = 0, i = 0, len = strlen(o);
+    while (i < len) {
+        while (i < len && py_space((unsigned char)o[i])) i++;
+        size_t a = i;
+        while (i < len && !py_space((unsigned char)o[i])) i++;
+        if (i == a) break;
+        if (!full) {
+            full = xstrndup(o + a, i - a);
+        } else {
+            pars = xrealloc(pars, (npar + 1) * sizeof(*pars));
+            pars[npar++] = xstrndup(o + a, i - a);
+        }
+    }
+    free(o);
+    if (!full) {
+        free_strv(pars, npar);
+        send_bad_parse(s, rev, what);
+        free(rev);
+        return NULL;
+    }
+    free(rev);
+    *pars_out = pars;
+    *npar_out = npar;
+    return full;
+}
+
+/* 读 HEAD 的 sha：优先直读 .git/HEAD（0 次 spawn），失败回退 rev-parse。 */
+static char *head_sha_fast(void) {
+    char *s = head_sha_direct();
+    return s ? s : head_sha();
 }
 
 /* 请求体里的 rev（`_check_sha(b.get(..))` 那一档）。 */
@@ -1007,16 +961,16 @@ static int do_revert_abort(SOCKET s) {
 static int do_revert(SOCKET s, const jnode *b) {
     int no_edit = 1;
     /* 参数求值顺序：`_bb(b, "no_edit", True)` 在进 do_revert 之前就求值了。 */
-    if (!ref_bool(s, b, "no_edit", 1, &no_edit)) return 1;
+    if (!wbody_bool(s, b, "no_edit", 1, &no_edit)) return 1;
     if (!require_repo(s)) return 1;
 
     const jnode *sv = jget(b, "sha");
     const jnode *mv = jget(b, "mainline");
-    char *real = check_sha(s, sv, "提交");
-    if (!real) return 1;
-
+    /* 一次 git show 同时拿 sha 与 parents（原来是 rev-parse + show 两次） */
     size_t npar = 0;
-    char **pars = parents_of(real, &npar);
+    char **pars = NULL;
+    char *real = check_sha_and_parents(s, sv, "提交", &pars, &npar);
+    if (!real) return 1;
 
     int have_ml = !(!mv || bjtype(mv) == BJ_NULL);
     buf blocker;
@@ -1145,7 +1099,7 @@ static int do_revert(SOCKET s, const jnode *b) {
         return 1;
     }
 
-    char *new_head = head_sha();
+    char *new_head = head_sha_fast();
     char *s8 = xstrndup(real, strlen(real) < 8 ? strlen(real) : 8);
     buf o;
     buf_init(&o);
@@ -1174,7 +1128,7 @@ static int do_revert(SOCKET s, const jnode *b) {
 
 static int do_branch_rename(SOCKET s, const jnode *b) {
     int confirmed = 0;
-    if (!ref_bool(s, b, "confirmed", 0, &confirmed)) return 1;
+    if (!wbody_bool(s, b, "confirmed", 0, &confirmed)) return 1;
     if (!confirmed) { send_needs_confirm(s, "rename-branch"); return 1; }
 
     if (!require_repo(s)) return 1;
@@ -1259,8 +1213,8 @@ static int do_branch_rename(SOCKET s, const jnode *b) {
 static int do_branch_delete(SOCKET s, const jnode *b) {
     int force = 0, confirmed = 0;
     /* 参数求值顺序：force 先，confirmed 后。 */
-    if (!ref_bool(s, b, "force", 0, &force)) return 1;
-    if (!ref_bool(s, b, "confirmed", 0, &confirmed)) return 1;
+    if (!wbody_bool(s, b, "force", 0, &force)) return 1;
+    if (!wbody_bool(s, b, "confirmed", 0, &confirmed)) return 1;
     if (!confirmed) { send_needs_confirm(s, "delete-branch"); return 1; }
 
     if (!require_repo(s)) return 1;
@@ -1458,7 +1412,7 @@ static int tag_exists(const char *name) {
 static int do_tag_create(SOCKET s, const jnode *b) {
     int force = 0;
     /* 参数求值顺序：`_bb(b, "force")` 先于进 do_tag_create。 */
-    if (!ref_bool(s, b, "force", 0, &force)) return 1;
+    if (!wbody_bool(s, b, "force", 0, &force)) return 1;
     if (!require_repo(s)) return 1;
     if (!require_commits(s, "打标签")) return 1;
 
@@ -1541,7 +1495,7 @@ static int do_tag_create(SOCKET s, const jnode *b) {
 
 static int do_tag_delete(SOCKET s, const jnode *b) {
     int confirmed = 0;
-    if (!ref_bool(s, b, "confirmed", 0, &confirmed)) return 1;
+    if (!wbody_bool(s, b, "confirmed", 0, &confirmed)) return 1;
     if (!confirmed) { send_needs_confirm(s, "tag-delete"); return 1; }
 
     if (!require_repo(s)) return 1;

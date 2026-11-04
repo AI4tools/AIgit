@@ -27,6 +27,7 @@
  *   * hard 在 `git reset --hard` 之后还要 `git clean -fd`（check=False）。
  */
 #include "routes.h"
+#include "params.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,62 +87,10 @@ static char *py_text(const char *p, size_t n) {
 }
 
 /* 就地 strip（前后都去），返回同一个指针。 */
-static char *py_strip(char *s) {
-    size_t n = strlen(s);
-    size_t a = 0;
-    while (a < n && py_space((unsigned char)s[a])) a++;
-    if (a) memmove(s, s + a, n - a + 1);
-    n -= a;
-    while (n > 0 && py_space((unsigned char)s[n - 1])) s[--n] = 0;
-    return s;
-}
-
 /* ---------------------------------------------------------------- 名字校验 */
 
 /* UTF-8 解一个码点。非法序列返回 0（Python 侧是 U+FFFD，同样不是 \w）。 */
-static int next_cp(const unsigned char *s, size_t n, size_t *i, unsigned *cp) {
-    unsigned char c = s[*i];
-    if (c < 0x80) { *cp = c; (*i)++; return 1; }
-    int need;
-    unsigned v;
-    if (c >= 0xc2 && c <= 0xdf) { need = 1; v = c & 0x1fu; }
-    else if (c >= 0xe0 && c <= 0xef) { need = 2; v = c & 0x0fu; }
-    else if (c >= 0xf0 && c <= 0xf4) { need = 3; v = c & 0x07u; }
-    else { (*i)++; return 0; }
-    if (*i + (size_t)need >= n) { (*i)++; return 0; }
-    for (int k = 1; k <= need; k++) {
-        unsigned char cc = s[*i + (size_t)k];
-        if ((cc & 0xc0) != 0x80) { (*i)++; return 0; }
-        v = (v << 6) | (cc & 0x3fu);
-    }
-    if ((need == 2 && v < 0x800) || (need == 3 && v < 0x10000) ||
-        (v >= 0xd800 && v <= 0xdfff) || v > 0x10ffff) { (*i)++; return 0; }
-    *i += (size_t)need + 1;
-    *cp = v;
-    return 1;
-}
-
 /* Python 的 `\w`（str 模式，Unicode）：字母/数字/下划线。 */
-static int word_cp(unsigned cp) {
-    if (cp < 0x80)
-        return (cp >= '0' && cp <= '9') || (cp >= 'a' && cp <= 'z') ||
-               (cp >= 'A' && cp <= 'Z') || cp == '_';
-    wchar_t w[2];
-    int n = 0;
-    if (cp <= 0xffff) {
-        w[n++] = (wchar_t)cp;
-    } else {
-        unsigned v = cp - 0x10000;
-        w[n++] = (wchar_t)(0xd800 + (v >> 10));
-        w[n++] = (wchar_t)(0xdc00 + (v & 0x3ff));
-    }
-    WORD t[2] = {0, 0};
-    if (!GetStringTypeW(CT_CTYPE1, w, n, t)) return 0;
-    for (int i = 0; i < n; i++)
-        if (t[i] & (C1_ALPHA | C1_DIGIT)) return 1;
-    return 0;
-}
-
 /* `_BRANCH_RE = [\w][\w./-]{0,99}` 的 fullmatch。 */
 static int branch_name_ok(const char *s, size_t n) {
     if (!s || n == 0) return 0;
@@ -150,8 +99,8 @@ static int branch_name_ok(const char *s, size_t n) {
     int first = 1;
     while (i < n) {
         unsigned cp = 0;
-        if (!next_cp((const unsigned char *)s, n, &i, &cp)) return 0;
-        int ok = word_cp(cp);
+        if (!py_utf8_step((const unsigned char *)s, n, &i, &cp)) return 0;
+        int ok = py_is_word(cp);
         if (!ok && !first)
             ok = (cp == '.' || cp == '/' || cp == '-');
         if (!ok) return 0;
@@ -169,13 +118,13 @@ static int ref_name_ok(const char *ref, size_t n) {
     int first = 1;
     while (i < n) {
         unsigned cp = 0;
-        if (!next_cp((const unsigned char *)ref, n, &i, &cp)) return 0;
+        if (!py_utf8_step((const unsigned char *)ref, n, &i, &cp)) return 0;
         int ok;
         if (first) {
-            ok = word_cp(cp) || cp == '@' || cp == '^' || cp == '~';
+            ok = py_is_word(cp) || cp == '@' || cp == '^' || cp == '~';
             first = 0;
         } else {
-            ok = word_cp(cp) || cp == '@' || cp == '^' || cp == '~' ||
+            ok = py_is_word(cp) || cp == '@' || cp == '^' || cp == '~' ||
                  cp == '{' || cp == '}' || cp == '+' || cp == '.' ||
                  cp == '/' || cp == '-';
         }
@@ -187,38 +136,19 @@ static int ref_name_ok(const char *ref, size_t n) {
 }
 
 /* Python `str.strip()` 的空白判定，含非 ASCII 空白（U+00A0 / U+3000 …）。 */
-static int py_space_cp(unsigned cp) {
-    if (cp < 0x80) return py_space((unsigned char)cp);
-    return cp == 0x85 || cp == 0xa0 || cp == 0x1680 ||
-           (cp >= 0x2000 && cp <= 0x200a) || cp == 0x2028 || cp == 0x2029 ||
-           cp == 0x202f || cp == 0x205f || cp == 0x3000;
-}
-
 /* 整个串是不是「只有空白」（空串也算）—— 对位 `not name.strip()`。 */
 static int all_space_utf8(const char *s, size_t n) {
     size_t i = 0;
     while (i < n) {
         unsigned cp = 0;
-        if (!next_cp((const unsigned char *)s, n, &i, &cp)) return 0;
-        if (!py_space_cp(cp)) return 0;
+        if (!py_utf8_step((const unsigned char *)s, n, &i, &cp)) return 0;
+        if (!py_is_space_cp(cp)) return 0;
     }
     return 1;
 }
 
 /* Python repr 的常用子集（错误文案里的 `%r` 用）。float 单独处理：
  * w_repr 的 `%g` 会把 5.0 打成 "5"，而 Python repr 是 "5.0"。 */
-static void repr_value(const jnode *v, buf *o) {
-    if (!v) { buf_puts(o, "None"); return; }
-    if (bjtype(v) == BJ_FLOAT) {
-        double d = jfloat(v);
-        long long ll = (long long)d;
-        if ((double)ll == d && d > -1e16 && d < 1e16) buf_printf(o, "%lld.0", ll);
-        else buf_printf(o, "%g", d);
-        return;
-    }
-    w_repr(v, o);
-}
-
 /* ---------------------------------------------------------------- git 封装 */
 
 /* Python `(p.stderr or p.stdout or "git 失败").strip()`，含 universal newlines。 */
@@ -304,7 +234,7 @@ static int utf8_ok(const char *s, size_t n) {
     size_t i = 0;
     while (i < n) {
         unsigned cp = 0;
-        if (!next_cp((const unsigned char *)s, n, &i, &cp)) return 0;
+        if (!py_utf8_step((const unsigned char *)s, n, &i, &cp)) return 0;
     }
     return 1;
 }
@@ -587,7 +517,7 @@ static int do_reset(SOCKET s, const jnode *b) {
         buf m;
         buf_init(&m);
         buf_puts(&m, MODE_HINT);
-        repr_value(mv, &m);
+        w_repr(mv, &m);
         send_400(s, buf_cstr(&m));
         buf_free(&m);
         return 1;

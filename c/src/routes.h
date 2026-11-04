@@ -13,6 +13,10 @@
 /* 基础读：branches / log / file / diff */
 int read_basic_get(const char *path, const char *query, SOCKET s);
 
+/* POST 里的读端点（C 的超集）：目前只有批量 diff。 */
+int read_basic_post(const char *path, const char *body, size_t body_len,
+                    SOCKET s);
+
 /* 历史读：history/{file,blame,tags,reflog,stashes} */
 int read_history_get(const char *path, const char *query, SOCKET s);
 
@@ -53,5 +57,13 @@ int write_refs_post(const char *path, const char *query, const char *body,
 /* stash 写：history/stash、stash apply/pop/drop */
 int write_stash_post(const char *path, const char *query, const char *body,
                      size_t body_len, SOCKET s);
+
+/* gen：/api/gen（随机测试数据生成器） */
+int gen_post(const char *path, const char *query, const char *body,
+             size_t body_len, SOCKET s);
+
+/* 远程写：remote/{fetch,pull,push} */
+int write_remote_post(const char *path, const char *query, const char *body,
+                      size_t body_len, SOCKET s);
 
 #endif

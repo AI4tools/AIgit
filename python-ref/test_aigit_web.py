@@ -38,7 +38,7 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-WEB = HERE / "web"
+WEB = HERE.parent / "web"
 TARGETS = ["index.html", "conflicts-demo.html", "virtuallist.js"]
 
 # NTFS 禁止 < > : " / \ | ? * ,所以这些 payload 只能走 query string,

@@ -8,6 +8,7 @@
 #include "git.h"
 #include "http.h"
 #include "json.h"
+#include "params.h"
 #include "status.h"
 
 static void send_bad(SOCKET s, const char *msg) {
@@ -44,43 +45,71 @@ jnode *wbody_parse(SOCKET s, const char *body, size_t len) {
     return v;
 }
 
-static void repr_float(double d, buf *out) {
-    if (isnan(d)) { buf_puts(out, "nan"); return; }
-    if (isinf(d)) { buf_puts(out, d > 0 ? "inf" : "-inf"); return; }
-    char t[64];
-    for (int p = 1; p <= 17; p++) {
-        snprintf(t, sizeof(t), "%.*g", p, d);
-        if (strtod(t, NULL) == d) break;
+static void repr_float(double x, buf *out) {
+    if (isnan(x)) { buf_puts(out, "nan"); return; }
+    if (isinf(x)) { buf_puts(out, x < 0 ? "-inf" : "inf"); return; }
+    int neg = signbit(x) ? 1 : 0;
+    double a = neg ? -x : x;
+    if (a == 0.0) { buf_puts(out, neg ? "-0.0" : "0.0"); return; }
+
+    /* 最短可回读的有效数字 */
+    char sci[64];
+    int p;
+    for (p = 1; p <= 17; p++) {
+        snprintf(sci, sizeof(sci), "%.*e", p - 1, a);
+        if (strtod(sci, NULL) == a) break;
     }
-    /* Python 的 repr 对整数值浮点保留 .0；指数形式保持 %g 的 e+XX */
-    if (!strchr(t, '.') && !strchr(t, 'e') && !strchr(t, 'E')) {
-        size_t n = strlen(t);
-        if (n + 3 < sizeof(t)) { t[n] = '.'; t[n + 1] = '0'; t[n + 2] = 0; }
+    if (p > 17) snprintf(sci, sizeof(sci), "%.17e", a);
+
+    char digits[32];
+    int nd = 0, E = 0;
+    const char *q = sci;
+    while (*q && *q != 'e' && *q != 'E') {
+        if (*q >= '0' && *q <= '9' && nd < (int)sizeof(digits) - 1)
+            digits[nd++] = *q;
+        q++;
     }
-    buf_puts(out, t);
+    digits[nd] = 0;
+    if (*q == 'e' || *q == 'E') E = atoi(q + 1);
+
+    if (neg) buf_putc(out, '-');
+    int decpt = E + 1;
+    if (E >= -4 && E < 16) {                 /* Python: 定点 */
+        if (decpt <= 0) {
+            buf_puts(out, "0.");
+            for (int k = 0; k < -decpt; k++) buf_putc(out, '0');
+            buf_puts(out, digits);
+        } else if (decpt >= nd) {
+            buf_puts(out, digits);
+            for (int k = nd; k < decpt; k++) buf_putc(out, '0');
+            buf_puts(out, ".0");
+        } else {
+            buf_append(out, digits, (size_t)decpt);
+            buf_putc(out, '.');
+            buf_puts(out, digits + decpt);
+        }
+    } else {                                  /* Python: 科学计数 */
+        buf_putc(out, digits[0]);
+        if (nd > 1) { buf_putc(out, '.'); buf_puts(out, digits + 1); }
+        buf_printf(out, "e%c%02d", E < 0 ? '-' : '+', E < 0 ? -E : E);
+    }
 }
 
 void w_repr(const jnode *v, buf *out) {
     switch (bjtype(v)) {
     case BJ_NULL: buf_puts(out, "None"); break;
     case BJ_BOOL: buf_puts(out, jbool(v) ? "True" : "False"); break;
-    case BJ_INT: buf_printf(out, "%lld", jint(v)); break;
+    case BJ_INT: {
+        const char *lit = jint_lit(v);
+        char *c = lit ? py_int_canon(lit) : NULL;
+        if (c) buf_puts(out, c);
+        else buf_printf(out, "%lld", jint(v));
+        free(c);
+        break;
+    }
     case BJ_FLOAT: repr_float(jfloat(v), out); break;
     case BJ_STR: {
-        buf_putc(out, '\'');
-        const unsigned char *p = (const unsigned char *)jstr(v);
-        size_t n = jstrlen(v);
-        for (size_t i = 0; i < n; i++) {
-            unsigned char c = p[i];
-            if (c == '\\') buf_puts(out, "\\\\");
-            else if (c == '\'') buf_puts(out, "\\'");
-            else if (c == '\n') buf_puts(out, "\\n");
-            else if (c == '\r') buf_puts(out, "\\r");
-            else if (c == '\t') buf_puts(out, "\\t");
-            else if (c < 0x20 || c == 0x7f) buf_printf(out, "\\x%02x", c);
-            else buf_append(out, (const char *)&p[i], 1);
-        }
-        buf_putc(out, '\'');
+        py_repr_str(out, jstr(v), jstrlen(v));
         break;
     }
     case BJ_ARR:
@@ -117,10 +146,8 @@ int wbody_int(SOCKET s, const jnode *b, const char *key, long long dflt, long lo
     if (jis_int(v)) { *out = jint(v); return 1; }
     if (jis_float(v)) { *out = (long long)jfloat(v); return 1; }
     if (jis_str(v)) {
-        const char *t = jstr(v);
-        char *end = NULL;
-        long long x = strtoll(t, &end, 10);
-        if (end && *end == 0 && end != t) { *out = x; return 1; }
+        long long x = 0;
+        if (py_int_parse(jstr(v), &x)) { *out = x; return 1; }
     }
     buf m;
     buf_init(&m);

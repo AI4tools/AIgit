@@ -40,6 +40,7 @@
 #include "git.h"
 #include "http.h"
 #include "json.h"
+#include "params.h"
 #include "util.h"
 
 /* ================================================================ 小工具 */
@@ -50,11 +51,7 @@ static int rp_is_ws(int c) {
 
 /* Python 的 str.strip()（ASCII 空白口径，够用：git 输出与参数都是这个范围）。 */
 static char *rp_strip_dup(const char *s) {
-    if (!s) return NULL;
-    while (*s && rp_is_ws((unsigned char)*s)) s++;
-    size_t n = strlen(s);
-    while (n && rp_is_ws((unsigned char)s[n - 1])) n--;
-    return xstrndup(s, n);
+    return py_strip_dup(s);
 }
 
 /* Python 的 universal newlines：\r\n 与 \r 都变 \n。 */
@@ -76,76 +73,22 @@ static char *rp_normalize_newlines(const char *s, size_t n) {
 
 /* Python repr(str) 的近似（错误文案里的 %r），支持内嵌 NUL。 */
 static char *rp_py_repr_n(const char *s, size_t n) {
-    char quote = '\'';
-    if (memchr(s, '\'', n) && !memchr(s, '"', n)) quote = '"';
-    buf b;
-    buf_init(&b);
-    buf_putc(&b, quote);
-    for (size_t i = 0; i < n; i++) {
-        unsigned c = (unsigned char)s[i];
-        if (c == (unsigned char)quote || c == '\\') {
-            buf_putc(&b, '\\');
-            buf_putc(&b, (char)c);
-        } else if (c == '\n') buf_puts(&b, "\\n");
-        else if (c == '\r') buf_puts(&b, "\\r");
-        else if (c == '\t') buf_puts(&b, "\\t");
-        else if (c < 0x20 || c == 0x7f) buf_printf(&b, "\\x%02x", c);
-        else buf_putc(&b, (char)c);
-    }
-    buf_putc(&b, quote);
-    char *r = xstrdup(buf_cstr(&b));
-    buf_free(&b);
-    return r;
+    return py_repr_n(s, n);
 }
 
 static char *rp_py_repr(const char *s) { return rp_py_repr_n(s, strlen(s)); }
 
-static int rp_hexval(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
 /* query 参数解码：保留内嵌 NUL（Python 的 parse_qs 也不截断，名字校验会
  * 把它按 %r 打出来）。返回 1=找到 0=没有 -1=值过大。 */
 static int rp_q_raw(const char *query, const char *key, char **out, size_t *outlen) {
-    *out = NULL;
-    *outlen = 0;
-    if (!query || !key) return 0;
-    size_t klen = strlen(key);
-    const char *p = query;
-    while (p && *p) {
-        const char *amp = strchr(p, '&');
-        const char *end = amp ? amp : p + strlen(p);
-        const char *eq = memchr(p, '=', (size_t)(end - p));
-        size_t this_klen = eq ? (size_t)(eq - p) : (size_t)(end - p);
-        if (this_klen == klen && !strncmp(p, key, klen)) {
-            const char *v = eq ? eq + 1 : end;
-            buf b;
-            buf_init(&b);
-            for (const char *q = v; q < end; q++) {
-                char c = *q;
-                if (c == '+') c = ' ';
-                else if (c == '%' && q + 2 < end) {
-                    int h = rp_hexval(q[1]), l = rp_hexval(q[2]);
-                    if (h >= 0 && l >= 0) { c = (char)((h << 4) | l); q += 2; }
-                }
-                buf_putc(&b, c);
-                if (b.n > 65536) { buf_free(&b); return -1; }
-            }
-            buf_reserve(&b, 0);
-            *outlen = b.n;
-            char *res = xmalloc(b.n + 1);
-            if (b.n) memcpy(res, b.p, b.n);
-            res[b.n] = 0;
-            *out = res;
-            buf_free(&b);
-            return 1;
-        }
-        p = amp ? amp + 1 : NULL;
+    int r = q_get_n(query, key, out, outlen);
+    if (r == 1 && *outlen > 65536) {
+        free(*out);
+        *out = NULL;
+        *outlen = 0;
+        return -1;
     }
-    return 0;
+    return r;
 }
 
 static void rp_j_bool(buf *o, int v) { buf_puts(o, v ? "true" : "false"); }
@@ -292,15 +235,13 @@ static int rp_check_ref_n(const char *ref, size_t n, const char *what,
         buf_free(&b);
         return 0;
     }
-    for (size_t i = 0; i < n; i++) {
-        if (rp_is_ws((unsigned char)ref[i]) || (unsigned char)ref[i] < 0x20) {
-            char *rp = rp_py_repr_n(ref, n);
-            buf_printf(&b, "%s 不能含空白或控制字符:%s", what, rp);
-            free(rp);
-            *msg = xstrdup(buf_cstr(&b));
-            buf_free(&b);
-            return 0;
-        }
+    if (py_has_space_or_ctrl(ref, n)) {
+        char *rp = rp_py_repr_n(ref, n);
+        buf_printf(&b, "%s 不能含空白或控制字符:%s", what, rp);
+        free(rp);
+        *msg = xstrdup(buf_cstr(&b));
+        buf_free(&b);
+        return 0;
     }
     int ok = 0;
     if (n >= 11 && !strncmp(ref, "refs/heads/", 11)) ok = rp_ref_body_ok(ref + 11, n - 11);

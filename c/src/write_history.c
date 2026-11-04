@@ -30,6 +30,7 @@
  *     原样留下（响应里的 `unstaged_kept` 就是它们）。
  */
 #include "routes.h"
+#include "params.h"
 
 #include <ctype.h>
 #include <float.h>
@@ -49,21 +50,14 @@
 
 /* ================================================================ 小工具 */
 
-static int is_ws(int c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
-}
-
 /* Python 的 str.strip()：就地截断尾部空白，返回跳过前导空白后的指针。 */
 static char *strip(char *s) {
-    while (*s && is_ws((unsigned char)*s)) s++;
-    size_t n = strlen(s);
-    while (n && is_ws((unsigned char)s[n - 1])) s[--n] = 0;
-    return s;
+    return py_strip(s);
 }
 
 static int blank(const char *s) {
     for (; *s; s++)
-        if (!is_ws((unsigned char)*s)) return 0;
+        if (!py_is_ascii_space((unsigned char)*s)) return 0;
     return 1;
 }
 
@@ -128,67 +122,7 @@ static void json_strlist(buf *o, const strlist *l) {
 /* Python repr(float) 的「最短往返」表示（CPython float_repr_style=short）：
  * 取能还原该 double 的最少有效位数，然后按 decpt 选定点/指数写法，
  * 定点时整数补 ".0"。`%g` 会把 5.0 印成 "5"、1e15 印成 "1e+15"，都对不上。 */
-static void py_repr_float(double v, buf *o) {
-    if (v != v) { buf_puts(o, "nan"); return; }
-    if (v > DBL_MAX) { buf_puts(o, "inf"); return; }
-    if (v < -DBL_MAX) { buf_puts(o, "-inf"); return; }
-
-    char tmp[64];
-    int prec;
-    for (prec = 1; prec <= 17; prec++) {
-        snprintf(tmp, sizeof(tmp), "%.*e", prec - 1, v);
-        if (strtod(tmp, NULL) == v) break;
-    }
-
-    const char *p = tmp;
-    int neg = 0;
-    if (*p == '-') { neg = 1; p++; }
-    char digits[40];
-    size_t nd = 0;
-    while (*p && *p != 'e' && *p != 'E') {
-        if (*p >= '0' && *p <= '9') digits[nd++] = *p;
-        p++;
-    }
-    digits[nd] = 0;
-    int exp10 = 0;
-    if (*p == 'e' || *p == 'E') exp10 = atoi(p + 1);
-    while (nd > 1 && digits[nd - 1] == '0') digits[--nd] = 0;
-
-    int decpt = exp10 + 1;      /* 小数点在第 decpt 位之后 */
-    if (neg) buf_putc(o, '-');
-    if (decpt <= -4 || decpt > 16) {
-        /* 指数写法：d[.ddd]e±XX（指数至少两位） */
-        buf_putc(o, digits[0]);
-        if (nd > 1) {
-            buf_putc(o, '.');
-            buf_puts(o, digits + 1);
-        }
-        int e = decpt - 1;
-        buf_printf(o, "e%c%02d", e < 0 ? '-' : '+', e < 0 ? -e : e);
-    } else if (decpt <= 0) {
-        buf_puts(o, "0.");
-        for (int i = 0; i < -decpt; i++) buf_putc(o, '0');
-        buf_puts(o, digits);
-    } else if ((size_t)decpt >= nd) {
-        buf_puts(o, digits);
-        for (size_t i = nd; i < (size_t)decpt; i++) buf_putc(o, '0');
-        buf_puts(o, ".0");
-    } else {
-        buf_append(o, digits, (size_t)decpt);
-        buf_putc(o, '.');
-        buf_puts(o, digits + decpt);
-    }
-}
-
 /* Python repr(value)：标量走 w_repr（共享层），float 换成上面的精确写法。 */
-static void repr_val(const jnode *v, buf *o) {
-    if (bjtype(v) == BJ_FLOAT) {
-        py_repr_float(jfloat(v), o);
-        return;
-    }
-    w_repr(v, o);
-}
-
 /* ================================================================ git 调用 */
 
 static int run_out(const char *const args[], buf *out) {
@@ -485,7 +419,7 @@ static int hist_bb(SOCKET s, const jnode *b, const char *key, int dflt, int *out
     buf_init(&m);
     buf_puts(&m, key);
     buf_puts(&m, " 必须是 true 或 false,收到 ");
-    repr_val(v, &m);
+    w_repr(v, &m);
     send_giterr(s, buf_cstr(&m));
     buf_free(&m);
     return 0;
@@ -725,7 +659,7 @@ static void handle_restore(SOCKET s, const jnode *b) {
         buf m;
         buf_init(&m);
         buf_puts(&m, "reflog 索引必须是整数,收到 ");
-        repr_val(iv, &m);
+        w_repr(iv, &m);
         send_hist(s, buf_cstr(&m), "bad_index", NULL);
         buf_free(&m);
         reflog_free(rows, nrow);

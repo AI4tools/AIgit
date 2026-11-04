@@ -2599,7 +2599,7 @@ def main():
                     help="建一个干净的演练仓(清空已有内容)")
     a = ap.parse_args()
 
-    WEB = Path(__file__).parent / "web"
+    WEB = Path(__file__).parent.parent / "web"   # python-ref/ 的上一级
     root = Path(a.root)
 
     if a.sandbox and root.exists():

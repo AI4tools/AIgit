@@ -19,6 +19,7 @@
  *   * 任何失败都是 400，绝无 500。
  */
 #include "routes.h"
+#include "params.h"
 
 #include <ctype.h>
 #include <stdint.h>
@@ -445,17 +446,10 @@ static char *pin_ancestors(pinlist *pl, const char *rel) {
 
 /* ================================================================ git 调用 */
 
-static char *strip_dup(const char *s) {
-    while (*s && isspace((unsigned char)*s)) s++;
-    size_t n = strlen(s);
-    while (n && isspace((unsigned char)s[n - 1])) n--;
-    return xstrndup(s, n);
-}
-
 /* (p.stderr or p.stdout or "git 失败").strip() */
 static char *git_fail_text(buf *out, buf *err) {
-    if (err && err->n) return strip_dup(buf_cstr(err));
-    if (out && out->n) return strip_dup(buf_cstr(out));
+    if (err && err->n) return py_strip_dup(buf_cstr(err));
+    if (out && out->n) return py_strip_dup(buf_cstr(out));
     return xstrdup("git 失败");
 }
 
@@ -1138,7 +1132,7 @@ static int add_scope(skset *wanted, slist *tracked_nc, char **errmsg) {
     buf_init(&er);
     int rc = git_run(a, NULL, 0, &out, &er);
     if (rc != 0) {
-        char *t = strip_dup(er.n ? buf_cstr(&er) : buf_cstr(&out));
+        char *t = py_strip_dup(er.n ? buf_cstr(&er) : buf_cstr(&out));
         if (strlen(t) > 160) t[160] = 0;
         buf m;
         buf_init(&m);
@@ -1181,7 +1175,7 @@ static int add_scope(skset *wanted, slist *tracked_nc, char **errmsg) {
     buf_init(&der);
     rc = git_run(d, NULL, 0, &dout, &der);
     if (rc != 0) {
-        char *t = strip_dup(der.n ? buf_cstr(&der) : buf_cstr(&dout));
+        char *t = py_strip_dup(der.n ? buf_cstr(&der) : buf_cstr(&dout));
         if (strlen(t) > 160) t[160] = 0;
         buf m;
         buf_init(&m);
@@ -1248,7 +1242,7 @@ static int index_delta(int head_exists, const slist *index_all, skset *out,
     buf_init(&e);
     int rc = git_run(a, NULL, 0, &o, &e);
     if (rc != 0) {
-        char *t = strip_dup(e.n ? buf_cstr(&e) : buf_cstr(&o));
+        char *t = py_strip_dup(e.n ? buf_cstr(&e) : buf_cstr(&o));
         if (strlen(t) > 160) t[160] = 0;
         buf m;
         buf_init(&m);
@@ -1436,15 +1430,6 @@ done:
 }
 
 /* Python str.isspace() 的近似（只用于「提交信息是不是全空白」这一处）。 */
-static int py_space_cp(unsigned cp) {
-    if (cp == 0x09 || cp == 0x0A || cp == 0x0B || cp == 0x0C || cp == 0x0D ||
-        cp == 0x1C || cp == 0x1D || cp == 0x1E || cp == 0x1F || cp == 0x20)
-        return 1;
-    if (cp == 0x85 || cp == 0xA0 || cp == 0x1680) return 1;
-    if (cp >= 0x2000 && cp <= 0x200A) return 1;
-    return cp == 0x2028 || cp == 0x2029 || cp == 0x202F || cp == 0x205F || cp == 0x3000;
-}
-
 static int py_blank(const char *s, size_t n) {
     size_t i = 0;
     while (i < n) {
@@ -1462,7 +1447,7 @@ static int py_blank(const char *s, size_t n) {
                 cp = (cp << 6) | (t & 0x3Fu);
             }
         }
-        if (!py_space_cp(cp)) return 0;
+        if (!py_is_space_cp(cp)) return 0;
         i += used;
     }
     return 1;
@@ -1523,7 +1508,7 @@ static void do_commit(const jnode *b, SOCKET s) {
     buf_init(&both);
     if (out.n) buf_append(&both, out.p, out.n);
     if (er.n) buf_append(&both, er.p, er.n);
-    char *text = strip_dup(both.p ? buf_cstr(&both) : "");
+    char *text = py_strip_dup(both.p ? buf_cstr(&both) : "");
     buf_free(&both);
     buf_free(&out);
     buf_free(&er);

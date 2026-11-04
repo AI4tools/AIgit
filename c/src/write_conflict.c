@@ -29,6 +29,7 @@
  */
 
 #include "routes.h"
+#include "params.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -60,57 +61,14 @@ static int is_py_space(int c) {
 }
 
 /* Python `s.strip()` 的等价物（ASCII 空白）。 */
-static char *strip_dup(const char *s) {
-    if (!s) return xstrdup("");
-    const char *b = s;
-    while (*b && is_py_space((unsigned char)*b)) b++;
-    size_t n = strlen(b);
-    while (n && is_py_space((unsigned char)b[n - 1])) n--;
-    return xstrndup(b, n);
-}
-
 static void free_strv(char **v, size_t n) {
     for (size_t i = 0; i < n; i++) free(v[i]);
     free(v);
 }
 
 /* Python repr(str) 的近似（错误文案里的 %r 用），支持内嵌 NUL。 */
-static char *py_repr_n(const char *s, size_t n) {
-    char quote = '\'';
-    if (memchr(s, '\'', n) && !memchr(s, '"', n)) quote = '"';
-    buf b;
-    buf_init(&b);
-    buf_putc(&b, quote);
-    for (size_t i = 0; i < n; i++) {
-        unsigned c = (unsigned char)s[i];
-        if (c == (unsigned char)quote || c == '\\') {
-            buf_putc(&b, '\\');
-            buf_putc(&b, (char)c);
-        } else if (c == '\n') buf_puts(&b, "\\n");
-        else if (c == '\r') buf_puts(&b, "\\r");
-        else if (c == '\t') buf_puts(&b, "\\t");
-        else if (c < 0x20 || c == 0x7f) buf_printf(&b, "\\x%02x", c);
-        else buf_putc(&b, (char)c);
-    }
-    buf_putc(&b, quote);
-    char *r = xstrdup(buf_cstr(&b));
-    buf_free(&b);
-    return r;
-}
-
 /* Python repr 的近似（错误文案里的 %r 用）。
  * 与 writeutil 的 w_repr 的区别：float 走 repr 口径（5.0 不能印成 "5"）。 */
-static void py_repr_val(const jnode *v, buf *out) {
-    if (v && bjtype(v) == BJ_FLOAT) {
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), "%g", jfloat(v));
-        buf_puts(out, tmp);
-        if (!strpbrk(tmp, ".eEn")) buf_puts(out, ".0");
-        return;
-    }
-    w_repr(v, out);
-}
-
 /* 非法 UTF-8 → U+FFFD（Python `bytes.decode("utf-8","replace")` 的口径）。 */
 static char *u8_sanitize(const char *s, size_t n) {
     buf b;
@@ -397,7 +355,7 @@ static char *git_fail_msg(const char *const *args, int rc, const char *errp, siz
     const char *src = (errn ? errp : outp);
     size_t srcn = (errn ? errn : outn);
     char *raw = xstrndup(src ? src : "", src ? srcn : 0);
-    char *msg = strip_dup(raw);
+    char *msg = py_strip_dup(raw);
     free(raw);
     /* 绝对路径脱敏（Python 版两种分隔符都抹） */
     char *root = w2u8(git_root());
@@ -521,7 +479,7 @@ static const wchar_t *gitdir_w(void) {
     buf_init(&err);
     const char *args[] = { "rev-parse", "--git-dir", NULL };
     if (git_run(args, NULL, 0, &out, &err) == 0) {
-        char *s = strip_dup(buf_cstr(&out));
+        char *s = py_strip_dup(buf_cstr(&out));
         if (*s) {
             wchar_t *w = u82w(s);
             if (w) {
@@ -653,7 +611,7 @@ static char *path_from_arg(const char *s, size_t n, char **err) {
     char *rel = path_rel_in_root(tmp, &perr);
     free(tmp);
     if (!rel) { *err = perr; return NULL; }
-    char *out = strip_dup(rel);
+    char *out = py_strip_dup(rel);
     free(rel);
     for (char *p = out; *p; p++) if (*p == '\\') *p = '/';
     if (!*out) {
@@ -779,7 +737,7 @@ static char **conflict_paths(size_t *out_n) {
         pos += rl + 1;
         if (!rl) continue;
         char *t = xstrndup(rec, rl);
-        char *s = strip_dup(t);
+        char *s = py_strip_dup(t);
         free(t);
         if (*s) {
             v = xrealloc(v, (n + 1) * sizeof(char *));
@@ -1183,7 +1141,7 @@ static int h_resolve(SOCKET s, const jnode *b) {
         buf m;
         buf_init(&m);
         buf_puts(&m, "不支持的 encoding:");
-        py_repr_val(encv, &m);
+        w_repr(encv, &m);
         buf_puts(&m, "(只支持 utf-8 / base64)");
         send_bad_buf(s, &m);
         buf_free(&m);
@@ -1252,7 +1210,7 @@ static int h_resolve(SOCKET s, const jnode *b) {
                 buf_putc(&m, '[');
                 for (size_t i = 0; i < lim; i++) {
                     if (i) buf_puts(&m, ", ");
-                    py_repr_val(jat(sv, i), &m);
+                    w_repr(jat(sv, i), &m);
                 }
                 buf_putc(&m, ']');
                 buf_puts(&m, ",实际 ");
@@ -1376,7 +1334,7 @@ static int h_choose(SOCKET s, const jnode *b) {
         buf m;
         buf_init(&m);
         buf_puts(&m, "side 只能是 ours/theirs/base,收到 ");
-        if (sv) py_repr_val(sv, &m);
+        if (sv) w_repr(sv, &m);
         else buf_puts(&m, "''");
         send_bad_buf(s, &m);
         buf_free(&m);
@@ -1567,7 +1525,7 @@ static char *rev_parse_head(void) {
     buf_free(&e);
     char *r = NULL;
     if (rc == 0) {
-        char *s = strip_dup(buf_cstr(&o));
+        char *s = py_strip_dup(buf_cstr(&o));
         if (*s) r = s;
         else free(s);
     }
@@ -1613,7 +1571,7 @@ static int h_commit(SOCKET s, const jnode *b) {
             const char *nl = strchr(p, '\n');
             size_t ln = nl ? (size_t)(nl - p) : strlen(p);
             char *line = xstrndup(p, ln);
-            char *st = strip_dup(line);
+            char *st = py_strip_dup(line);
             free(line);
             if (*st) { dflt = st; break; }
             free(st);
@@ -1686,7 +1644,7 @@ static int h_commit(SOCKET s, const jnode *b) {
     }
 
     /* text = (message or "").strip() or default */
-    char *msg_stripped = message ? strip_dup(message) : xstrdup("");
+    char *msg_stripped = message ? py_strip_dup(message) : xstrdup("");
     char *text = xstrdup(*msg_stripped ? msg_stripped : dflt);
     /* messageSource 看的是**去空白后**的 message，不是原始真值：
      * `{"message": "   "}` 在 Python 里 messageSource 是 "MERGE_MSG"。 */
@@ -1781,7 +1739,7 @@ static int h_commit(SOCKET s, const jnode *b) {
         const char *args[] = { "log", "-1", "--pretty=%s", NULL };
         wc_git(args, &o, &e);
         buf_free(&e);
-        subject = strip_dup(buf_cstr(&o));
+        subject = py_strip_dup(buf_cstr(&o));
         buf_free(&o);
     }
 

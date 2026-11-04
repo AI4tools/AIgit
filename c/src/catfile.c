@@ -102,7 +102,7 @@ static BOOL CALLBACK cat_init_cb(PINIT_ONCE once, PVOID param, PVOID *ctx) {
         /* 环境继承父进程（cat-file 只读对象，不受 guard 影响；与 Python 一样
          * 这次 Popen 不进计数）。 */
         if (CreateProcessW(NULL, (wchar_t *)cmd.p, NULL, NULL, TRUE,
-                           CREATE_NO_WINDOW, NULL, git_root(), &si, &pi)) {
+                           0, NULL, git_root(), &si, &pi)) {
             CloseHandle(pi.hThread);
             g_cat.proc = pi.hProcess;
             g_cat.wr = in_w;
@@ -188,6 +188,16 @@ int cat_read_ex(const char *spec, char *got, size_t gotsz, buf *data,
             }
             line[ln] = 0;
             if (!bad) {
+                /* `git cat-file --batch` 对没有对象的 spec 回的是
+                 * `<原样输入> missing`（输入里有空格就整行带空格）。
+                 * 必须先按后缀判定，否则会被当成 `<sha> <type> <size>`，
+                 * 读一个不存在的 payload 而永久阻塞（实测卡死）。 */
+                size_t L = strlen(line);
+                if (L >= 8 && !strcmp(line + L - 8, " missing")) {
+                    if (status) *status = 0;
+                } else if (L >= 10 && !strcmp(line + L - 10, " ambiguous")) {
+                    if (status) *status = -1;
+                } else {
                 char *sp1 = strchr(line, ' ');
                 if (!sp1) {
                     bad = 1;
@@ -217,6 +227,7 @@ int cat_read_ex(const char *spec, char *got, size_t gotsz, buf *data,
                             ok = 1;
                         }
                     }
+                }
                 }
             }
             if (bad) g_cat.state = 2;

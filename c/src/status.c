@@ -36,6 +36,20 @@ static int nth_field(const char *s, int idx, const char **out, size_t *len) {
     return 1;
 }
 
+/* 取第 idx 个字段之后的**剩余整段**（porcelain v2 的路径字段永远是最后一段，
+ * 路径里可以有空格；按空格切会把 "with space.txt" 截成 "with"）。 */
+static int nth_rest(const char *s, int idx, const char **out, size_t *len) {
+    const char *p = s;
+    for (int i = 0; i < idx; i++) {
+        const char *sp = strchr(p, ' ');
+        if (!sp) return 0;
+        p = sp + 1;
+    }
+    *out = p;
+    *len = strlen(p);
+    return 1;
+}
+
 int status_compute(status_t *st, char **err) {
     memset(st, 0, sizeof(*st));
     buf out, er;
@@ -94,12 +108,12 @@ int status_compute(status_t *st, char **err) {
         const char *path = NULL;
         size_t plen = 0;
         if (f[0] == '1') {
-            if (!nth_field(f, 1, &xy, &xylen) || !nth_field(f, 8, &path, &plen)) continue;
+            if (!nth_field(f, 1, &xy, &xylen) || !nth_rest(f, 8, &path, &plen)) continue;
         } else if (f[0] == '2') {
-            if (!nth_field(f, 1, &xy, &xylen) || !nth_field(f, 9, &path, &plen)) continue;
+            if (!nth_field(f, 1, &xy, &xylen) || !nth_rest(f, 9, &path, &plen)) continue;
             skip_next = 1;                      /* 下一字段是 origPath */
         } else if (f[0] == 'u') {
-            if (!nth_field(f, 1, &xy, &xylen) || !nth_field(f, 10, &path, &plen)) continue;
+            if (!nth_field(f, 1, &xy, &xylen) || !nth_rest(f, 10, &path, &plen)) continue;
             item_push(&st->conf, &st->nc, path, plen, 'U', 1);
         } else {
             continue;

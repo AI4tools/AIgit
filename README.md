@@ -1,8 +1,17 @@
 # aigit —— 本地 git 图形工具（零参数可跑）
 
+[![ci](https://github.com/AI4tools/AIgit/actions/workflows/ci.yml/badge.svg)](https://github.com/AI4tools/AIgit/actions/workflows/ci.yml)
+[![release](https://github.com/AI4tools/AIgit/actions/workflows/release.yml/badge.svg)](https://github.com/AI4tools/AIgit/actions/workflows/release.yml)
+[![license: GPL-2.0](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
+
+
 `aigit` 是一个只跑在本机的 git 前端：`server.py` 用标准库起一个小 HTTP 服务，
 浏览器打开页面后可以看改动、暂存、提交、造分支、试合并。
 没有数据库，没有账号，没有网络请求。
+
+> **目录布局（2026-11-04）**：产品实现是 C 版 `c/build/aigit.exe`，启动器默认跑它。
+> Python 参考实现与它的测试已整体移到 `python-ref/`，只作为一致性判据的对照；
+> 下文命令里的 `server.py` / `test_aigit.py` 等，实际路径都是 `python-ref/` 下的同名文件。
 
 **先分清楚两层覆盖范围 —— 界面和 API 不是一回事：**
 
@@ -18,7 +27,7 @@
 **界面上点不到，不等于功能不存在，但也不等于有图形界面** —— 第二类操作目前只能手工发请求。
 路由表见「冲突解决与历史操作」一节。
 
-**永远不会自动打开浏览器，也永远不会弹任何窗口。** 启动器只在控制台打印一行
+**默认不会自动打开浏览器，也不会弹任何窗口。** 启动器只在控制台打印一行
 `http://127.0.0.1:8777/`，你自己复制到浏览器地址栏。这是刻意的：多线并行开发时
 一个突然弹出的浏览器窗口会把终端输出冲掉。
 
@@ -167,6 +176,24 @@ python tools\aigit\aigit_perf.py
 批处理版**不带任何参数直接双击即可运行**，仓库和端口都用默认值。
 它会依次尝试 `py -3`、`python`、`python3`，谁先成功用谁。
 不认识的参数不报错，原样透传给 `server.py`（保持服务端可扩展）。
+
+---
+
+## C 版（可选，同一套 HTTP 契约）
+
+仓库里还有一份 C 重写：`c/build/aigit.exe`，单个静态 exe、无运行时依赖。
+它和 `server.py` 是**对等实现**（JSON/状态码/副作用按同一套判据对齐），
+构建与运行：
+
+```powershell
+$env:PATH='C:\Environment\cpp\mingw64\bin;'+$env:PATH
+mingw32-make -C c -j4
+c\build\aigit.exe --root D:\path\to\repo --port 8899
+```
+
+支持 `--sandbox`、`--web <dir>`；Python 版 `server.py` 的全部路由（含 `/api/gen`、
+`remote/{fetch,pull,push}`）与静态页都已接。怎么验、当前覆盖与已知差异见
+`c/README.md`；一页交付视图见 `doc/aigit-delivery.md` 第 6 节。
 
 ---
 
@@ -902,3 +929,25 @@ LF**（167 LF / 0 CRLF）—— 直接拷贝会让门禁**把自己报成 adviso
 
 ⚠ 源文件（`litematica-preview\tools\check-encoding.ps1`）**仍是 LF**，那边跑门禁
 会把自己报成 advisory。**那是另一条线的事，本轮没动它。**
+
+## 许可
+
+GPL-2.0（与 git 相同）。完整文本见 [LICENSE](LICENSE)。
+发行版（`c/dist/aigit-c.zip`）里也带一份 `LICENSE`，并注明源码地址。
+
+## CI / CD
+
+| 工作流 | 触发 | 做什么 |
+|---|---|---|
+| [.github/workflows/ci.yml](.github/workflows/ci.yml) | push main / PR / 手动 | 4 个 job 并行：构建冒烟、16 片一致性判据、质量（加固/Unicode/批量/4 个演练）、压力（并发/长跑/畸形/变异 3 靶） |
+| [.github/workflows/release.yml](.github/workflows/release.yml) | 打 `v*` 标签 | 构建 + 打包 zip + 生成 `SHA256SUMS.txt` + 发布 GitHub Release |
+
+本地等价命令（CI 跑的就是它们）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File c\build.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File c\tests\run-all-c.ps1
+```
+
+CI 用 MSYS2 的 mingw64（`AIGIT_MINGW=C:\msys64\mingw64`）；
+`build.ps1` 的顺序是 `AIGIT_MINGW` → 常见安装目录 → PATH，三个本地/CI 都能用。

@@ -31,6 +31,7 @@
  *     这里先按 Python 的语义拦下来）。
  */
 #include "routes.h"
+#include "params.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,78 +132,11 @@ static void qvals(const char *query, const char *key, qlist *out) {
 /* Python repr(str) 的常用子集：默认单引号，串里有 ' 且没有 " 时改双引号，
  * 反斜杠与引号转义，控制字符 \n\r\t\xNN。非 ASCII 可打印字符原样输出
  * （Python 3 的 repr 也是这样）。只用于错误文案里回显 mode 与含 NUL 的路径。 */
-static char *py_repr(const char *s, size_t n) {
-    int has_sq = 0, has_dq = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (s[i] == '\'') has_sq = 1;
-        else if (s[i] == '"') has_dq = 1;
-    }
-    char q = (has_sq && !has_dq) ? '"' : '\'';
-    buf o;
-    buf_init(&o);
-    buf_putc(&o, q);
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)s[i];
-        if (c == (unsigned char)q || c == '\\') { buf_putc(&o, '\\'); buf_putc(&o, (char)c); }
-        else if (c == '\n') buf_puts(&o, "\\n");
-        else if (c == '\r') buf_puts(&o, "\\r");
-        else if (c == '\t') buf_puts(&o, "\\t");
-        else if (c < 0x20 || c == 0x7f) buf_printf(&o, "\\x%02x", (unsigned)c);
-        else buf_putc(&o, (char)c);
-    }
-    buf_putc(&o, q);
-    char *r = xstrdup(buf_cstr(&o));
-    buf_free(&o);
-    return r;
-}
-
 /* ---------------------------------------------------------------- ref 校验 */
 
 /* UTF-8 解一个码点。非法序列返回 0（Python 侧是 U+FFFD，同样不是 \w）。 */
-static int next_cp(const unsigned char *s, size_t n, size_t *i, unsigned *cp) {
-    unsigned char c = s[*i];
-    if (c < 0x80) { *cp = c; (*i)++; return 1; }
-    int need;
-    unsigned v;
-    if (c >= 0xc2 && c <= 0xdf) { need = 1; v = c & 0x1fu; }
-    else if (c >= 0xe0 && c <= 0xef) { need = 2; v = c & 0x0fu; }
-    else if (c >= 0xf0 && c <= 0xf4) { need = 3; v = c & 0x07u; }
-    else { (*i)++; return 0; }
-    if (*i + (size_t)need >= n) { (*i)++; return 0; }
-    for (int k = 1; k <= need; k++) {
-        unsigned char cc = s[*i + (size_t)k];
-        if ((cc & 0xc0) != 0x80) { (*i)++; return 0; }
-        v = (v << 6) | (cc & 0x3fu);
-    }
-    if ((need == 2 && v < 0x800) || (need == 3 && v < 0x10000) ||
-        (v >= 0xd800 && v <= 0xdfff) || v > 0x10ffff) { (*i)++; return 0; }
-    *i += (size_t)need + 1;
-    *cp = v;
-    return 1;
-}
-
 /* Python 的 `\w`（str 模式，Unicode）：字母/数字/下划线。
  * ASCII 自己判；其余交给 Windows 的 CT_CTYPE1（C1_ALPHA / C1_DIGIT）。 */
-static int word_cp(unsigned cp) {
-    if (cp < 0x80)
-        return (cp >= '0' && cp <= '9') || (cp >= 'a' && cp <= 'z') ||
-               (cp >= 'A' && cp <= 'Z') || cp == '_';
-    wchar_t w[2];
-    int n = 0;
-    if (cp <= 0xffff) {
-        w[n++] = (wchar_t)cp;
-    } else {
-        unsigned v = cp - 0x10000;
-        w[n++] = (wchar_t)(0xd800 + (v >> 10));
-        w[n++] = (wchar_t)(0xdc00 + (v & 0x3ff));
-    }
-    WORD t[2] = {0, 0};
-    if (!GetStringTypeW(CT_CTYPE1, w, n, t)) return 0;
-    for (int i = 0; i < n; i++)
-        if (t[i] & (C1_ALPHA | C1_DIGIT)) return 1;
-    return 0;
-}
-
 static int ref_ok(const char *ref, size_t n) {
     if (!ref || n == 0) return 0;
     if (memchr(ref, 0, n)) return 0;          /* 内嵌 NUL：正则不可能匹配 */
@@ -210,13 +144,13 @@ static int ref_ok(const char *ref, size_t n) {
     int first = 1;
     while (i < n) {
         unsigned cp = 0;
-        if (!next_cp((const unsigned char *)ref, n, &i, &cp)) return 0;
+        if (!py_utf8_step((const unsigned char *)ref, n, &i, &cp)) return 0;
         int ok;
         if (first) {
-            ok = word_cp(cp) || cp == '@' || cp == '^' || cp == '~';
+            ok = py_is_word(cp) || cp == '@' || cp == '^' || cp == '~';
             first = 0;
         } else {
-            ok = word_cp(cp) || cp == '@' || cp == '^' || cp == '~' ||
+            ok = py_is_word(cp) || cp == '@' || cp == '^' || cp == '~' ||
                  cp == '{' || cp == '}' || cp == '+' || cp == '.' ||
                  cp == '/' || cp == '-';
         }
@@ -500,7 +434,7 @@ static void handle_reset_plan(const char *query, SOCKET s) {
     int is_mixed = (mn == 5 && !memcmp(m, "mixed", 5));
     int is_hard = (mn == 4 && !memcmp(m, "hard", 4));
     if (!is_soft && !is_mixed && !is_hard) {
-        char *rp = py_repr(m, mn);
+        char *rp = py_repr_n(m, mn);
         buf msg;
         buf_init(&msg);
         buf_puts(&msg, "mode 必须是 'soft' / 'mixed' / 'hard' 之一,收到 ");
@@ -671,7 +605,7 @@ static void handle_discard_plan(const char *query, SOCKET s) {
         const char *raw = files.v[i].s;
         size_t rawn = files.v[i].n;
         if (memchr(raw, 0, rawn)) {
-            char *rp = py_repr(raw, rawn);
+            char *rp = py_repr_n(raw, rawn);
             buf msg;
             buf_init(&msg);
             buf_puts(&msg, "路径里不能包含 NUL 字符,已拒绝:");

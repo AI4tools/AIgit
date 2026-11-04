@@ -15,4 +15,8 @@
  * （malloc 的可读文案，调用方 free）。 */
 char *path_rel_in_root(const char *input, char **err);
 
+/* 已通过 path_rel_in_root 的仓内相对路径 -> 磁盘真实大小写（保留剩余后缀）。
+ * 取不到真实路径时返回原样的副本；不改变越界/.git 的判定。 */
+char *path_canon_rel(const char *rel);
+
 #endif

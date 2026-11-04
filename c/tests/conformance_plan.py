@@ -34,8 +34,8 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 C_ROOT = os.path.dirname(HERE)
 EXE = os.path.join(C_ROOT, "build", "aigit.exe")
-_PY_SIBLING = os.path.join(os.path.dirname(C_ROOT), "server.py")
-PY_ROOT = os.path.dirname(_PY_SIBLING) if os.path.isfile(_PY_SIBLING) else r"D:\project\aigit"
+_PY_SIBLING = os.path.join(os.path.dirname(C_ROOT), "python-ref", "server.py")
+PY_ROOT = os.path.dirname(_PY_SIBLING) if os.path.isfile(_PY_SIBLING) else r"D:\project\aigit\python-ref"
 BASE = os.path.join(os.environ["TEMP"], "aigit_c_plan_%d" % (os.getpid() % 100000))
 
 Q = urllib.parse.quote

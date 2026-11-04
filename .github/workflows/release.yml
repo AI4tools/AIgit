@@ -1,0 +1,56 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+  AIGIT_MINGW: C:\msys64\mingw64
+
+jobs:
+  release:
+    name: build + package + publish
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: git environment
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+      - name: add mingw64 to PATH
+        run: '"$env:AIGIT_MINGW\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH'
+      - name: build + package (exe + web + start.bat + README + LICENSE)
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File c\package.ps1
+      - name: SHA256SUMS
+        run: |
+          $zip = 'c\dist\aigit-c.zip'
+          $h = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$h  aigit-c.zip" | Out-File -Encoding ascii 'c\dist\SHA256SUMS.txt'
+          Get-Content 'c\dist\SHA256SUMS.txt'
+      - name: publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            c\dist\aigit-c.zip
+            c\dist\SHA256SUMS.txt
+          generate_release_notes: true
+          # 标签里带 - 就自动标成 Pre-release（例如 v1.0.0-beta.1）
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

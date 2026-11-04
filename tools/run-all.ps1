@@ -43,6 +43,7 @@ $env:PYTHONIOENCODING = "utf-8"
 $env:PYTHONUTF8 = "1"
 
 $root = Split-Path -Parent $PSScriptRoot
+$pyroot = Join-Path $root "python-ref"
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $logdir = Join-Path $env:TEMP ("aigit-gate-" + $stamp)
 New-Item -ItemType Directory -Path $logdir -Force | Out-Null
@@ -147,27 +148,27 @@ if (Test-Path $gate) {
 
 # 2) 12 self-running suites
 foreach ($s in $SUITES) {
-    if (-not (Test-Path (Join-Path $root $s))) {
+    if (-not (Test-Path (Join-Path $pyroot $s))) {
         Add-Result $s 1 0 "file not found"
         Write-Host ("  FAIL  {0,-28} file not found" -f $s)
         continue
     }
-    Invoke-Step $s $Python @("-X", "utf8", $s) $root
+    Invoke-Step $s $Python @("-X", "utf8", $s) $pyroot
 }
 
 # 3) concurrency suite
 if (-not $Fast) {
-    Invoke-Step "test_aigit_concurrency.py" $Python @("-X", "utf8", "test_aigit_concurrency.py") $root
+    Invoke-Step "test_aigit_concurrency.py" $Python @("-X", "utf8", "test_aigit_concurrency.py") $pyroot
 }
 
 # 3b) performance budget (spawn is the hard criterion, wall clock is a band)
 if (-not $Fast) {
-    $budget = Join-Path $root "tools\perf-budget.py"
+    $budget = Join-Path $pyroot "tools\perf-budget.py"
     if (Test-Path $budget) {
         Invoke-Step "perf-budget" $Python @("-X", "utf8", $budget,
             "--json", (Join-Path $logdir "perf-budget.json")) $root
     } else {
-        Add-Result "perf-budget" 1 0 "missing: tools/perf-budget.py"
+        Add-Result "perf-budget" 1 0 "missing: python-ref/tools/perf-budget.py"
         Write-Host "  FAIL  perf-budget                 script not found"
     }
 }

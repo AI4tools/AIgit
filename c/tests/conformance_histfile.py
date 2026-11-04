@@ -27,8 +27,8 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 C_ROOT = os.path.dirname(HERE)                 # ...\c
-# Python 参考版：本任务的 C 副本在别处，参考版固定在 D:\project\aigit（只读）。
-PY_ROOT = os.environ.get("AIGIT_PY_ROOT") or r"D:\project\aigit"
+# Python 参考版：本任务的 C 副本在别处，参考版固定在 D:\project\aigit\python-ref（只读）。
+PY_ROOT = os.environ.get("AIGIT_PY_ROOT") or r"D:\project\aigit\python-ref"
 EXE = os.path.join(C_ROOT, "build", "aigit.exe")
 BASE = os.path.join(os.environ["TEMP"], "aigit_c_hist_%d" % (os.getpid() % 100000))
 

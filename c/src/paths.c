@@ -92,6 +92,44 @@ static wchar_t *resolve_with_existing_prefix(const wchar_t *full, const wchar_t 
     return NULL;
 }
 
+char *path_canon_rel(const char *rel) {
+    if (!rel) return xstrdup("");
+    const wchar_t *root = git_root();
+    if (!root) return xstrdup(rel);
+    wchar_t *rw = u82w(rel);
+    if (!rw) return xstrdup(rel);
+
+    buf full;
+    buf_init(&full);
+    buf_append(&full, root, wcslen(root) * sizeof(wchar_t));
+    buf_append(&full, L"\\", sizeof(wchar_t));
+    for (wchar_t *q = rw; *q; q++) {
+        wchar_t c = (*q == L'/') ? L'\\' : *q;
+        buf_append(&full, &c, sizeof(wchar_t));
+    }
+    wchar_t z = 0;
+    buf_append(&full, &z, sizeof(wchar_t));
+    free(rw);
+
+    wchar_t *resolved = resolve_with_existing_prefix((wchar_t *)full.p, root);
+    buf_free(&full);
+    if (!resolved) return xstrdup(rel);
+
+    const wchar_t *p = strip_ns_prefix(resolved);
+    size_t rl = wcslen(root);
+    if (_wcsnicmp(p, root, rl) != 0 || p[rl] != L'\\' || !p[rl + 1]) {
+        free(resolved);
+        return xstrdup(rel);
+    }
+    wchar_t *tmp = _wcsdup(p + rl + 1);
+    for (wchar_t *q = tmp; *q; q++)
+        if (*q == L'\\') *q = L'/';
+    char *out = w2u8(tmp);
+    free(tmp);
+    free(resolved);
+    return out ? out : xstrdup(rel);
+}
+
 char *path_rel_in_root(const char *input, char **err) {
     if (err) *err = NULL;
     if (!input || !*input) { set_err(err, "%s", "路径为空"); return NULL; }

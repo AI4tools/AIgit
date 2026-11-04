@@ -22,10 +22,14 @@ build/aigit.exe: $(OBJ)
 build/%.o: src/%.c src/*.h | build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# mkdir / rm / rmdir 各写一条，前面加 '-' 让另一种 shell 下的失败被忽略：
+# cmd 下用 mkdir + rmdir，MSYS2/bash 下用 mkdir + rm。
 build:
-	@if not exist build mkdir build
+	-@mkdir build
+	-@rm -rf build
 
 clean:
-	@if exist build rmdir /s /q build
+	-@rm -rf build
+	-@rmdir /s /q build
 
 .PHONY: all clean

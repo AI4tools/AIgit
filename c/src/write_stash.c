@@ -26,6 +26,7 @@
  *   * 所有成功响应都是模块自己的 dict（**不走** _ok_with_status，不带 status 字段）。
  */
 #include "routes.h"
+#include "params.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,34 +88,13 @@ static char *py_text_n(const char *p, size_t n, size_t *outn) {
 }
 
 /* 就地 strip（前后都去），返回同一个指针。 */
-static char *py_strip(char *s) {
-    size_t n = strlen(s);
-    size_t a = 0;
-    while (a < n && py_space((unsigned char)s[a])) a++;
-    if (a) memmove(s, s + a, n - a + 1);
-    n -= a;
-    while (n > 0 && py_space((unsigned char)s[n - 1])) s[--n] = 0;
-    return s;
-}
-
 /* malloc 一份 [s,s+n) 并 strip。 */
-static char *strip_dup(const char *s, size_t n) {
-    char *o = xstrndup(s, n);
-    return py_strip(o);
-}
-
 /* Python repr 的常用子集（错误文案里的 %r 用）。float 单独处理：
  * w_repr 的 `%g` 会把 5.0 打成 "5"，而 Python repr 是 "5.0"。 */
 static void py_float(buf *o, double d) {
     long long ll = (long long)d;
     if ((double)ll == d && d > -1e16 && d < 1e16) buf_printf(o, "%lld.0", ll);
     else buf_printf(o, "%g", d);
-}
-
-static void repr_value(const jnode *v, buf *o) {
-    if (!v) { buf_puts(o, "None"); return; }
-    if (bjtype(v) == BJ_FLOAT) { py_float(o, jfloat(v)); return; }
-    w_repr(v, o);
 }
 
 /* Python `str(v)`（pop 的 needs_confirmation 文案里 `%s` 用）：字符串不加引号，
@@ -124,7 +104,15 @@ static void py_str_value(const jnode *v, buf *o) {
     switch (bjtype(v)) {
     case BJ_NULL:  buf_puts(o, "None"); break;
     case BJ_BOOL:  buf_puts(o, jbool(v) ? "True" : "False"); break;
-    case BJ_INT:   buf_printf(o, "%lld", jint(v)); break;
+    case BJ_INT: {
+        /* Python 的 int 无上限：溢出时用 JSON 里保留的字面量。 */
+        const char *lit = jint_lit(v);
+        char *c = lit ? py_int_canon(lit) : NULL;
+        if (c) buf_puts(o, c);
+        else buf_printf(o, "%lld", jint(v));
+        free(c);
+        break;
+    }
     case BJ_FLOAT: py_float(o, jfloat(v)); break;
     case BJ_STR:   buf_append(o, jstr(v), jstrlen(v)); break;
     default:       w_repr(v, o); break;
@@ -133,20 +121,6 @@ static void py_str_value(const jnode *v, buf *o) {
 
 /* `_bb` 的本地副本：语义与 writeutil.c 的 wbody_bool 相同，只把错误文案里的
  * `%r` 换成 float 感知的 repr_value（wbody_bool 用 w_repr，1.0 会打成 "1"）。 */
-static int body_bool(SOCKET s, const jnode *b, const char *key, int dflt, int *out) {
-    const jnode *v = jget(b, key);
-    if (!v) { *out = dflt; return 1; }
-    if (jis_bool(v)) { *out = jbool(v); return 1; }
-    buf m;
-    buf_init(&m);
-    buf_puts(&m, key);
-    buf_puts(&m, " 必须是 true 或 false,收到 ");
-    repr_value(v, &m);
-    http_send_err(s, 400, buf_cstr(&m), NULL);
-    buf_free(&m);
-    return 0;
-}
-
 /* ---------------------------------------------------------------- 错误响应 */
 
 /* {"ok":false,"error":...,"code":...,<extra>}（HistoryError.to_dict 的形状）。 */
@@ -394,13 +368,13 @@ static void stash_list(slist *l, int limit) {
         const char *sub = colon ? colon + 1 : desc + descn;
         size_t sub_n = colon ? descn - sha_n - 1 : 0;
 
-        char *name = strip_dup(desc ? desc : "", sha_n);
-        char *subject = strip_dup(sub, sub_n);
+        char *name = py_strip_dup_n(desc ? desc : "", sha_n, NULL);
+        char *subject = py_strip_dup_n(sub, sub_n, NULL);
         if (!*subject) {
             free(subject);
-            subject = strip_dup(desc ? desc : "", descn);
+            subject = py_strip_dup_n(desc ? desc : "", descn, NULL);
         }
-        char *raw = strip_dup(line, ln);
+        char *raw = py_strip_dup_n(line, ln, NULL);
 
         buf ref;
         buf_init(&ref);
@@ -428,6 +402,17 @@ static long long stash_count(void) {
     return n;
 }
 
+/* Python 的 int 没有 2^126 上限，错误文案要原样回显；这里优先用 JSON 里
+ * 保留下来的十进制字面量，没有溢出时退回内部值。 */
+static char *index_echo_of(const jnode *idxv, long long index) {
+    const char *lit = idxv ? jint_lit(idxv) : NULL;
+    char *c = lit ? py_int_canon(lit) : NULL;
+    if (c) return c;
+    char t[32];
+    snprintf(t, sizeof(t), "%lld", index);
+    return xstrdup(t);
+}
+
 /* `_stash_ref(index)`：类型/负数/越界三道闸，成功时 *pos 是位置下标。 */
 static int stash_lookup(SOCKET s, const jnode *idxv, slist *l, size_t *pos) {
     long long index;
@@ -447,7 +432,9 @@ static int stash_lookup(SOCKET s, const jnode *idxv, slist *l, size_t *pos) {
     if (index >= (long long)l->n) {
         buf m;
         buf_init(&m);
-        buf_printf(&m, "没有第 %lld 个 stash(共 %lld 个)", index, (long long)l->n);
+        char *echo = index_echo_of(idxv, index);
+        buf_printf(&m, "没有第 %s 个 stash(共 %lld 个)", echo, (long long)l->n);
+        free(echo);
         send_err_extra(s, buf_cstr(&m), "no_such_stash", NULL);
         buf_free(&m);
         slist_free(l);
@@ -474,7 +461,7 @@ static void conflicted_paths(char ***v, size_t *count) {
     while (i < n) {
         size_t j = i;
         while (j < n && t[j] != '\n') j++;
-        char *line = strip_dup(t + i, j - i);
+        char *line = py_strip_dup_n(t + i, j - i, NULL);
         if (*line) strv_push(v, count, line, strlen(line));
         free(line);
         i = j + 1;
@@ -545,8 +532,8 @@ static int apply_core(SOCKET s, const jnode *idxv, buf *dict) {
 /* POST /api/history/stash */
 static void do_stash(SOCKET s, const jnode *b) {
     int inc = 0, keep = 0;
-    if (!body_bool(s, b, "include_untracked", 0, &inc)) return;
-    if (!body_bool(s, b, "keep_index", 0, &keep)) return;
+    if (!wbody_bool(s, b, "include_untracked", 0, &inc)) return;
+    if (!wbody_bool(s, b, "keep_index", 0, &keep)) return;
 
     /* _need_msg(b.get("message"), "stash 说明") */
     const jnode *mv = jget(b, "message");
@@ -657,7 +644,7 @@ static void do_stash_apply(SOCKET s, const jnode *b) {
 /* POST /api/history/stash/pop —— 接线层的 confirmed 闸先于一切。 */
 static void do_stash_pop(SOCKET s, const jnode *b) {
     int conf = 0;
-    if (!body_bool(s, b, "confirmed", 0, &conf)) return;
+    if (!wbody_bool(s, b, "confirmed", 0, &conf)) return;
     if (!conf) {
         buf m;
         buf_init(&m);
@@ -727,7 +714,7 @@ static void do_stash_pop(SOCKET s, const jnode *b) {
 /* POST /api/history/stash/drop */
 static void do_stash_drop(SOCKET s, const jnode *b) {
     int conf = 0;
-    if (!body_bool(s, b, "confirmed", 0, &conf)) return;
+    if (!wbody_bool(s, b, "confirmed", 0, &conf)) return;
     if (!conf) {
         send_err_extra(s, MSG_DROP_NEEDS_CONFIRM, "needs_confirmation",
                        "\"op\":\"stash-drop\"");

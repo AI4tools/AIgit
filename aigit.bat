@@ -29,6 +29,7 @@ rem ==========================================================================
 setlocal EnableExtensions EnableDelayedExpansion
 
 set "AIGIT_DIR=%~dp0"
+set "CEXE=%AIGIT_DIR%c\build\aigit.exe"
 
 set "PORT=8777"
 set "REPO="
@@ -140,19 +141,21 @@ if "!PORT:~0,1!"=="0" if not "!PORT!"=="0" (
 if !PORT! LSS 1 goto :bad_port
 if !PORT! GTR 65535 goto :bad_port
 
-if not exist "%AIGIT_DIR%server.py" (
+if not exist "%CEXE%" if not exist "%AIGIT_DIR%python-ref\server.py" (
     call :die "找不到 server.py" ^
-        "应该在 %AIGIT_DIR%server.py" ^
+        "应该在 %AIGIT_DIR%python-ref\server.py" ^
         "但这个文件不存在。" ^
-        "请确认 aigit.bat 和 server.py 在同一个文件夹里。"
+        "请确认 aigit.bat 与 python-ref\server.py 的相对位置没变。"
     goto :fail
 )
 
-rem ---------------------------------------------------------------- 找 Python
-call :find_python
-if not defined PYEXE (
-    call :die_python
-    goto :fail
+rem ---------------------------------------------------------------- 找 Python（有 C 版就跳过）
+if not exist "%CEXE%" (
+    call :find_python
+    if not defined PYEXE (
+        call :die_python
+        goto :fail
+    )
 )
 
 rem ---------------------------------------------------------------- 找 git
@@ -269,7 +272,7 @@ if defined SANDBOX set "SANDBOXARG=--sandbox"
 echo.
 echo ------------------------------------------------------------
 echo   aigit
-echo   python    !PYEXE!
+if exist "%CEXE%" (echo   server    %CEXE%) else (echo   python    !PYEXE!)
 echo   仓库      "%REPO%"
 if defined SANDBOX echo   模式      演练仓(已清空重建)
 if not defined SANDBOX echo   模式      现有仓库(改动请当心)
@@ -279,12 +282,16 @@ echo   提醒      不会自动打开浏览器,请自己复制上面那行地址
 echo ------------------------------------------------------------
 echo.
 
-%PYEXE% "%AIGIT_DIR%server.py" --root "%REPO%" --port %PORT% %SANDBOXARG% %PASSTHRU%
+if exist "%CEXE%" (
+    "%CEXE%" --root "%REPO%" --port %PORT% %SANDBOXARG% %PASSTHRU%
+) else (
+    %PYEXE% "%AIGIT_DIR%python-ref\server.py" --root "%REPO%" --port %PORT% %SANDBOXARG% %PASSTHRU%
+)
 set "RC=%ERRORLEVEL%"
 
 if "%RC%"=="0" goto :done
 echo.
-echo [错误] server.py 以退出码 %RC% 结束。
+echo [错误] server 以退出码 %RC% 结束。
 if "%RC%"=="1" (
     echo        上面若有 "Address already in use" 或 "WinError 10048",说明端口又被占了,
     echo        换个端口重试:aigit.bat -Port 8888

@@ -160,3 +160,65 @@ int idx_has(const idx_names *ix, const char *path) {
         if (!strcmp(ix->paths[i], path)) return 1;
     return 0;
 }
+
+/* 40 位十六进制才认（短 sha / 符号引用一律回退）。 */
+static int looks_like_sha(const char *s, size_t n) {
+    if (n != 40) return 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F')))
+            return 0;
+    }
+    return 1;
+}
+
+char *head_sha_direct(void) {
+    wchar_t gd[IW];
+    if (!gitdir_w(gd, IW)) return NULL;
+
+    wchar_t p[IW];
+    _snwprintf(p, IW, L"%ls\\HEAD", gd);
+    buf b;
+    buf_init(&b);
+    if (!read_bytes(p, &b)) { buf_free(&b); return NULL; }
+    buf_cstr(&b);
+
+    /* 去掉尾部空白 */
+    size_t n = b.n;
+    while (n && (b.p[n - 1] == '\n' || b.p[n - 1] == '\r' ||
+                 b.p[n - 1] == ' ' || b.p[n - 1] == '\t'))
+        n--;
+    b.p[n] = 0;
+
+    if (n >= 5 && !strncmp(b.p, "ref: ", 5)) {
+        char *ref = b.p + 5;
+        while (*ref == ' ' || *ref == '\t') ref++;
+        /* 只接受 refs/... 这种正常路径，别让 ../ 之类跑出 gitdir */
+        if (strncmp(ref, "refs/", 5) != 0 || strstr(ref, "..") ||
+            strchr(ref, '\\')) {
+            buf_free(&b);
+            return NULL;
+        }
+        wchar_t *rw = u82w(ref);
+        if (!rw) { buf_free(&b); return NULL; }
+        _snwprintf(p, IW, L"%ls\\%ls", gd, rw);
+        free(rw);
+        buf r;
+        buf_init(&r);
+        if (!read_bytes(p, &r)) { buf_free(&r); buf_free(&b); return NULL; }
+        buf_cstr(&r);
+        size_t rn = r.n;
+        while (rn && (r.p[rn - 1] == '\n' || r.p[rn - 1] == '\r' ||
+                      r.p[rn - 1] == ' ' || r.p[rn - 1] == '\t'))
+            rn--;
+        char *out = looks_like_sha(r.p, rn) ? xstrndup(r.p, rn) : NULL;
+        buf_free(&r);
+        buf_free(&b);
+        return out;
+    }
+
+    char *out = looks_like_sha(b.p, n) ? xstrndup(b.p, n) : NULL;
+    buf_free(&b);
+    return out;
+}

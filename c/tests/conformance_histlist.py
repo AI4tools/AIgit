@@ -25,7 +25,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 C_ROOT = os.path.dirname(HERE)                       # ...\c_agent_histlist\c
 EXE = os.path.join(C_ROOT, "build", "aigit.exe")
-PY_ROOT = os.environ.get("AIGIT_PY_ROOT") or r"D:\project\aigit"
+PY_ROOT = os.environ.get("AIGIT_PY_ROOT") or r"D:\project\aigit\python-ref"
 BASE = os.path.join(os.environ["TEMP"], "aigit_c_histlist_%d" % (os.getpid() % 100000))
 
 TAGS = "/api/history/tags"

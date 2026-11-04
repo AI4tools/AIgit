@@ -146,46 +146,6 @@ static int reply_blame_empty(SOCKET s, const char *msg, long long total) {
 /* Python int(str) 的可接受子集：两端空白、可选 +/-、数字间单个 '_'。
  * 用 __int128 承接，Python 的 int 是任意精度 —— 10^30 这种 start/end 是能传到
  * `git blame -L` 的（git 自己会夹），饱和到 long long 就会变成负数并报错。 */
-static int py_int128(const char *s, __int128 *out) {
-    if (!s) return 0;
-    while (*s && isspace((unsigned char)*s)) s++;
-    const char *e = s + strlen(s);
-    while (e > s && isspace((unsigned char)e[-1])) e--;
-    if (e == s) return 0;
-    const char *p = s;
-    int neg = 0;
-    if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
-    if (p == e) return 0;
-    __int128 v = 0;
-    const __int128 lim = ((__int128)1) << 126;
-    int prev_digit = 0, overflow = 0;
-    for (; p < e; p++) {
-        if (*p == '_') {
-            if (!prev_digit) return 0;
-            prev_digit = 0;
-            continue;
-        }
-        if (*p < '0' || *p > '9') return 0;
-        int d = *p - '0';
-        if (v > (lim - d) / 10) overflow = 1;
-        else v = v * 10 + d;
-        prev_digit = 1;
-    }
-    if (!prev_digit) return 0;
-    if (overflow) v = lim;
-    *out = neg ? -v : v;
-    return 1;
-}
-
-static int py_int(const char *s, long long *out) {
-    __int128 v;
-    if (!py_int128(s, &v)) return 0;
-    if (v > (__int128)LLONG_MAX) v = (__int128)LLONG_MAX;
-    if (v < (__int128)LLONG_MIN) v = (__int128)LLONG_MIN;
-    *out = (long long)v;
-    return 1;
-}
-
 static void fmt_i128(char *out, size_t n, __int128 v) {
     char tmp[64];
     int i = 0;
@@ -200,21 +160,8 @@ static void fmt_i128(char *out, size_t n, __int128 v) {
 }
 
 /* Python repr(str) 的常见形态（用于「参数 X 必须是整数,收到 %r」）。 */
-static void py_repr_n(buf *o, const char *s, size_t n) {
-    int has_sq = memchr(s, '\'', n) != NULL;
-    int has_dq = memchr(s, '"', n) != NULL;
-    char q = (has_sq && !has_dq) ? '"' : '\'';
-    buf_putc(o, q);
-    for (size_t i = 0; i < n; i++) {
-        unsigned c = (unsigned char)s[i];
-        if (c == '\\' || c == (unsigned)q) { buf_putc(o, '\\'); buf_putc(o, (char)c); }
-        else if (c == '\n') buf_puts(o, "\\n");
-        else if (c == '\r') buf_puts(o, "\\r");
-        else if (c == '\t') buf_puts(o, "\\t");
-        else if (c < 0x20 || c == 0x7f) buf_printf(o, "\\x%02x", c);
-        else buf_putc(o, (char)c);
-    }
-    buf_putc(o, q);
+static void hist_repr_str(buf *o, const char *s, size_t n) {
+    py_repr_str(o, s, n);
 }
 
 
@@ -222,7 +169,7 @@ static int bad_int_err(SOCKET s, const char *key, const char *val, size_t vlen) 
     buf m;
     buf_init(&m);
     buf_printf(&m, "参数 %s 必须是整数,收到 ", key);
-    py_repr_n(&m, val, vlen);
+    hist_repr_str(&m, val, vlen);
     int r = reply_err(s, buf_cstr(&m), NULL);
     buf_free(&m);
     return r;
@@ -238,7 +185,7 @@ static int qi_py(SOCKET s, const char *query, const char *key, long long dflt,
         *out = dflt;
         return 0;
     }
-    int ok = !memchr(v, 0, vlen) && py_int(v, out);
+    int ok = !memchr(v, 0, vlen) && py_int_parse(v, out);
     if (!ok) { bad_int_err(s, key, v, vlen); free(v); return -1; }
     free(v);
     return 0;
@@ -246,17 +193,20 @@ static int qi_py(SOCKET s, const char *query, const char *key, long long dflt,
 
 /* server.py::_qopt —— 没给/空串 -> 无；非法 -> 400（返回 -1，已发响应）。 */
 static int qopt_py(SOCKET s, const char *query, const char *key,
-                   int *given, __int128 *out) {
+                   int *given, __int128 *out, char **canon) {
     char *v = NULL;
     size_t vlen = 0;
+    if (canon) *canon = NULL;
     if (!q_get_n(query, key, &v, &vlen) || vlen == 0) {
         free(v);
         *given = 0;
         return 0;
     }
-    int ok = !memchr(v, 0, vlen) && py_int128(v, out);
+    int ok = !memchr(v, 0, vlen) && py_int128_parse(v, out);
     if (!ok) { bad_int_err(s, key, v, vlen); free(v); return -1; }
     *given = 1;
+    /* 原文本的规范十进制：C 只算到 2^126，回显必须给精确值。 */
+    if (canon) *canon = py_int_canon_n(v, vlen);
     free(v);
     return 0;
 }
@@ -290,7 +240,7 @@ static int take_file(SOCKET s, const char *query, char **out) {
         buf m;
         buf_init(&m);
         buf_puts(&m, "路径里不能包含 NUL 字符,已拒绝:");
-        py_repr_n(&m, v, vlen);
+        hist_repr_str(&m, v, vlen);
         int r = reply_err(s, buf_cstr(&m), NULL);
         buf_free(&m);
         free(v);
@@ -357,87 +307,9 @@ static char *cat2(const char *a, const char *b) {
  * —— 与 Path.resolve() 在 Windows 上的行为一致。
  */
 
-static wchar_t *final_path_w(const wchar_t *path) {
-    HANDLE h = CreateFileW(path, 0,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    if (h == INVALID_HANDLE_VALUE) return NULL;
-    DWORD need = GetFinalPathNameByHandleW(h, NULL, 0, FILE_NAME_NORMALIZED);
-    wchar_t *out = NULL;
-    if (need) {
-        out = xmalloc(((size_t)need + 1) * sizeof(wchar_t));
-        if (!GetFinalPathNameByHandleW(h, out, need, FILE_NAME_NORMALIZED)) {
-            free(out);
-            out = NULL;
-        }
-    }
-    CloseHandle(h);
-    return out;
-}
-
 /* 最长已存在祖先的真实路径 + 原样拼回剩余后缀 */
-static wchar_t *real_abs(const wchar_t *full) {
-    wchar_t *cur = _wcsdup(full);
-    wchar_t *suffix = _wcsdup(L"");
-    wchar_t *result = NULL;
-    for (int depth = 0; depth < 256; depth++) {
-        wchar_t *rp = final_path_w(cur);
-        if (rp) {
-            const wchar_t *p = rp;
-            if (p[0] == L'\\' && p[1] == L'\\' && p[2] == L'?' && p[3] == L'\\') p += 4;
-            buf b;
-            buf_init(&b);
-            buf_append(&b, p, wcslen(p) * sizeof(wchar_t));
-            if (suffix[0]) {
-                buf_append(&b, L"\\", sizeof(wchar_t));
-                buf_append(&b, suffix, wcslen(suffix) * sizeof(wchar_t));
-            }
-            wchar_t z = 0;
-            buf_append(&b, &z, sizeof(wchar_t));
-            result = (wchar_t *)b.p;
-            free(rp);
-            break;
-        }
-        wchar_t *slash = wcsrchr(cur, L'\\');
-        if (!slash || slash == cur) break;
-        if (suffix[0]) {
-            size_t ln = wcslen(slash + 1), ls = wcslen(suffix);
-            wchar_t *ns = xmalloc((ln + 1 + ls + 1) * sizeof(wchar_t));
-            wcscpy(ns, slash + 1);
-            wcscat(ns, L"\\");
-            wcscat(ns, suffix);
-            free(suffix);
-            suffix = ns;
-        } else {
-            free(suffix);
-            suffix = _wcsdup(slash + 1);
-        }
-        *slash = 0;
-    }
-    free(cur);
-    free(suffix);
-    return result;
-}
-
 static char *canon_rel(const char *rel) {
-    wchar_t *full = abs_of(rel);
-    if (!full) return xstrdup(rel);
-    size_t n = wcslen(full);
-    while (n > 3 && (full[n - 1] == L'\\' || full[n - 1] == L'/')) full[--n] = 0;
-    wchar_t *real = real_abs(full);
-    free(full);
-    if (!real) return xstrdup(rel);
-    const wchar_t *root = git_root();
-    size_t rl = root ? wcslen(root) : 0;
-    if (!root || _wcsnicmp(real, root, rl) != 0 || real[rl] != L'\\' || !real[rl + 1]) {
-        free(real);
-        return xstrdup(rel);
-    }
-    wchar_t *rest = real + rl + 1;
-    for (wchar_t *p = rest; *p; p++) if (*p == L'\\') *p = L'/';
-    char *out = w2u8(rest);
-    free(real);
-    return out ? out : xstrdup(rel);
+    return path_canon_rel(rel);
 }
 
 /* ---------------------------------------------------------------- 杂项 */
@@ -467,13 +339,6 @@ static void universal_nl(buf *b) {
     }
     b->n = w;
     b->p[w] = 0;
-}
-
-static char *strip_dup(const char *s) {
-    while (*s && isspace((unsigned char)*s)) s++;
-    const char *e = s + strlen(s);
-    while (e > s && isspace((unsigned char)e[-1])) e--;
-    return xstrndup(s, (size_t)(e - s));
 }
 
 static int all_digits(const char *s) {
@@ -546,7 +411,7 @@ static long long blob_lines(const char *rel) {
         buf o;
         buf_init(&o);
         int rc = git_run(args, NULL, 0, &o, NULL);
-        char *s = strip_dup(buf_cstr(&o));
+        char *s = py_strip_dup(buf_cstr(&o));
         if (rc != 0 || !all_digits(s)) {
             free(s);
             buf_free(&o);
@@ -554,7 +419,7 @@ static long long blob_lines(const char *rel) {
             return 0;
         }
         long long size = 0;
-        (void)py_int(s, &size);
+        (void)py_int_parse(s, &size);
         free(s);
         buf_free(&o);
 
@@ -591,7 +456,7 @@ static void civil_from_days(long long z, int *y, unsigned *m, unsigned *d) {
 
 static void iso_from_epoch(const char *epoch, const char *tz, buf *o) {
     long long e = 0;
-    if (!epoch || !py_int(epoch, &e)) return;      /* Python: 解析不了 -> "" */
+    if (!epoch || !py_int_parse(epoch, &e)) return;      /* Python: 解析不了 -> "" */
     int sign = 1, hh = 0, mm = 0;
     if (tz && (tz[0] == '+' || tz[0] == '-') &&
         isdigit((unsigned char)tz[1]) && isdigit((unsigned char)tz[2]) &&
@@ -780,10 +645,10 @@ static int file_history_json(SOCKET s, const char *rel, long long limit, int fol
         buf_init(&ro);
         git_run(args, NULL, 0, &ro, NULL);
         universal_nl(&ro);
-        char *more = strip_dup(buf_cstr(&ro));
+        char *more = py_strip_dup(buf_cstr(&ro));
         if (all_digits(more)) {
             long long mv = 0;
-            (void)py_int(more, &mv);
+            (void)py_int_parse(more, &mv);
             if (mv > (long long)rows.n) truncated = 1;
         }
         free(more);
@@ -799,7 +664,7 @@ static int file_history_json(SOCKET s, const char *rel, long long limit, int fol
         buf_init(&to);
         git_run(args, NULL, 0, &to, NULL);
         universal_nl(&to);
-        char *t = strip_dup(buf_cstr(&to));
+        char *t = py_strip_dup(buf_cstr(&to));
         tracked = (*t != 0);
         free(t);
         buf_free(&to);
@@ -938,7 +803,8 @@ static void free_blame(brecs *recs, char **keys, char **vals, size_t nmeta,
 }
 
 static int blame_json(SOCKET s, const char *rel, int have_start, __int128 start,
-                      int have_end, __int128 end, long long limit_in) {
+                      int have_end, __int128 end, long long limit_in,
+                      const char *start_canon, const char *end_canon) {
     if (!repo_exists()) {
         char *root = w2u8(git_root());
         buf m;
@@ -1013,7 +879,9 @@ static int blame_json(SOCKET s, const char *rel, int have_start, __int128 start,
             fmt_i128(s_first, sizeof s_first, first);
             buf m;
             buf_init(&m);
-            buf_printf(&m, "end_line(%s) 不能小于 start_line(%s)", s_end, s_first);
+            /* 负的超大 end 也要按用户原文回显（Python 的 int 无上限）。 */
+            const char *e_txt = end_canon ? end_canon : s_end;
+            buf_printf(&m, "end_line(%s) 不能小于 start_line(%s)", e_txt, s_first);
             int r = reply_err(s, buf_cstr(&m), "bad_line");
             buf_free(&m);
             return r;
@@ -1044,7 +912,7 @@ static int blame_json(SOCKET s, const char *rel, int have_start, __int128 start,
         buf_init(&errb);
         rc = git_run(args, NULL, 0, &out, &errb);
         if (rc != 0) {
-            char *msg = strip_dup(errb.n ? buf_cstr(&errb) : buf_cstr(&out));
+            char *msg = py_strip_dup(errb.n ? buf_cstr(&errb) : buf_cstr(&out));
             buf_free(&errb);
             buf_free(&out);
             if (!has_commits()) {
@@ -1131,7 +999,7 @@ static int blame_json(SOCKET s, const char *rel, int have_start, __int128 start,
                              ? lens[j] - 1 : 0;
 
         long long lno = 0;
-        (void)py_int(final, &lno);
+        (void)py_int_parse(final, &lno);
 
         brec r;
         memset(&r, 0, sizeof r);
@@ -1179,8 +1047,12 @@ static int blame_json(SOCKET s, const char *rel, int have_start, __int128 start,
         char s_first[64], s_last[64];
         fmt_i128(s_first, sizeof s_first, first);
         fmt_i128(s_last, sizeof s_last, last);
-        buf_printf(&o, ",\"requested_first\":%s", s_first);
-        buf_printf(&o, ",\"requested_end\":%s", s_last);
+        /* 用户给的大整数按原样回显（Python 的 int 没有上限）：
+         * 只在「确实取了用户值」时才用规范文本，否则用夹取后的内部值。 */
+        const char *f = (start_canon && first > 1) ? start_canon : s_first;
+        const char *l = (end_canon && end > 0 && last == end) ? end_canon : s_last;
+        buf_printf(&o, ",\"requested_first\":%s", f);
+        buf_printf(&o, ",\"requested_end\":%s", l);
     }
     buf_printf(&o, ",\"first_line\":%lld", recs.v[0].line);
     buf_printf(&o, ",\"last_line\":%lld", covered);
@@ -1251,14 +1123,25 @@ static int handle_blame(SOCKET s, const char *query) {
     __int128 start = 0, end = 0;
     long long limit = DEFAULT_BLAME_LINES;
     int have_start = 0, have_end = 0;
-    if (qopt_py(s, query, "start", &have_start, &start) < 0) { free(rel); return 1; }
-    if (qopt_py(s, query, "end", &have_end, &end) < 0) { free(rel); return 1; }
+    char *start_canon = NULL, *end_canon = NULL;
+    if (qopt_py(s, query, "start", &have_start, &start, &start_canon) < 0) {
+        free(rel);
+        return 1;
+    }
+    if (qopt_py(s, query, "end", &have_end, &end, &end_canon) < 0) {
+        free(start_canon);
+        free(rel);
+        return 1;
+    }
     if (qi_py(s, query, "limit", DEFAULT_BLAME_LINES, &limit) < 0) {
         free(rel);
         return 1;
     }
 
-    int r = blame_json(s, rel, have_start, start, have_end, end, limit);
+    int r = blame_json(s, rel, have_start, start, have_end, end, limit,
+                       start_canon, end_canon);
+    free(start_canon);
+    free(end_canon);
     free(rel);
     return r;
 }

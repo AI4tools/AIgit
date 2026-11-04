@@ -46,21 +46,14 @@
 
 /* ================================================================ 小工具 */
 
-static int is_ws(int c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
-}
-
 /* Python 的 str.strip()：就地截断尾部空白，返回跳过前导空白后的指针。 */
 static char *strip(char *s) {
-    while (*s && is_ws((unsigned char)*s)) s++;
-    size_t n = strlen(s);
-    while (n && is_ws((unsigned char)s[n - 1])) s[--n] = 0;
-    return s;
+    return py_strip(s);
 }
 
 static int blank(const char *s) {
     for (; *s; s++)
-        if (!is_ws((unsigned char)*s)) return 0;
+        if (!py_is_ascii_space((unsigned char)*s)) return 0;
     return 1;
 }
 
@@ -115,9 +108,9 @@ static char *utf8_prefix(const char *s, size_t nchars) {
 /* Python int() 的 ASCII 子集：可选空白/符号 + 数字（数字间允许单个下划线）。 */
 static int py_int(const char *raw, long long *out) {
     const char *p = raw;
-    while (*p && is_ws((unsigned char)*p)) p++;
+    while (*p && py_is_ascii_space((unsigned char)*p)) p++;
     const char *q = p + strlen(p);
-    while (q > p && is_ws((unsigned char)q[-1])) q--;
+    while (q > p && py_is_ascii_space((unsigned char)q[-1])) q--;
     if (p == q) return 0;
     int neg = 0;
     if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
@@ -276,6 +269,18 @@ static char *get_str(const char *query, const char *key, size_t *outlen) {
 }
 
 /* 取整数参数。返回 0=成功（含缺省），1=不是整数（*bad 已填 repr 文本）。 */
+/* 大整数回显：优先用 query 原文本的规范十进制（Python 的 int 无上限）。 */
+static char *index_echo_q(const char *query, long long v) {
+    size_t n = 0;
+    char *raw = get_raw(query, "index", &n);
+    char *c = raw ? py_int_canon_n(raw, n) : NULL;
+    free(raw);
+    if (c) return c;
+    char t[32];
+    snprintf(t, sizeof(t), "%lld", v);
+    return xstrdup(t);
+}
+
 static int get_int(const char *query, const char *key, long long dflt, long long *out,
                    buf *bad) {
     size_t n = 0;
@@ -466,10 +471,10 @@ static strlist parents_of(const char *rev) {
         /* Python: s.split() —— 任意空白切分 */
         char *p = line;
         while (*p) {
-            while (*p && is_ws((unsigned char)*p)) p++;
+            while (*p && py_is_ascii_space((unsigned char)*p)) p++;
             if (!*p) break;
             char *q = p;
-            while (*q && !is_ws((unsigned char)*q)) q++;
+            while (*q && !py_is_ascii_space((unsigned char)*q)) q++;
             char save = *q;
             *q = 0;
             sl_push(&l, p);
@@ -909,7 +914,7 @@ static char *match_stash(const char *line, long long *idx) {
     }
     if (p[0] != '}' || p[1] != ':') return NULL;
     p += 2;
-    while (*p && is_ws((unsigned char)*p)) p++;
+    while (*p && py_is_ascii_space((unsigned char)*p)) p++;
     *idx = v;
     return (char *)p;
 }
@@ -1182,7 +1187,9 @@ static void handle_stash_show(const char *query, SOCKET s) {
     if (index >= (long long)nrow) {
         buf m;
         buf_init(&m);
-        buf_printf(&m, "没有第 %lld 个 stash(共 %zu 个)", index, nrow);
+        char *echo = index_echo_q(query, index);
+        buf_printf(&m, "没有第 %s 个 stash(共 %zu 个)", echo, nrow);
+        free(echo);
         send_hist(s, buf_cstr(&m), "no_such_stash", NULL);
         buf_free(&m);
         stashes_free(rows, nrow);
@@ -1296,7 +1303,9 @@ static void plan_stash_drop_q(const char *query, SOCKET s) {
     if (index >= (long long)nrow) {
         buf m;
         buf_init(&m);
-        buf_printf(&m, "没有第 %lld 个 stash(共 %zu 个)", index, nrow);
+        char *echo = index_echo_q(query, index);
+        buf_printf(&m, "没有第 %s 个 stash(共 %zu 个)", echo, nrow);
+        free(echo);
         send_hist(s, buf_cstr(&m), "no_such_stash", NULL);
         buf_free(&m);
         stashes_free(rows, nrow);

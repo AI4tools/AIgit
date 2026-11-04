@@ -24,7 +24,7 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 C_ROOT = os.path.dirname(HERE)                 # ...\aigit\c
-PY_ROOT = os.path.dirname(C_ROOT)              # ...\aigit
+PY_ROOT = os.path.join(os.path.dirname(C_ROOT), "python-ref")              # ...\aigit
 EXE = os.path.join(C_ROOT, "build", "aigit.exe")
 BASE = os.path.join(os.environ["TEMP"], "aigit_c_m0_%d" % (os.getpid() % 100000))
 

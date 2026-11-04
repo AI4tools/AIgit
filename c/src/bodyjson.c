@@ -13,6 +13,7 @@ struct jnode {
     long long i;
     double f;
     char *str;      /* BJ_STR: UTF-8, NUL 结尾；也可含内嵌 NUL（用 len） */
+    char *lit;      /* BJ_INT: 原始十进制字面量（超 int64 时用来精确回显） */
     size_t slen;
     jnode **items;  /* BJ_ARR */
     size_t n;
@@ -237,20 +238,21 @@ static jnode *parse_number(jp *p) {
         set_err(p, "Expecting value", start);
         return NULL;
     }
-    char tmp[128];
     size_t len = p->i - start;
-    if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
-    memcpy(tmp, p->s + start, len);
-    tmp[len] = 0;
+    char *lit = xstrndup(p->s + start, len);
     jnode *v;
     if (is_float) {
         v = jnew(BJ_FLOAT);
-        v->f = strtod(tmp, NULL);
+        v->f = strtod(lit, NULL);
+        free(lit);
     } else {
         v = jnew(BJ_INT);
         errno = 0;
-        long long x = strtoll(tmp, NULL, 10);
-        v->i = x;                            /* 超 int64 饱和（已知差异） */
+        long long x = strtoll(lit, NULL, 10);
+        v->i = x;
+        /* 字面量留着：Python 的 int 是任意精度，超 int64 时回显要精确。 */
+        if (errno == ERANGE) v->lit = lit;
+        else free(lit);
     }
     return v;
 }
@@ -417,6 +419,11 @@ int jbool(const jnode *v) { return jis_bool(v) ? v->b : 0; }
 int jis_int(const jnode *v) { return v && v->type == BJ_INT; }
 int jis_float(const jnode *v) { return v && v->type == BJ_FLOAT; }
 long long jint(const jnode *v) { return jis_int(v) ? v->i : 0; }
+
+/* 超出 int64 时保留的原始字面量；没有（正常范围内）返回 NULL。 */
+const char *jint_lit(const jnode *v) {
+    return (v && v->type == BJ_INT) ? v->lit : NULL;
+}
 double jfloat(const jnode *v) { return jis_float(v) ? v->f : 0.0; }
 size_t jlen(const jnode *v) {
     if (!v) return 0;

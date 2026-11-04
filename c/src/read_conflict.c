@@ -45,14 +45,6 @@
 
 /* ================================================================ 小工具 */
 
-static char *strip_dup(const char *s) {
-    if (!s) return NULL;
-    while (*s && isspace((unsigned char)*s)) s++;
-    size_t n = strlen(s);
-    while (n && isspace((unsigned char)s[n - 1])) n--;
-    return xstrndup(s, n);
-}
-
 static int is_ws_ascii(int c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
 }
@@ -83,7 +75,7 @@ static void free_strv(char **v, size_t n) {
 /* 合法 sha（40 或 64 位十六进制），与 gitrefs._is_sha 同口径（先 strip）。 */
 static int is_sha_text(const char *s) {
     if (!s) return 0;
-    char *t = strip_dup(s);
+    char *t = py_strip_dup(s);
     size_t n = strlen(t);
     int ok = (n == 40 || n == 64);
     for (size_t i = 0; ok && i < n; i++) {
@@ -138,78 +130,19 @@ static char *u8_sanitize(const char *s, size_t n) {
 }
 
 /* Python repr(str) 的近似（用于错误文案里的 %r），支持内嵌 NUL。 */
-static char *py_repr_n(const char *s, size_t n) {
-    char quote = '\'';
-    if (memchr(s, '\'', n) && !memchr(s, '"', n)) quote = '"';
-    buf b;
-    buf_init(&b);
-    buf_putc(&b, quote);
-    for (size_t i = 0; i < n; i++) {
-        unsigned c = (unsigned char)s[i];
-        if (c == (unsigned char)quote || c == '\\') {
-            buf_putc(&b, '\\');
-            buf_putc(&b, (char)c);
-        } else if (c == '\n') buf_puts(&b, "\\n");
-        else if (c == '\r') buf_puts(&b, "\\r");
-        else if (c == '\t') buf_puts(&b, "\\t");
-        else if (c < 0x20 || c == 0x7f) buf_printf(&b, "\\x%02x", c);
-        else buf_putc(&b, (char)c);
-    }
-    buf_putc(&b, quote);
-    char *r = xstrdup(buf_cstr(&b));
-    buf_free(&b);
-    return r;
-}
-
-static char *py_repr(const char *s) { return py_repr_n(s, strlen(s)); }
-
-static int hexval_c(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
 
 /* query 参数解码：保留内嵌 NUL（q_get 的 NUL 会截断，而 Python 版会拒绝
  * 含 NUL 的路径/名字 —— 实测 `?file=a.txt%00` Python 回 400「路径里不能包含
  * NUL 字符」，用 q_get 则会静默变成 a.txt，等于路径走私）。 */
 static int q_raw(const char *query, const char *key, char **out, size_t *outlen) {
-    *out = NULL;
-    *outlen = 0;
-    if (!query || !key) return 0;
-    size_t klen = strlen(key);
-    const char *p = query;
-    while (p && *p) {
-        const char *amp = strchr(p, '&');
-        const char *end = amp ? amp : p + strlen(p);
-        const char *eq = memchr(p, '=', (size_t)(end - p));
-        size_t this_klen = eq ? (size_t)(eq - p) : (size_t)(end - p);
-        if (this_klen == klen && !strncmp(p, key, klen)) {
-            const char *v = eq ? eq + 1 : end;
-            buf b;
-            buf_init(&b);
-            for (const char *q = v; q < end; q++) {
-                char c = *q;
-                if (c == '+') c = ' ';
-                else if (c == '%' && q + 2 < end) {
-                    int h = hexval_c(q[1]), l = hexval_c(q[2]);
-                    if (h >= 0 && l >= 0) { c = (char)((h << 4) | l); q += 2; }
-                }
-                buf_putc(&b, c);
-                if (b.n > 65536) { buf_free(&b); return -1; }
-            }
-            buf_reserve(&b, 0);
-            *outlen = b.n;
-            char *res = xmalloc(b.n + 1);
-            if (b.n) memcpy(res, b.p, b.n);
-            res[b.n] = 0;
-            *out = res;
-            buf_free(&b);
-            return 1;
-        }
-        p = amp ? amp + 1 : NULL;
+    int r = q_get_n(query, key, out, outlen);
+    if (r == 1 && *outlen > 65536) {
+        free(*out);
+        *out = NULL;
+        *outlen = 0;
+        return -1;
     }
-    return 0;
+    return r;
 }
 
 /* ================================================================ SHA-256 */
@@ -453,7 +386,7 @@ static const wchar_t *gitdir_w(void) {
     const char *args[] = { "rev-parse", "--git-dir", NULL };
     int rc = run_git(&out, &err, args);
     if (rc == 0) {
-        char *s = strip_dup(buf_cstr(&out));
+        char *s = py_strip_dup(buf_cstr(&out));
         if (*s) {
             wchar_t *w = u82w(s);
             if (w) {
@@ -543,7 +476,7 @@ static char *resolve_ref_loose(const wchar_t *gd, const char *refname) {
         filebytes fb;
         read_plain_file(cur, &fb);
         if (fb.exists) {
-            char *t = strip_dup(fb.raw ? fb.raw : "");
+            char *t = py_strip_dup(fb.raw ? fb.raw : "");
             if (is_sha_text(t)) sha = xstrdup(t);
             free(t);
         }
@@ -592,10 +525,10 @@ static void head_state(headst *hs) {
         read_plain_file(hp, &fb);
         free(hp);
         if (fb.exists) {
-            char *raw = strip_dup(fb.raw ? fb.raw : "");
+            char *raw = py_strip_dup(fb.raw ? fb.raw : "");
             free(fb.raw);
             if (!strncmp(raw, "ref: ", 5)) {
-                char *ref = strip_dup(raw + 5);
+                char *ref = py_strip_dup(raw + 5);
                 if (!strncmp(ref, "refs/heads/", 11) && ref[11]) {
                     char *sha = resolve_ref_loose(gd, ref);
                     if (!sha) {
@@ -624,7 +557,7 @@ static void head_state(headst *hs) {
     buf_init(&err);
     const char *a1[] = { "rev-parse", "--verify", "--quiet", "HEAD", NULL };
     if (run_git(&out, &err, a1) == 0) {
-        char *t = strip_dup(buf_cstr(&out));
+        char *t = py_strip_dup(buf_cstr(&out));
         if (*t) { hs->sha = xstrdup(t); hs->kind = 1; }
         free(t);
     }
@@ -634,7 +567,7 @@ static void head_state(headst *hs) {
      * 否则 unborn + GIT_DIR 回退会把 currentBranch 变成 null。 */
     run_git(&out, &err, a2);
     {
-        char *t = strip_dup(buf_cstr(&out));
+        char *t = py_strip_dup(buf_cstr(&out));
         if (*t) { hs->branch = xstrdup(t); }
         free(t);
     }
@@ -1123,7 +1056,7 @@ static char *merge_base(char **reason) {
     buf_init(&e);
     const char *args[] = { "merge-base", "HEAD", "MERGE_HEAD", NULL };
     int rc = run_git(&o, &e, args);
-    char *t = strip_dup(buf_cstr(&o));
+    char *t = py_strip_dup(buf_cstr(&o));
     char *out = NULL;
     *reason = NULL;
     if (rc == 0 && *t) out = xstrdup(t);
@@ -1275,7 +1208,7 @@ static void gate_json(buf *o) {
     const char *raw = getenv("AIGIT_NET");
     if (raw) {
         source = "env:AIGIT_NET";
-        char *t = strip_dup(raw);
+        char *t = py_strip_dup(raw);
         const char *lv = NULL;
         if (!*t || !strcmp(t, "0") || ascii_lower_eq(t, "off") ||
             ascii_lower_eq(t, "none") || ascii_lower_eq(t, "no") ||
@@ -1287,7 +1220,7 @@ static void gate_json(buf *o) {
                  ascii_lower_eq(t, "rw") || ascii_lower_eq(t, "push")) lv = "write";
         if (!lv) {
             lv = "off";
-            char *rp = py_repr(raw);
+            char *rp = py_repr_n(raw, strlen(raw));
             buf nb;
             buf_init(&nb);
             buf_printf(&nb, "AIGIT_NET=%s 读不懂(只认 off/read/write),已按 off 处理。", rp);
@@ -1751,7 +1684,7 @@ static void conflict_files_json(buf *out, long *count) {
         pos += rl + 1;
         if (!rl) continue;
         char *t = xstrndup(rec, rl);
-        char *s = strip_dup(t);
+        char *s = py_strip_dup(t);
         free(t);
         if (*s) {
             paths = xrealloc(paths, (np + 1) * sizeof(char *));
@@ -1820,7 +1753,7 @@ static int h_state(SOCKET s) {
             const char *nl = strchr(p, '\n');
             size_t ln = nl ? (size_t)(nl - p) : strlen(p);
             char *t = xstrndup(p, ln);
-            char *st = strip_dup(t);
+            char *st = py_strip_dup(t);
             free(t);
             if (*st) { first_line = st; break; }
             free(st);
@@ -2056,7 +1989,7 @@ static void send_git_failed(SOCKET s, buf *err, buf *out, const char *verb, int 
     else if (out && out->n) src = buf_cstr(out);
     if (!src) src = "git 失败";
     char *norm = normalize_newlines(src, strlen(src));
-    char *msg = strip_dup(norm);
+    char *msg = py_strip_dup(norm);
     free(norm);
     buf o;
     buf_init(&o);
@@ -2116,12 +2049,17 @@ static int check_remote_name_n(const char *name, size_t n, char **msg) {
 
 /* ref 白名单，与 gitops._check_ref 同序同文案。 */
 static int ref_body_ok(const char *s, size_t n) {
+    /* Python 的 _REF_RE 是 **ASCII-only**：别换成 isalnum()，那受 locale 影响。 */
     if (n < 1 || n > 200) return 0;
-    if (!isalnum((unsigned char)s[0])) return 0;
+    unsigned char c0 = (unsigned char)s[0];
+    if (!((c0 >= '0' && c0 <= '9') || (c0 >= 'A' && c0 <= 'Z') ||
+          (c0 >= 'a' && c0 <= 'z')))
+        return 0;
     for (size_t i = 1; i < n; i++) {
-        char c = s[i];
-        if (!isalnum((unsigned char)c) && c != '.' && c != '_' && c != '/' && c != '-')
-            return 0;
+        unsigned char c = (unsigned char)s[i];
+        int alnum = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                    (c >= 'a' && c <= 'z');
+        if (!alnum && c != '.' && c != '_' && c != '/' && c != '-') return 0;
     }
     return 1;
 }
@@ -2147,15 +2085,13 @@ static int check_ref_n(const char *ref, size_t n, const char *what, char **msg, 
         buf_free(&b);
         return 0;
     }
-    for (size_t i = 0; i < n; i++) {
-        if (is_ws_ascii((unsigned char)ref[i]) || (unsigned char)ref[i] < 0x20) {
-            char *rp = py_repr_n(ref, n);
-            buf_printf(&b, "%s 不能含空白或控制字符:%s", what, rp);
-            free(rp);
-            *msg = xstrdup(buf_cstr(&b));
-            buf_free(&b);
-            return 0;
-        }
+    if (py_has_space_or_ctrl(ref, n)) {
+        char *rp = py_repr_n(ref, n);
+        buf_printf(&b, "%s 不能含空白或控制字符:%s", what, rp);
+        free(rp);
+        *msg = xstrdup(buf_cstr(&b));
+        buf_free(&b);
+        return 0;
     }
     int ok = 0;
     if (n >= 11 && !strncmp(ref, "refs/heads/", 11)) ok = ref_body_ok(ref + 11, n - 11);
@@ -2268,7 +2204,7 @@ static char *head_branch_name(void) {
     const char *args[] = { "rev-parse", "--abbrev-ref", "HEAD", NULL };
     char *out = NULL;
     if (run_git(&o, &e, args) == 0) {
-        char *t = strip_dup(buf_cstr(&o));
+        char *t = py_strip_dup(buf_cstr(&o));
         if (*t) out = t;
         else free(t);
     }

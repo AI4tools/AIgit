@@ -27,11 +27,11 @@
 | 历史 | `history/{amend,undo-last-commit,revert,revert/abort,stash,stash/apply,stash/pop,stash/drop,tag/create,tag/delete,branch/rename,branch/delete,reflog/restore}` |
 | 静态 | `/` 与三个面板的 js/html |
 
-### 1.2 v1 不做（明确登记）
+### 1.2 原计划「v1 不做」的两个缺口（已补）
 
-- `remote/{fetch,pull,push,ls-remote}`：要接凭据助手/SSH/代理，属于另一条线；v1 保留 `capability` 与只读的 `ahead-behind`
-- `/api/gen`（随机测试数据生成器）：测试工具，不是产品面
-- 非 Windows 平台
+- `remote/{fetch,pull,push}`：已实现（NetGate 三档、本地 bare remote 127 例对拍）
+- `/api/gen`：已实现（语义/确定性/count/护栏 262 项对拍；随机内容与 Python 不同）
+- 非 Windows 平台：仍不做（本机无法验证）
 
 ### 1.3 契约冻结
 
@@ -135,12 +135,18 @@ cmake -S c -B c\build-msvc -G Ninja && ninja -C c\build-msvc
 | 阶段 | 状态 | 实测依据 |
 |---|---|---|
 | M0 | **完成** | `conformance_m0.py` 9/9；`c/build/aigit.exe` 静态单文件 |
-| M1（读面） | **完成** | Python `do_GET` 的 21 组路由全部接上；`cmp_vs_git_c.py` **275/275**；8 片一致性 **2,442 项全过** |
+| M1（读面） | **完成** | Python `do_GET` 的 21 组路由全部接上；`cmp_vs_git_c.py` **275/275**；8 片一致性 **2,442 项全过**（M2/M3 后扩到 16 片） |
 | M1.5（直读快路径） | **完成（读面）** | branches/file/diff/conflict/tags/reflog/stashes 均 0 spawn；tags 63.4→1.0ms、reflog 57.5→2.1ms、stashes 57.6→5.4ms（详见 `doc/aigit-perf.md` §12.23） |
 | M2（写面） | **完成** | `cmp_write_vs_git_c.py` **12/12 场景**；3 片写面一致性（stage/unstage/discard/commit 122 项；checkout/branch/merge/reset 93 步 + 28 状态；conflict/* 221 步 + 44 状态） |
 | M3（冲突/历史写） | **完成** | `/api/history/*` 13 个写路由已接：amend/undo/reflog restore 93 次 POST；revert/branch/tag 154 步 + 466 fuzz；stash 103 次 POST，全部 0 失败 |
-| M4（安全面） | 部分 | `paths.c` 已有越界/`.git`/真实路径复查；符号链接受限（本机 WinError 1314），未做句柄级全量对拍 |
-| M5（并发/打包） | **性能预算完成，并发部分** | 28 项预算对 C **28/28 全过**（§12.24）；POST 全局串行化（并发 8 commit 实测 1×200+7×400，无 5xx）；并发读冒烟 12×25=300 请求 0 不一致 |
+| M4（安全面） | **基本完成** | 路径越界/`.git`/真实路径复查；guard 按真实 gitdir（含 worktree）枚举 filter/diff/merge/alias（转义子段名、续行），每次调用按配置指纹重新枚举（运行中改配置也绕不过）；diff 动词补 `--no-ext-diff/--no-textconv`，远程动词保留用户凭据；配置执行面对抗实测通过；`-fanalyzer` 修掉空指针/socket 泄漏。符号链接仍受限（WinError 1314），ASan 不可用 |
+| M5（并发/打包） | **完成** | spawn 预算 28/28；ms 预算 27–28/28（`stage` 环境敏感，同机 Python 也超 170）；请求内串行 + 跨进程仓锁；HTTP chunked/10s 超时；静态清单；并发 300、长跑 2,400、畸形 200、变异 3/3 全过；`build.ps1`/`package.ps1` + `run-all-c.ps1` |
+| Unicode 语义（v27） | **完成** | `\w` 733 段区间表（133,548 码点与
+  `str.isalnum()` 逐码点一致）；`isspace` 29 码点；`strip`/`repr` 共享实现
+  （不可打印按 `\xNN`/`\uNNNN`/`\UNNNNNNNN`）；query/路径/整数/UTF-8 解码
+  的本地副本全部删除；超 2^126 的整数回显用 `py_int_canon`（88 例一致） |
+| 独立套件复核 | **完成（发现并修复 6 个真缺陷）** | `test_aigit_contract` **18/18**；`test_aigit_extra` **20 PASS/0 FAIL/1 SKIP**；`test_aigit_gate` **10/10**；`test_aigit_web` **43 PASS/0 FAIL/1 WARN**；`test_aigit.py` **56 PASS / 0 FAIL / 3 ERROR / 1 SKIP**（3 ERROR 是测试进程 `import server`，C 无此模块） |
+| 全路由覆盖 | **完成** | Python `server.py` 的 21 组 GET + 31 个 POST + 5 个静态页全部实现；新增 `/api/gen`（262 项）与 `remote/{fetch,pull,push}`（127 例） |
 
 读面已完成的边界（与 Python 版仍不同的点）登记在 `c/README.md`「已知差异」，
 主要包括：非 ASCII 数字、超 2^126 饱和、Unicode `strip`/`\w` 近似、非法 UTF-8

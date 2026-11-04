@@ -47,22 +47,15 @@
 
 /* ---------------------------------------------------------------- 小工具 */
 
-static int is_ws(int c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
-}
-
 /* Python 的 str.strip()：就地截断尾部空白，返回跳过前导空白后的指针。 */
 static char *strip(char *s) {
-    while (*s && is_ws((unsigned char)*s)) s++;
-    size_t n = strlen(s);
-    while (n && is_ws((unsigned char)s[n - 1])) s[--n] = 0;
-    return s;
+    return py_strip(s);
 }
 
 /* 全空白（Python 的 `not line.strip()`）。 */
 static int blank(const char *s) {
     for (; *s; s++)
-        if (!is_ws((unsigned char)*s)) return 0;
+        if (!py_is_ascii_space((unsigned char)*s)) return 0;
     return 1;
 }
 
@@ -101,40 +94,19 @@ static int limit_of(const char *query, long long dflt, long long lo, long long h
     char tmp[512];
     int got = q_get(query, "limit", tmp, sizeof(tmp));
     if (got == 0) { *out = dflt; return 0; }
-    if (got < 0) {                       /* 超长：不可能是个合法整数 */
+    if (got < 0) {                       /* 超长 / 内嵌 NUL */
         snprintf(raw, rawsz, "(超长)");
         return -1;
     }
-    const char *p = tmp;
-    while (*p && is_ws((unsigned char)*p)) p++;
-    const char *q = p + strlen(p);
-    while (q > p && is_ws((unsigned char)q[-1])) q--;
-    if (q == p) { *out = dflt; return 0; }        /* "" / "   " -> 缺省 */
-
-    /* Python int() 的 ASCII 子集：可选正负号 + 数字（数字间允许单个下划线）。 */
-    const char *d = p;
-    int neg = 0;
-    if (*d == '+' || *d == '-') { neg = (*d == '-'); d++; }
-    if (d == q) { snprintf(raw, rawsz, "%s", tmp); return -1; }
-    long long v = 0;
-    int prev_digit = 0;
-    for (const char *c = d; c < q; c++) {
-        if (*c >= '0' && *c <= '9') {
-            if (v < 100000000000000000LL) v = v * 10 + (*c - '0');
-            prev_digit = 1;
-        } else if (*c == '_' && prev_digit && c + 1 < q &&
-                   c[1] >= '0' && c[1] <= '9') {
-            prev_digit = 0;
-        } else {
-            snprintf(raw, rawsz, "%s", tmp);
-            return -1;
-        }
+    if (!tmp[0]) { *out = dflt; return 0; }        /* "" -> 缺省 */
+    __int128 v128;
+    if (!py_int128_parse(tmp, &v128)) {
+        snprintf(raw, rawsz, "%s", tmp);
+        return -1;
     }
-    if (!prev_digit) { snprintf(raw, rawsz, "%s", tmp); return -1; }
-    if (neg) v = -v;
-    if (v < lo) v = lo;
-    if (v > hi) v = hi;
-    *out = v;
+    if (v128 > (__int128)hi) v128 = (__int128)hi;
+    if (v128 < (__int128)lo) v128 = (__int128)lo;
+    *out = (long long)v128;
     return 0;
 }
 
@@ -1020,7 +992,7 @@ static char *match_stash(const char *line, long long *idx) {
     }
     if (p[0] != '}' || p[1] != ':') return NULL;
     p += 2;
-    while (*p && is_ws((unsigned char)*p)) p++;
+    while (*p && py_is_ascii_space((unsigned char)*p)) p++;
     *idx = v;
     return (char *)p;
 }

@@ -1,0 +1,148 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+  GIT_AUTHOR_NAME: ci
+  GIT_AUTHOR_EMAIL: ci@example.invalid
+  GIT_COMMITTER_NAME: ci
+  GIT_COMMITTER_EMAIL: ci@example.invalid
+  # setup-msys2 installs to C:\msys64 by default; both build.ps1 and mutation_c use this.
+  AIGIT_MINGW: C:\msys64\mingw64
+
+jobs:
+  build:
+    name: build (mingw64)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: git environment (byte-exact comparisons)
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+      - name: add mingw64 to PATH
+        run: '"$env:AIGIT_MINGW\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH'
+      - name: build (zero third-party deps, static single exe)
+        run: .\c\build.ps1
+      - name: smoke (--version / --help)
+        run: |
+          .\c\build\aigit.exe --version
+          .\c\build\aigit.exe --help
+      - name: upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: aigit-exe
+          path: c\build\aigit.exe
+          if-no-files-found: error
+
+  conformance:
+    name: conformance (16 shards, C vs Python)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: git environment (byte-exact comparisons)
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+      - name: add mingw64 to PATH
+        run: '"$env:AIGIT_MINGW\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH'
+      - run: .\c\build.ps1
+      - name: 16 conformance shards
+        run: python -X utf8 c\tests\run_conformance.py
+
+  quality:
+    name: quality (guard / unicode / batch / scenarios)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: git environment (byte-exact comparisons)
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+      - name: add mingw64 to PATH
+        run: '"$env:AIGIT_MINGW\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH'
+      - run: .\c\build.ps1
+      - name: launch hardening (Host/Origin gate, port fallback)
+        run: python -X utf8 c\tests\launch_guard_c.py
+      - name: repo config cannot execute (guard)
+        run: python -X utf8 c\tests\guard_adv_c.py
+      - name: unicode names / ints / bigints
+        run: |
+          python -X utf8 c\tests\unicode_name_c.py
+          python -X utf8 c\tests\unicode_int_c.py
+          python -X utf8 c\tests\bigint_c.py
+      - name: batch diff endpoint
+        run: python -X utf8 c\tests\batch_diff_c.py
+      - name: end-to-end scenarios (4)
+        run: |
+          python -X utf8 c\tests\scenario_session.py
+          python -X utf8 c\tests\scenario_reset.py
+          python -X utf8 c\tests\scenario_batch.py
+          python -X utf8 c\tests\scenario_conflict.py
+
+  stress:
+    name: stress (concurrency / soak / fuzz / mutation)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: git environment (byte-exact comparisons)
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
+      - name: add mingw64 to PATH
+        run: '"$env:AIGIT_MINGW\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH'
+      - run: .\c\build.ps1
+      - name: concurrency (12 threads x 25 = 300 requests)
+        run: python -X utf8 c\tests\concurrency_c.py 12 25
+      - name: soak (8 x 120 = 960 requests, handles/working set)
+        run: python -X utf8 c\tests\soak_c.py 8 120
+      - name: malformed HTTP (200, service must survive)
+        run: python -X utf8 c\tests\fuzz_http_c.py 200
+      - name: mutation baseline (3 targets, all must be KILLED)
+        run: python -X utf8 c\tests\mutation_c.py

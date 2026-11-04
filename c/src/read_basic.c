@@ -28,6 +28,7 @@
 #include "json.h"
 #include "params.h"
 #include "paths.h"
+#include "writeutil.h"
 #include "util.h"
 
 /* ================================================================ 通用小工具 */
@@ -63,13 +64,6 @@ static int cmp_str(const void *a, const void *b) {
 static int str_starts(const char *s, const char *p) {
     size_t n = strlen(p);
     return strncmp(s, p, n) == 0;
-}
-
-static int hexval(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
 }
 
 /* ================================================================ UTF-8 解码
@@ -177,40 +171,7 @@ typedef struct { char *p; size_t n; } qval;
 static int q_val(const char *query, const char *key, qval *out) {
     out->p = NULL;
     out->n = 0;
-    if (!query) return 0;
-    size_t klen = strlen(key);
-    const char *p = query;
-    while (p && *p) {
-        const char *amp = strchr(p, '&');
-        const char *end = amp ? amp : p + strlen(p);
-        const char *eq = memchr(p, '=', (size_t)(end - p));
-        size_t this_klen = eq ? (size_t)(eq - p) : (size_t)(end - p);
-        if (this_klen == klen && !strncmp(p, key, klen)) {
-            const char *v = eq ? eq + 1 : end;
-            buf b;
-            buf_init(&b);
-            for (const char *q = v; q < end; q++) {
-                char c = *q;
-                if (c == '+') {
-                    c = ' ';
-                } else if (c == '%' && q + 2 < end) {
-                    int h = hexval(q[1]), l = hexval(q[2]);
-                    if (h >= 0 && l >= 0) {
-                        c = (char)((h << 4) | l);
-                        q += 2;
-                    }
-                }
-                buf_putc(&b, c);
-            }
-            buf_cstr(&b);
-            if (b.n == 0) { buf_free(&b); return 0; }
-            out->p = b.p;
-            out->n = b.n;
-            return 1;
-        }
-        p = amp ? amp + 1 : NULL;
-    }
-    return 0;
+    return q_get_nonempty(query, key, &out->p, &out->n);
 }
 
 /* 按 Python unquote(errors="replace") 的口径：非法 UTF-8 -> U+FFFD，保留 NUL。 */
@@ -246,64 +207,8 @@ static void json_str_n(buf *o, const char *s, size_t n) {
 }
 
 /* Python repr() 的常见形态（只用于错误文案里的值回显）。 */
-static char *py_repr_n(const char *s, size_t n) {
-    int has_sq = memchr(s, '\'', n) != NULL;
-    int has_dq = memchr(s, '"', n) != NULL;
-    char quote = (has_sq && !has_dq) ? '"' : '\'';
-    buf b;
-    buf_init(&b);
-    buf_putc(&b, quote);
-    for (size_t i = 0; i < n; i++) {
-        unsigned c = (unsigned char)s[i];
-        if (c == (unsigned char)quote || c == '\\') {
-            buf_putc(&b, '\\');
-            buf_putc(&b, (char)c);
-        } else if (c == '\n') buf_puts(&b, "\\n");
-        else if (c == '\r') buf_puts(&b, "\\r");
-        else if (c == '\t') buf_puts(&b, "\\t");
-        else if (c < 0x20 || c == 0x7f) buf_printf(&b, "\\x%02x", c);
-        else buf_putc(&b, (char)c);
-    }
-    buf_putc(&b, quote);
-    buf_cstr(&b);
-    char *out = xstrdup(b.p);
-    buf_free(&b);
-    return out;
-}
-
 /* Python int() 的近似：允许前后空白与正负号、数字之间的单个下划线，
  * 其余必须是十进制数字。 */
-static int parse_int(const char *s, long long *out) {
-    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r' || *s == '\v' || *s == '\f') s++;
-    if (!*s) return 0;
-    buf clean;
-    buf_init(&clean);
-    for (size_t i = 0; s[i]; i++) {
-        if (s[i] == '_') {
-            /* int() 只认「数字 _ 数字」 */
-            if (i == 0 || !isdigit((unsigned char)s[i - 1]) || !isdigit((unsigned char)s[i + 1])) {
-                buf_free(&clean);
-                return 0;
-            }
-            continue;
-        }
-        buf_putc(&clean, s[i]);
-    }
-    buf_cstr(&clean);
-    char *end = NULL;
-    long long v = strtoll(clean.p, &end, 10);
-    int ok = end && end != clean.p;
-    if (ok) {
-        while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r' ||
-               *end == '\v' || *end == '\f') end++;
-        if (*end) ok = 0;
-    }
-    buf_free(&clean);
-    if (!ok) return 0;
-    *out = v;
-    return 1;
-}
-
 /* ================================================================ 路径判定 */
 
 #define WBUF 4096
@@ -362,74 +267,8 @@ static int read_bytes_w(const wchar_t *path, buf *out) {
  * 这里按「最长已存在祖先的真实路径 + 剩余后缀」补一次，与 Python 对齐；
  * 任何一步取不到就原样返回（paths.c 已经做过越界拒绝，不会因此放行仓外路径）。 */
 
-static const wchar_t *strip_ns(const wchar_t *p) {
-    if (p && p[0] == L'\\' && p[1] == L'\\' && p[2] == L'?' && p[3] == L'\\') return p + 4;
-    return p;
-}
-
 static char *normalize_rel(const char *rel) {
-    wchar_t *full = rel_w(rel);
-    if (!full) return xstrdup(rel);
-    wchar_t *cur = _wcsdup(full);
-    wchar_t *suffix = _wcsdup(L"");
-    wchar_t *resolved = NULL;
-
-    for (int depth = 0; depth < 128 && !resolved; depth++) {
-        HANDLE h = CreateFileW(cur, 0,
-                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                               NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-        if (h == INVALID_HANDLE_VALUE)
-            h = CreateFileW(cur, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (h != INVALID_HANDLE_VALUE) {
-            DWORD need = GetFinalPathNameByHandleW(h, NULL, 0, FILE_NAME_NORMALIZED);
-            if (need) {
-                wchar_t *rp = xmalloc(((size_t)need + 1) * sizeof(wchar_t));
-                DWORD got = GetFinalPathNameByHandleW(h, rp, need, FILE_NAME_NORMALIZED);
-                if (got) {
-                    const wchar_t *p = strip_ns(rp);
-                    buf j;
-                    buf_init(&j);
-                    buf_append(&j, p, wcslen(p) * sizeof(wchar_t));
-                    if (suffix[0]) {
-                        buf_append(&j, L"\\", sizeof(wchar_t));
-                        buf_append(&j, suffix, wcslen(suffix) * sizeof(wchar_t));
-                    }
-                    wchar_t z = 0;
-                    buf_append(&j, &z, sizeof(wchar_t));
-                    resolved = (wchar_t *)j.p;
-                }
-                free(rp);
-            }
-            CloseHandle(h);
-            if (resolved) break;
-        }
-        wchar_t *slash = wcsrchr(cur, L'\\');
-        if (!slash || slash == cur) break;
-        size_t tl = wcslen(slash + 1), sl = wcslen(suffix);
-        wchar_t *ns = xmalloc((tl + (sl ? sl + 1 : 0) + 1) * sizeof(wchar_t));
-        wcscpy(ns, slash + 1);
-        if (sl) { wcscat(ns, L"\\"); wcscat(ns, suffix); }
-        free(suffix);
-        suffix = ns;
-        *slash = 0;
-    }
-
-    char *out = NULL;
-    const wchar_t *root = git_root();
-    size_t rl = wcslen(root);
-    if (resolved && _wcsnicmp(resolved, root, rl) == 0 && resolved[rl] == L'\\' &&
-        resolved[rl + 1]) {
-        wchar_t *r = resolved + rl + 1;
-        for (wchar_t *p = r; *p; p++) if (*p == L'\\') *p = L'/';
-        out = w2u8(r);
-    }
-    if (!out) out = xstrdup(rel);
-    free(resolved);
-    free(suffix);
-    free(cur);
-    free(full);
-    return out;
+    return path_canon_rel(rel);
 }
 
 /* ================================================================ refs 直读 */
@@ -1060,7 +899,7 @@ static int do_log(SOCKET s, const char *query) {
     if (q_val(query, "limit", &lv)) {
         long long v = 0;
         char *sval = u8_replace(lv.p, lv.n);
-        if (!parse_int(sval, &v)) {
+        if (!py_int_parse(sval, &v)) {
             char *rp = py_repr_n(sval, strlen(sval));
             buf msg;
             buf_init(&msg);
@@ -1359,4 +1198,259 @@ int read_basic_get(const char *path, const char *query, SOCKET s) {
     return 0;
 }
 
+/* ================================================================ 批量 diff */
 
+/* 批量 diff 的「一个文件一块」。它是 C 的超集（Python 只有逐文件 GET）：
+ * 一次请求返回多文件的 hunk，前端批量审核不再逐文件 40ms×N。
+ *
+ * 实现：两次 spawn（`-z --name-only` 拿精确路径顺序，`-p` 拿补丁），按顺序
+ * 一一配对；两者条数不一致（理论上不该发生）时退回逐文件，绝不给出错配的内容。
+ * `--no-renames` 保证「每个路径各自一块」，不做改名合并。
+ */
+typedef struct {
+    char *name;
+    size_t off, len;
+} bdiff_block;
+
+static int bdiff_index_of(char **v, size_t n, const char *p) {
+    for (size_t i = 0; i < n; i++)
+        if (!strcmp(v[i], p)) return (int)i;
+    return -1;
+}
+
+static void bdiff_free(char **rels, size_t n) {
+    for (size_t i = 0; i < n; i++) free(rels[i]);
+    free(rels);
+}
+
+static void bdiff_split_names(const buf *o, char ***out, size_t *nout) {
+    char **v = NULL;
+    size_t n = 0, i = 0;
+    while (i < o->n) {
+        const char *p = o->p + i;
+        size_t len = strnlen(p, o->n - i);
+        if (len) {
+            v = xrealloc(v, (n + 1) * sizeof(*v));
+            v[n++] = xstrndup(p, len);
+        }
+        i += len + 1;
+    }
+    *out = v;
+    *nout = n;
+}
+
+static void bdiff_split_blocks(const char *p, size_t n, bdiff_block **out,
+                               size_t *nout) {
+    bdiff_block *v = NULL;
+    size_t cnt = 0;
+    size_t i = 0;
+    while (i < n) {
+        /* 块之间用 "\ndiff --git " 分隔；第一块从 0 开始 */
+        size_t next = 0;
+        for (size_t k = i + 1; k + 11 <= n; k++) {
+            if (p[k - 1] == '\n' && !memcmp(p + k, "diff --git ", 11)) {
+                next = k;
+                break;
+            }
+        }
+        size_t end = next ? next : n;
+        v = xrealloc(v, (cnt + 1) * sizeof(*v));
+        v[cnt].name = NULL;
+        v[cnt].off = i;
+        v[cnt].len = end - i;
+        cnt++;
+        if (!next) break;
+        i = next;
+    }
+    *out = v;
+    *nout = cnt;
+}
+
+static void emit_diff_field(buf *o, const char *p, size_t n) {
+    json_str_n(o, p ? p : "", n);
+}
+
+static int do_diff_batch(SOCKET s, const char *body, size_t body_len) {
+    jnode *b = wbody_parse(s, body, body_len);
+    if (!b) return 1;
+
+    const jnode *fv = jget(b, "files");
+    if (!fv || bjtype(fv) != BJ_ARR || jlen(fv) == 0) {
+        http_send_err(s, 400, "缺少 files 参数(批量 diff 要一个文件数组)", NULL);
+        jfree(b);
+        return 1;
+    }
+    int staged = 0;
+    const jnode *sv = jget(b, "staged");
+    if (sv && bjtype(sv) != BJ_NULL) {
+        if (bjtype(sv) != BJ_BOOL) {
+            http_send_err(s, 400, "staged 必须是布尔值", NULL);
+            jfree(b);
+            return 1;
+        }
+        staged = jbool(sv);
+    }
+
+    size_t nreq = jlen(fv);
+    char **rels = NULL;
+    size_t nrel = 0;
+    for (size_t i = 0; i < nreq; i++) {
+        const jnode *it = jat(fv, i);
+        if (!it || !jis_str(it)) {
+            http_send_err(s, 400, "files 里每一项都必须是字符串", NULL);
+            bdiff_free(rels, nrel);
+            jfree(b);
+            return 1;
+        }
+        size_t sl = jstrlen(it);
+        if (memchr(jstr(it), 0, sl)) {
+            http_send_err(s, 400, "路径里不能包含 NUL 字符", NULL);
+            bdiff_free(rels, nrel);
+            jfree(b);
+            return 1;
+        }
+        char *perr = NULL;
+        char *rel = path_rel_in_root(jstr(it), &perr);
+        if (!rel) {
+            http_send_err(s, 400, perr ? perr : "路径不合法", NULL);
+            free(perr);
+            bdiff_free(rels, nrel);
+            jfree(b);
+            return 1;
+        }
+        free(perr);
+        if (path_kind(rel) == PK_DIR) {
+            buf m;
+            buf_init(&m);
+            buf_printf(&m, "不是文件(是目录),已拒绝:%s", rel);
+            http_send_err(s, 400, buf_cstr(&m), NULL);
+            buf_free(&m);
+            free(rel);
+            bdiff_free(rels, nrel);
+            jfree(b);
+            return 1;
+        }
+        if (!path_known(rel)) {
+            buf m;
+            buf_init(&m);
+            buf_printf(&m, "文件不存在,已拒绝:%s", rel);
+            http_send_err(s, 400, buf_cstr(&m), NULL);
+            buf_free(&m);
+            free(rel);
+            bdiff_free(rels, nrel);
+            jfree(b);
+            return 1;
+        }
+        if (bdiff_index_of(rels, nrel, rel) >= 0) {
+            free(rel);          /* 重复路径只留一份 */
+            continue;
+        }
+        rels = xrealloc(rels, (nrel + 1) * sizeof(*rels));
+        rels[nrel++] = rel;
+    }
+
+    /* 1) 路径顺序（-z：精确字节，不受 quoting 影响） */
+    const char *an[10];
+    size_t ai = 0;
+    an[ai++] = "--literal-pathspecs";
+    an[ai++] = "diff";
+    an[ai++] = "--no-color";
+    an[ai++] = "--no-ext-diff";
+    an[ai++] = "--no-renames";
+    if (staged) an[ai++] = "--cached";
+    an[ai++] = "-z";
+    an[ai++] = "--name-only";
+    an[ai] = NULL;
+
+    buf names, nerr;
+    buf_init(&names);
+    buf_init(&nerr);
+    (void)git_run(an, NULL, 0, &names, &nerr);
+    buf_free(&nerr);
+
+    char **nmlist = NULL;
+    size_t nname = 0;
+    bdiff_split_names(&names, &nmlist, &nname);
+
+    /* 2) 补丁（同样顺序） */
+    const char *ap[10];
+    ai = 0;
+    ap[ai++] = "--literal-pathspecs";
+    ap[ai++] = "diff";
+    ap[ai++] = "--no-color";
+    ap[ai++] = "--no-ext-diff";
+    ap[ai++] = "--no-renames";
+    if (staged) ap[ai++] = "--cached";
+    ap[ai++] = "-p";
+    ap[ai] = NULL;
+
+    buf patch, perr2;
+    buf_init(&patch);
+    buf_init(&perr2);
+    int prc = git_run(ap, NULL, 0, &patch, &perr2);
+    buf_free(&perr2);
+    bdiff_block *blocks = NULL;
+    size_t nblk = 0;
+    bdiff_split_blocks(patch.p ? patch.p : "", patch.n, &blocks, &nblk);
+
+    int aligned = (prc == 0 && nblk == nname);
+    for (size_t i = 0; aligned && i < nblk; i++) {
+        blocks[i].name = nmlist[i];
+    }
+
+    buf o;
+    buf_init(&o);
+    buf_puts(&o, "{\"ok\":true,\"staged\":");
+    buf_puts(&o, staged ? "true" : "false");
+    buf_printf(&o, ",\"count\":%zu,\"files\":[", nrel);
+    for (size_t i = 0; i < nrel; i++) {
+        if (i) buf_putc(&o, ',');
+        buf_puts(&o, "{\"path\":");
+        json_str(&o, rels[i]);
+        buf_puts(&o, ",\"diff\":");
+        const bdiff_block *hit = NULL;
+        if (aligned) {
+            for (size_t k = 0; k < nblk; k++)
+                if (blocks[k].name && !strcmp(blocks[k].name, rels[i])) { hit = &blocks[k]; break; }
+        }
+        if (hit) {
+            emit_diff_field(&o, patch.p + hit->off, hit->len);
+        } else {
+            /* 没对齐或该文件没有改动：退回单文件 diff（正确优先） */
+            const char *args[9];
+            size_t k = 0;
+            args[k++] = "--literal-pathspecs";
+            args[k++] = "diff";
+            args[k++] = "--no-color";
+            args[k++] = "--no-ext-diff";
+            if (staged) args[k++] = "--cached";
+            args[k++] = "--";
+            args[k++] = rels[i];
+            args[k] = NULL;
+            buf t;
+            run_text(args, &t, NULL);
+            emit_diff_field(&o, t.p ? t.p : "", t.n);
+            buf_free(&t);
+        }
+        buf_putc(&o, '}');
+    }
+    buf_puts(&o, "]}");
+    send_ok_json(s, &o);
+    buf_free(&o);
+
+    for (size_t i = 0; i < nblk; i++) blocks[i].name = NULL;
+    free(blocks);
+    for (size_t i = 0; i < nname; i++) free(nmlist[i]);
+    free(nmlist);
+    buf_free(&patch);
+    buf_free(&names);
+    bdiff_free(rels, nrel);
+    jfree(b);
+    return 1;
+}
+
+int read_basic_post(const char *path, const char *body, size_t body_len, SOCKET s) {
+    if (!path) return 0;
+    if (!strcmp(path, "/api/diff")) return do_diff_batch(s, body, body_len);
+    return 0;
+}

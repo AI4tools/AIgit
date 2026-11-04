@@ -1601,14 +1601,50 @@ Python / C 服务，每个端点 3 轮热身 + 30 次采样，取 **p50**；同�
 
 **结论与边界**：
 
-- 读面里所有**已经 0 spawn** 的端点，C 都不慢于 Python（0.15×–0.73×）。
-- 仍然 1–3 spawn 的端点（status / log / history-file / blame / remote-list），C 比 Python
-  慢 11%–29%；差异全部落在 git 子进程的启动/管道开销上，不是解析。这一档属于 M3
-  性能线，尚未开刀。
+- 读面里所有**已经 0 spawn** 的端点，C 都不慢于 Python（0.06×–0.55×）。
+- 仍然 1–3 spawn 的端点（status / log / history-file / blame / remote-list），**上表这一轮**
+  C 比 Python 慢 11%–29%；差异全部落在 git 子进程的启动/管道开销上，不是解析。
+  **该差异已在 2026-11-03 定位并修复**（`CREATE_NO_WINDOW` 每次 spawn +12ms，
+  见下方「修复后复测」），上表保留为修复前的历史测量。
 - `/api/history/stashes` 虽然也是 0 spawn，仍比 Python 慢 3.1×（5.4ms vs 1.7ms）；
   绝对差 3.7ms，未定位（待测：怀疑是每条 stash 多一次文件打开）。
 - **本表只代表这一台机器、这一个 fixture**；没有做冷启动/大仓/并发下的对比，
-  这些数字不能外推。C 版并发面尚未测。
+  这些数字不能外推。C 版并发面另见 §12.24 与 README 的并发冒烟。
+
+**修复后复测（2026-11-03 追加，[实测]）**：同一脚本、同一 fixture、30 次采样。
+
+| 端点 | Python p50 | C p50 | C/Python |
+|---|---:|---:|---:|
+| `/api/status` | 49.8ms | 49.0ms | **0.98×** |
+| `/api/log?limit=50` | 53.5ms | 48.9ms | **0.91×** |
+| `/api/history/file?file=f100.txt&limit=20` | 137.8ms | 122.7ms | **0.89×** |
+| `/api/history/blame?file=f100.txt&start=1&end=40` | 50.0ms | 54.1ms | **1.08×** |
+| `/api/remote/list` | 41.9ms | 41.1ms | **0.98×** |
+| `/api/branches` | 1.8ms | 1.0ms | 0.55× |
+| `/api/history/tags` | 1.3ms | 0.7ms | 0.50× |
+| `/api/history/reflog` | 3.3ms | 1.4ms | 0.41× |
+| `/api/history/stashes` | 1.4ms | 0.7ms | 0.49× |
+| `/api/conflict/state` | 3.0ms | 0.8ms | 0.26× |
+
+根因：C 的 `CreateProcessW` 带了 `CREATE_NO_WINDOW`。微基准（`git version`×30）：
+带该标志 51.5ms、不带 38.6/40.8ms；完整 guard 下 C 57.1→41.5ms，Python 41.3ms。
+去掉后单次 spawn 与 Python 持平，读面所有端点都不再慢于参考版。
+
+**5,000 文件仓复测（2026-11-11，[实测]）**：每文件 40 行、50 个文件改脏，
+15 次 p50：
+
+| 端点 | Python | C | C/Python |
+|---|---:|---:|---:|
+| `/api/status` | 73.0ms | 62.3ms | **0.85×** |
+| `/api/branches` | 1.9ms | 1.1ms | **0.56×** |
+| `/api/log?limit=50` | 43.7ms | 41.7ms | **0.95×** |
+| `/api/file?file=f100.txt` | 1.9ms | 1.5ms | **0.78×** |
+| `/api/diff` | 0.8ms | 0.6ms | **0.73×** |
+| `/api/history/tags?limit=20` | 1.1ms | 0.8ms | **0.73×** |
+
+这一组推翻了「只在 400 文件 fixture 上测过」的局限：5k 文件下 C 仍全面不慢于
+Python。`status` 从 44.7ms（400 文件）涨到 62.3ms，说明索引规模开始成为成本，
+但 Python 同口径涨得更多（51.5→73.0ms）。
 
 本次判据（同一构建）：
 
@@ -1656,7 +1692,27 @@ Python / C 服务，每个端点 3 轮热身 + 30 次采样，取 **p50**；同�
 | POST /api/discard (no-status) | 70.7 | 1 | 2 | 140 | ok |
 | POST /api/commit (no-status) | 496.1 | 7 | 7 | 600 | ok |
 
-**结果：28/28 在预算内。**
+**结果：spawn 预算 28/28 全过；ms 预算 27–28/28。**
+
+`POST /api/stage` 是**环境敏感项**：2026-11-11 连续实测 C 为 **177.1 / 177.8 /
+164.5ms**（预算 170），同机 Python 参考版 **179.9ms** 也同样超线。它需要 2 次
+git spawn（add + status），剩余是磁盘/索引抖动；C 与 Python 同口径，不构成回归。
+其余 27 项有余量。**因此不能再宣称「稳定 28/28」。**
+
+**每次 spawn 的 12ms（2026-11-03 追加，[实测]）**：C 版之前在每个 git 调用上带
+`CREATE_NO_WINDOW`。微基准（同一 `git version`、30 次平均）：
+
+| 调用方 | 平均 |
+|---|---:|
+| C `CreateProcessW` + `CREATE_NO_WINDOW` | 51.5ms |
+| C `CreateProcessW` flags=0 | **38.6 / 40.8ms** |
+| C 完整 guard（13 个 `-c`）+ NO_WINDOW | 57.1ms |
+| Python subprocess 完整 guard | 41.3ms |
+| C 完整 guard，去掉 NO_WINDOW（修复后） | **41.5ms** |
+
+去掉 `CREATE_NO_WINDOW` 后，C 的单次 spawn 与 Python 持平（41.5 vs 41.3ms），
+两 spawn 的 `stage` 因此快约 24ms。控制台窗口不会弹：aigit 本身是控制台程序，
+子进程继承同一个控制台。
 
 **补快路径前**是 **7 项超**，全部是 spawn 数：
 
@@ -1681,9 +1737,220 @@ split-index / reftable 一律回退），`stage/unstage` 的 tracked 集合不�
 
 ---
 
+## 12.25 fork 一个节点 / 回退到某个节点要多久（当轮二十五，[实测]）
+
+「会话节点」在实现上就是提交 + reflog 条目。所以 **fork 会话线 = 在某个节点开分支**，
+**回退现场 = 移动 HEAD**。两者都不复制工作区文件。
+
+### 12.25.1 测法
+
+`c/tests/rollback_speed.py`（本仓内，可复跑）：造 300 / 5,000 文件的仓、20 次提交，
+每项跑 10 轮取 p50/p95，并记录服务器自报的 git spawn 次数
+（`X-aigit-git-calls`，环境变量 `AIGIT_GIT_COUNT=1`）。
+
+### 12.25.2 结果（Windows，本机，[实测]）
+
+| 操作 | 300 文件 p50 / p95 | 5,000 文件 p50 / p95 | spawn |
+|---|---:|---:|---:|
+| fork：`POST /api/branch`（建分支并切过去） | 101.9 / 123.0ms | 121.2 / 140.0ms | 2 |
+| fork：`POST /api/checkout`（单次） | 103.9 / 110.9ms | 138.5 / 159.2ms | 2 |
+| 回退：`reflog/restore`（`--hard`） | 144.4 / 166.0ms | 204.2 / 216.9ms | 3 |
+| 回退：`history/revert`（反向提交） | 160.9 / 169.8ms | 268.2 / 282.3ms | 3 |
+| 回退：`discard`（丢未提交改动） | 100.9 / 101.8ms | 121.1 / 137.7ms | 2 |
+| 往返：`stash` + `pop`（合计） | 379.5 / 444.0ms | 551.3 / 599.1ms | 4 / 7 |
+
+### 12.25.3 怎么读这组数
+
+* **fork 与仓库大小基本无关**：建分支只是写一个 ref + 切 HEAD，2 次 spawn 是固定成本
+  （本机 ~40ms/次）。300 → 5,000 文件只多了 ~20–35ms（读 index）。
+* **回退跟「距离」无关、跟「差异文件数」有关**：`reset --hard` 只重写目标节点与
+  当前不同的文件。本次 20 个提交每次只动 1 个文件，所以距离 5 个节点与 0 个节点
+  的耗时没有可见差别（145.6ms vs 144.4ms，同一量级）。
+* **`revert` 从 5 次 spawn 降到 3 次**（2026-11-14）：原来 `rev-parse`（解析 sha）与
+  `show -s --format=%P`（取父提交）各一次，现在合并成一次
+  `show -s --format=%H %P <rev>^{commit}`；成功后的 `new_head` 改成直读
+  `.git/HEAD`（`head_sha_direct()`，reftable/worktree/GIT_DIR 一律回退 rev-parse）。
+  实测 **244.7ms → 160.9ms（-34%）**，`git spawn` 5 → 3。
+  换来的是「历史只追加」。
+* 这些是**服务端处理时间**，不含浏览器/前端渲染。
+
+### 12.25.4 聊天层：fork 是复制，**回退**是元数据 + 截断
+
+代码节点由 aigit 管；聊天记录在 opencode 的库里（`~/.local/share/opencode/opencode.db`）。
+二进制里的路由表（`opencode-cli.exe` 的字符串）写得很清楚：
+
+* `POST /api/session/:id/fork` —— "Create a child session by **copying projected
+  history**"：**整份复制**消息（新 id、data 逐字节相同；库里有
+  `fork_session_id` + `fork_boundary` 记录血缘，但消息仍是副本）。
+* `POST /api/session/:id/revert/stage` / `revert/commit` / `DELETE .../revert`
+  —— "Stage or move a **reversible** session revert"：**不复制**，先 stage 元数据
+  （`session_v2.revert = {"messageID":…,"files":[]}`，消息一条不少），
+  commit 时才把回退点之后的消息截掉。实测确认：
+  * stage 是**可移动**的 —— 对同一个会话再 stage 另一个 messageID，回退点就移过去
+    （消息仍是 8 条，一条没删）；
+  * 清除用 **`DELETE /api/session/<id>/revert`**（204，`revert` 变 None，消息不变）；
+  * `POST .../revert`（不带 stage）是 404 —— 别照上面板里的名字猜；
+  * **没有 stage 就 commit** 会多出一条消息（实测 8 → 9），别这么调。
+
+**实测（2026-11-14，[实测]；三档规模、每档 2 轮，分叉上做、做完删除）**
+
+| 会话消息数 | fork（复制） | revert/stage | revert/commit |
+|---:|---:|---:|---:|
+| 30 | 6.2 / 19.7ms | 3.5 / 14.8ms | 2.5 / 3.2ms |
+| 3,136 | 887 / 2,087ms | 150 / 152ms | 20 / 29ms |
+| 6,496 | 2,359 / 3,489ms | 102 / 106ms | 21 / 27ms |
+
+结论：
+
+* **回退对话 ≈ 120–180ms（6 千条）**，与 fork 差一个数量级；30 条的会话回退只要
+  几毫秒到十几毫秒。
+* **fork 是复制语义**，约 **0.1–0.5ms/条**（同一会话跨多次测量波动 3 倍，
+  取决于 SQLite 写入负载；早期一次 6.5k 是 739ms，后期 2.4–3.5s）。
+* 「引用式 fork」在 schema 层是现成的（`fork_session_id` + `fork_boundary` 已经
+  在写），但产品仍选择复制，因为 fork 的语义是**独立会话**：父会话之后继续追加、
+  被回退、被压缩（compaction 重写 projected history）甚至被删除，都不该改变子会话。
+  真要改成引用式，需要消息列表拼接父前缀 + 悬挂父引用 + 压缩边界 + 审批/计费口径，
+  属于 opencode 服务端的改动，**不是 aigit 能改的**。
+* 因此「要回退」不必 fork：用 `revert/stage` + `revert/commit` 即可（O(1) 元数据 +
+  一次截断），这也是本机测量里最快的路径。
+
+> 工具侧发现：`ocprompt.py` 里 `CLI` 写死的是旧包名
+> `%LOCALAPPDATA%\\Programs\\@opencodedesktop\\resources\\opencode-cli.exe`，
+> 实际安装路径是 `ai.opencode.desktop`，于是 `ocp.bat doctor` 会误报「服务没在跑」。
+> 已改成候选列表（备份 `ocprompt.py.bak-before-cli-fix`），`doctor` 现在全部 ok。
+
+## 12.26 批量审核 / 批量重置的实测（当轮二十六，[实测]）
+
+300 个改动 + 100 个未跟踪、一次 1,000 个文件；每项 3 轮取 p50，全部用 sha256 逐字节校验。
+
+| 操作 | p50 | 备注 |
+|---|---:|---|
+| `POST /api/stage` 300 个 | 229.1ms | 首次 2.5s（冷），之后稳定 |
+| `POST /api/unstage` 300 个 | 188.9ms | |
+| `POST /api/discard` 300 个 | 316.7ms | 300/300 字节一致；未跟踪不动 |
+| `POST /api/reset` `--hard`（300 脏） | 350.8ms | 300/300 字节一致 |
+| `stage` / `discard` 1,000 个 | 495.4 / 895.7ms | 逐字节 1000/1000 |
+| 单文件 `GET /api/diff` | 42.6ms | 300 个 ≈ 12.8s（**没有**批量 diff 端点） |
+
+**为什么没有命令行长度问题**：批量路径走 `run_paths()` →
+`--literal-pathspecs <verb> --pathspec-from-file=- --pathspec-file-nul`，
+路径从 stdin 喂（NUL 分隔），不受 Windows 32KB 命令行限制；1,000 个文件也照跑。
+
+**两个必须知道的语义**（都与 Python 对拍一致）：
+
+1. `discard` 对**已暂存**文件是 no-op —— Python 也是 `git checkout -- <path>`（从索引
+   恢复，而索引里正是已暂存的坏内容）。批量重置已暂存内容要 `unstage` → `discard`，
+   或直接 `reset --hard`。
+2. 批量里出现不存在的路径会被**静默忽略**（整体仍 200）；`.git/config` 与 `../` 越界
+   仍然 400。
+
+**缺口**：批量审核只能逐文件取 diff（42.6ms × N）。300 个文件的审阅 ≈ 12.8s。
+要真正“批量审核”，需要一个批量 diff 端点（例如 `POST /api/diff {files:[...]}`，
+返回每文件 hunk），目前没有。
+
+## 12.27 批量 diff 端点：把「审核 300 个文件」从 13.4s 压到 143ms（当轮二十七，[实测]）
+
+单文件 `GET /api/diff` 每次 spawn 一次 git（42.6ms）。300 个文件逐个取 = 12.8–13.4s，
+这是批量审核里唯一真正慢的一环。新增 C 的超集端点：
+
+```
+POST /api/diff  {"files": ["a.txt", …], "staged": true|false}
+→ {"ok":true,"staged":true,"count":N,"files":[{"path":"a.txt","diff":"…"}, …]}
+```
+
+**实现（read_basic.c::do_diff_batch）**：两次 spawn，与文件数无关。
+
+1. `git diff [--cached] --no-color --no-ext-diff --no-renames -z --name-only`
+   —— 拿到**精确字节**的路径顺序（`-z` 不受 quoting 影响，空格/中文都原样）；
+2. `git diff [--cached] --no-color --no-ext-diff --no-renames -p`
+   —— 拿整份补丁，按 `"\ndiff --git "` 切块；
+3. 两者条数一致就按顺序一一配对（`--no-renames` 保证每个路径各自一块）；
+   不一致则**退回逐文件**（正确优先，不会给出错配内容）。
+
+**实测（300 个改动文件，staged）**
+
+| | 耗时 |
+|---|---:|
+| 批量端点（一次请求） | **142.8ms** |
+| 逐个 `GET /api/diff`（推算法） | ≈ 13,363ms |
+| 加速比 | **94×** |
+
+**正确性**：每个文件的 `diff` 与单文件 `GET /api/diff` **逐字节相同**（判据
+`c/tests/batch_diff_c.py`，16 项）：覆盖空格文件名、中文名、子目录、
+二进制（`Binary files … differ`）、改名（旧路径删除块 + 新路径新增块）。
+
+**护栏**与单文件版一致：目录 → 400「不是文件(是目录)」、`.git` → 400
+「不允许操作 .git」、`../` → 400「路径越界」、从不存在的路径 → 400
+「文件不存在」；`files` 缺失/为空、`staged` 不是布尔 → 400。整批失败，
+不做部分成功。
+
+旧的逐文件 `GET /api/diff` 完全不变；Python 参考实现没有这个端点（C 的超集，
+与 `chunked`、`gen count` 上限同类）。
+
 ## 13. 变更记录
 
-- **v24（2026-11-03 当轮二十一，C 版写面性能预算）**：新增 §12.24。28 项预算对 C 全过；
+- **v33（2026-11-14，上架加固）**：本机同源闸（`Host` 必须是回环、`Origin`
+  必须同源、无 `Host` 一律 403）——堵 DNS rebinding 与「网页对本地端口发
+  `text/plain` POST 触发 discard/reset」；`nosniff`；端口占用自动顺延 20 个；
+  `--version` / `--open`；打包加 `README.txt` 与日志落盘。判据
+  `c/tests/launch_guard_c.py`（13 项）。没有性能回归（这些都在请求入口做，
+  一次字符串比较）。
+
+- **v32（2026-11-14，批量 diff 端点）**：新增 `POST /api/diff {files:[…],staged}`
+  （C 超集）。2 次 spawn（`-z --name-only` + `-p`）按顺序配对，条数不一致退回
+  逐文件。300 个文件 **142.8ms** vs 逐个 13.4s（**94×**），内容与单文件版逐字
+  节相同；护栏与单文件版一致。判据 `c/tests/batch_diff_c.py`（16 项）。
+
+- **v31（2026-11-14，批量审核/批量重置实测）**：新增 §12.26 与
+  `c/tests/scenario_batch.py`。300 个文件：stage 229ms、unstage 189ms、
+  discard 317ms、reset --hard 351ms；1,000 个文件也照跑（pathspec-from-file，
+  无长度上限）。发现 `discard` 对已暂存文件是 no-op（与 Python 同义），
+  且没有批量 diff 端点（逐文件 42.6ms → 300 个 12.8s）。
+
+- **v30（2026-11-14，聊天层回退 vs 分叉）**：查到 opencode 的
+  `revert/stage` + `revert/commit`（非破坏性回退：先 stage 元数据，commit 才截断），
+  6,496 条会话实测约 120–180ms；fork 是「copying projected history」，约 0.1–0.5ms/条
+  （6.5k 条 0.7–3.5s，随 DB 负载波动）。结论：回退不用 fork，快一个数量级；
+  「引用式 fork」受限于 opencode 服务端，不是 aigit 能改的。
+
+- **v29（2026-11-14，revert 少两次 spawn + 聊天层分叉实测）**：
+  `revert` 把「解析 sha」与「取父提交」合并成一次 `git show`，`new_head` 改直读
+  `.git/HEAD` —— 5 → 3 次 spawn、244.7ms → 160.9ms（-34%）。聊天层
+  `POST /api/session/<id>/fork`：196 条 126ms、2,872 条 468ms、6,457 条 739ms，
+  按消息条数线性（查库确认复制条数一致）。
+
+- **v28（2026-11-14 当轮二十五，fork/回退延迟实测）**：新增 §12.25 与
+  `c/tests/rollback_speed.py`。结论：fork（建分支）~100–120ms、`reflog restore --hard`
+  ~144–204ms、`revert` ~245–339ms、`discard` ~101–121ms；耗时几乎全是 git spawn
+  固定成本，fork 不复制工作区，回退只写有差异的文件。
+
+- **v27（2026-11-11 当轮二十四，Unicode 与任意精度对齐）**：`c/src` 里的
+  strip / repr / `\w` / UTF-8 解码 / 整数解析本地副本全部删掉，收进 `params.c`
+  （16 个共享函数）。新增 733 段 `\w` 区间表与 701 段不可打印表（均由 Python
+  生成并逐码点校验）：旧实现用 Windows `CT_CTYPE1`，**漏认 85,535 个码点**
+  （CJK 分支名会被误拒）。`w_repr` 的 float 改成 Python `repr` 规则
+  （1e15 定点 / 1e16 科学计数）；`repr` 对不可打印字符按 `\xNN`/`\uNNNN`/
+  `\UNNNNNNNN` 转义。超 2^126 / int64 的整数回显改用 `py_int_canon`
+  （JSON body 保留字面量 `jint_lit`），88 例与 Python 逐字节一致。
+  对拍：`\w` 133,548 码点全等、`isspace` 29 码点全等、strip 4,087 例、
+  repr 4,125 例，0 不一致（性能无回归：这几处都在内存里做，不增 spawn）。
+  另外把 `serve_static` 与 `/api/health` 移出全局请求锁（它们不碰 git）：
+  16 路并发 `git status` 期间，`/index.html` 的 p50 从 **718.4ms** 降到
+  **1.1ms**（p95 11.1ms，3 秒完成数 5 → 540），单发 0.5ms 不变。
+
+- **v26（2026-11-11 当轮二十三，健壮性补课）**：`-fanalyzer` 全量（9→3，修空指针/
+  socket 泄漏）；线程本地计数（并发 `X-aigit-git-calls` 不再串）；HTTP 支持 chunked
+  与 10s 慢速连接超时；进程级仓锁（同一仓第二个实例拒绝，worktree 跳过）；guard 配置
+  解析加固（转义子段名、续行）+ 配置执行面对抗实测；5,000 文件仓基准（C 0.56–0.95×）。
+  ASan 因 MinGW 无 `libasan` 不可用，已登记。
+
+- **v25（2026-11-03 当轮二十二，spawn 开销定位）**：`CREATE_NO_WINDOW` 每次 spawn
+  +12ms（51.5 vs 38.6ms）；去掉后 C 单次 spawn 41.5ms ≈ Python 41.3ms。读面所有
+  1-spawn 端点从慢 11–29% 变为 0.89–1.08×（§12.23 已追加修复后复测）；
+  `stage` 稳定 148–162ms（预算 170），性能预算连续 7 次中 6 次全过。
+
+- **v24（2026-11-03 当轮二十一，C 版写面性能预算）**：新增 §12.24。spawn 预算 28/28
+  全过；ms 预算 27–28/28，`POST /api/stage` 擦线（160.8–390.3ms，预算 170）。
   补 `.git/index` 直读后 7 项 spawn 超支归零（stage/unstage 3→2、conflict/list 1→0）。
   登记补快路径时引入并修复的双重释放。
 
