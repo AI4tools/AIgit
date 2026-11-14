@@ -939,7 +939,7 @@ GPL-2.0（与 git 相同）。完整文本见 [LICENSE](LICENSE)。
 
 | 工作流 | 触发 | 做什么 |
 |---|---|---|
-| [.github/workflows/ci.yml](.github/workflows/ci.yml) | push main / PR / 手动 | 4 个 job 并行：构建冒烟、16 片一致性判据、质量（加固/Unicode/批量/4 个演练）、压力（并发/长跑/畸形/变异 3 靶） |
+| [.github/workflows/ci.yml](.github/workflows/ci.yml) | push main / PR / 手动 | 4 个 job 并行：构建冒烟、16 片一致性判据、质量（加固/Unicode/批量/4 个演练）、压力（并发/长跑/畸形/变异 3 靶）。**PR 只跑前两个**（省钱），全量在 main 上跑 |
 | [.github/workflows/release.yml](.github/workflows/release.yml) | 打 `v*` 标签 | 构建 + 打包 zip + 生成 `SHA256SUMS.txt` + 发布 GitHub Release |
 
 本地等价命令（CI 跑的就是它们）：

@@ -59,6 +59,8 @@ jobs:
 
   conformance:
     name: conformance (16 shards, C vs Python)
+    # PR 只跑 build + quality；全量对拍在 main / 手动时跑（Windows 按 2 倍计费）
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -120,6 +122,7 @@ jobs:
 
   stress:
     name: stress (concurrency / soak / fuzz / mutation)
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
