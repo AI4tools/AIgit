@@ -50,7 +50,10 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 C_ROOT = os.path.dirname(HERE)
-PY_ROOT = r"D:\project\aigit\python-ref"
+_PY_CANDS = [os.environ.get("AIGIT_PY_ROOT"),
+             os.path.join(os.path.dirname(C_ROOT), "python-ref"),
+             r"D:\project\aigit\python-ref"]
+PY_ROOT = next((p for p in _PY_CANDS if p and os.path.isdir(p)), _PY_CANDS[1])
 EXE = os.path.join(C_ROOT, "build", "aigit.exe")
 BASE = os.path.join(os.environ["TEMP"], "aigit_c_m3wr_%d" % (os.getpid() % 100000))
 

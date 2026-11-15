@@ -19,7 +19,9 @@ import sys
 import tempfile
 import time
 
-EXE = r"D:\project\aigit\c\build\aigit.exe"
+HERE = os.path.dirname(os.path.abspath(__file__))
+EXE = os.environ.get("AIGIT_C_EXE") or os.path.join(
+    os.path.dirname(HERE), "build", "aigit.exe")
 BASE = tempfile.mkdtemp(prefix="aigit_reset_")
 FAILS, OKS = [], []
 

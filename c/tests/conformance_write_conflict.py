@@ -45,7 +45,10 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 C_ROOT = os.path.dirname(HERE)                       # ...\c
-PY_ROOT = r"D:\project\aigit\python-ref"                        # Python 参考版（只读）
+_PY_CANDS = [os.environ.get("AIGIT_PY_ROOT"),
+             os.path.join(os.path.dirname(C_ROOT), "python-ref"),
+             r"D:\project\aigit\python-ref"]
+PY_ROOT = next((p for p in _PY_CANDS if p and os.path.isdir(p)), _PY_CANDS[1])
 EXE = os.path.join(C_ROOT, "build", "aigit.exe")
 BASE = os.path.join(os.environ["TEMP"], "aigit_c_m2wc_%d" % (os.getpid() % 100000))
 # F-06 场景的仓外哨兵目录（两个仓指向**同一个**目录，只有仓根不同）

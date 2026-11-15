@@ -173,6 +173,38 @@ static int ensure_repo(const wchar_t *root) {
     return rc == 0;
 }
 
+
+/* 把根路径规范成「真实长路径 + 真实大小写」（Python 的 Path.resolve() 同义）。
+ *
+ * 为什么必须有：TEMP 在 GitHub runner 上是 8.3 短名（C:\Users\RUNNER~1\...），
+ * 而 path_rel_in_root 用 GetFinalPathNameByHandleW 拿到的**真实**路径去比较。
+ * 根还是短名时，仓内每个文件都会被判成「路径越界」—— 实测 CI 上 /api/file、
+ * /api/diff 全 400。junction / symlink / 大小写不一致同理。
+ */
+static void canon_root_w(wchar_t *p) {
+    HANDLE h = CreateFileW(p, 0,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD need = GetFinalPathNameByHandleW(h, NULL, 0, FILE_NAME_NORMALIZED);
+    if (need) {
+        wchar_t *b = (wchar_t *)xmalloc(((size_t)need + 1) * sizeof(wchar_t));
+        DWORD got = GetFinalPathNameByHandleW(h, b, need + 1, FILE_NAME_NORMALIZED);
+        if (got && got <= need) {
+            const wchar_t *q = b;
+            if (!wcsncmp(q, L"\\\\?\\UNC\\", 8)) {
+                _snwprintf(p, 32768, L"\\\\%ls", q + 8);
+            } else if (!wcsncmp(q, L"\\\\?\\", 4)) {
+                _snwprintf(p, 32768, L"%ls", q + 4);
+            } else {
+                _snwprintf(p, 32768, L"%ls", q);
+            }
+        }
+        free(b);
+    }
+    CloseHandle(h);
+}
+
 static HANDLE g_repolock = INVALID_HANDLE_VALUE;
 
 /* 取真实 gitdir：普通仓是 <root>\.git；worktree/submodule 的 .git 是文件，
@@ -286,6 +318,7 @@ int wmain(int argc, wchar_t **argv) {
 
     wchar_t full[32768];
     DWORD n = GetFullPathNameW(root, 32768, full, NULL);
+    canon_root_w(full);
     if (!n || n >= 32768) {
         fputs("aigit: bad --root\n", stderr);
         return 2;

@@ -26,7 +26,9 @@ import tempfile
 import time
 import socket
 
-EXE = r"D:\project\aigit\c\build\aigit.exe"
+HERE = os.path.dirname(os.path.abspath(__file__))
+EXE = os.environ.get("AIGIT_C_EXE") or os.path.join(
+    os.path.dirname(HERE), "build", "aigit.exe")
 N_FILES = int(os.environ.get("AIGIT_BENCH_FILES", "300"))
 N_COMMITS = 20
 ROUNDS = 10
