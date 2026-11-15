@@ -415,6 +415,54 @@ def normalize(js, repo):
 
 
 # 每个 fixture 的场景：[(场景名, [(path, body[, raw]), ...]), ...]
+# CPython 补丁版本之间，同一段 Python 代码吐出的**异常文案**会变。实测：
+#   * 3.11.0 / 3.12.4：`dict[:12]` → TypeError("unhashable type: 'slice'")
+#   * 3.12.10（CI 上）：`dict[:12]` → KeyError，str() 是 "slice(None, 12, None)"
+# C 只能对齐其中一种口径，而这一族文案在 Python 侧自己就注释成「服务端内部
+# 细节，不回异常类名」。所以只对**已知等价**的这几个文案折叠后再比，且折叠
+# 时打 NOTE（不静默）。
+_EXC_PFX = "请求参数不合法:"
+_EXC_EQUIV = {
+    "unhashable type: 'slice'": "<PY_VERSION_SPECIFIC:dict-slice>",
+    "slice(None, 12, None)": "<PY_VERSION_SPECIFIC:dict-slice>",
+}
+_FOLDED_EXC = []
+
+
+def fold_exc(js):
+    """把异常文案族里「同一语义、不同 CPython 版本」的文案折成同一个标记。"""
+    if isinstance(js, str):
+        if js.startswith(_EXC_PFX):
+            tail = js[len(_EXC_PFX):]
+            if tail in _EXC_EQUIV:
+                if tail not in _FOLDED_EXC:
+                    _FOLDED_EXC.append(tail)
+                return _EXC_PFX + _EXC_EQUIV[tail]
+        return js
+    if isinstance(js, list):
+        return [fold_exc(x) for x in js]
+    if isinstance(js, dict):
+        return {k: fold_exc(v) for k, v in js.items()}
+    return js
+
+
+def _b64_is_lenient():
+    """本机参考解释器是否「接受多余填充」。3.11.0/3.12.4 接受 "abcd="，
+    3.12.10 起拒绝（Excess padding not allowed）。C 跟新口径，所以参考版
+    宽松时那条场景只能跳过 —— 否则比的是两个 Python 版本的差别。"""
+    try:
+        base64.b64decode("abcd=")
+        return True
+    except Exception:
+        return False
+
+
+B64_LENIENT = _b64_is_lenient()
+SKIP_SCENARIOS = set()
+if B64_LENIENT:
+    SKIP_SCENARIOS.add("resolve base64 无填充（abcd=）→ commit")
+
+# 每个 fixture 的场景：[(场景名, [(path, body[, raw]), ...]), ...]]
 SCENARIOS = {
     "modify": [
         ("resolve 参数校验（全部 400，不改状态）", [
@@ -795,7 +843,8 @@ def run_scenario(fixture, name, steps, env, results):
             if normalize_abs:
                 ja = normalize(ja, ra)
                 jb = normalize(jb, rb)
-            ok = (ca == cb and ja == jb and ca != 500 and cb != 500)
+            ok = (ca == cb and fold_exc(ja) == fold_exc(jb)
+                  and ca != 500 and cb != 500)
             if ok:
                 print("  PASS %-8s #%02d %-60s code=%s" % (fixture, i, label[:60], ca))
                 if results.get((fixture, path)) != "FAIL":
@@ -890,6 +939,11 @@ def main():
             print("[%s]" % tag)
             tot = 0
             for name, steps in SCENARIOS.get(tag, []):
+                if name in SKIP_SCENARIOS:
+                    print("  NOTE %-8s 跳过「%s」：本机参考版 Python 的 "
+                          "b64decode 接受多余填充，C 跟新版（3.12.10）严格口径"
+                          % (tag, name))
+                    continue
                 f, pos = run_scenario(tag, name, steps, env, results)
                 fails += f
                 tot += pos
@@ -908,6 +962,11 @@ def main():
                 row += " %-9s" % results.get((c, ep), "-")
             print(row)
         print("失败 %d" % fails)
+        if _FOLDED_EXC:
+            print("  NOTE 异常文案折过：%r —— CPython 补丁版本之间这几个文案不同"
+                  "（3.11.0/3.12.4 是 TypeError(unhashable)，3.12.10 是 "
+                  "KeyError(slice)），C 只能对齐一种口径。"
+                  % (_FOLDED_EXC,))
     finally:
         subprocess.run(["cmd", "/c", "rd", "/s", "/q", BASE], capture_output=True)
     return 1 if fails else 0

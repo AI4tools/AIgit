@@ -213,12 +213,14 @@ static void sha256_hex(const void *data, size_t n, char out[65]) {
 
 /* `base64.b64decode(s, validate=True)` 的等价实现。
  *
- * 失败文案必须逐字对齐 CPython 3.11 的 binascii（实测口径）：
+ * 失败文案必须逐字对齐 CPython 的 binascii（实测口径；CI 上是 3.12.10）：
  *   Only base64 data is allowed / Excess data after padding /
- *   Discontinuous padding not allowed / Leading padding not allowed /
- *   Incorrect padding /
+ *   Excess padding not allowed / Discontinuous padding not allowed /
+ *   Leading padding not allowed / Incorrect padding /
  *   Invalid base64-encoded string: number of data characters (N) cannot be
  *   1 more than a multiple of 4
+ * ⚠ "Excess padding not allowed" 是较新补丁版本才有的：3.11.0 / 3.12.4 会
+ * 接受 "abcd="，3.12.10 拒绝。C 跟新口径。
  * 成功返回 1（*out 是 malloc 的字节，*outlen 长度）；失败返回 0 并写 *err。 */
 static int b64_val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -255,6 +257,15 @@ static int b64_decode(const char *s, size_t n, char **out, size_t *outlen, char 
             }
             pads++;
             int q = (int)(n_data % 4);
+            /* CPython 的补丁版本之间这条规则变过：3.11.0 / 3.12.4 对
+             * "abcd="（数据已满 4 个字符还带填充）是**接受**的，3.12.10 起
+             * 报 "Excess padding not allowed"（CI 上的 Python 就是这个口径，
+             * 实测 conformance 抓到的差异）。C 跟新口径走。 */
+            if (q == 0) {
+                *err = xstrdup("Excess padding not allowed");
+                buf_free(&o);
+                return 0;
+            }
             if ((q == 2 && pads > 2) || (q == 3 && pads > 1)) {
                 *err = xstrdup("Excess data after padding");
                 buf_free(&o);
