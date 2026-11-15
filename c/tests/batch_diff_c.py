@@ -59,18 +59,21 @@ def main():
     sh("git", "config", "user.email", "t@t", cwd=repo)
 
     # 各种名字：普通 / 空格 / 中文 / 子目录
-    names = ["a.txt", "b b.txt", "中文.txt", "sub/c.txt"]
+    names = ["a.txt", "b b.txt", "中文.txt", "sub/c.txt", "crlf.txt"]
+    sh("git", "config", "core.autocrlf", "false", cwd=repo)
     for n in names:
         p = os.path.join(repo, n)
         os.makedirs(os.path.dirname(p) or repo, exist_ok=True)
-        open(p, "w", encoding="utf-8").write("base %s\n" % n)
+        nl = "\r\n" if n == "crlf.txt" else "\n"
+        open(p, "w", encoding="utf-8", newline="").write("base %s%s" % (n, nl))
     open(os.path.join(repo, "rename-me.txt"), "w", encoding="utf-8").write("r\n" * 50)
     open(os.path.join(repo, "bin.dat"), "wb").write(bytes([1, 2, 0, 3]))
     sh("git", "add", "-A", cwd=repo)
     sh("git", "commit", "-q", "-m", "base", cwd=repo)
 
     for n in names:
-        open(os.path.join(repo, n), "a", encoding="utf-8").write("edit %s\n" % n)
+        nl = "\r\n" if n == "crlf.txt" else "\n"
+        open(os.path.join(repo, n), "a", encoding="utf-8", newline="").write("edit %s%s" % (n, nl))
     sh("git", "mv", "rename-me.txt", "renamed.txt", cwd=repo)
     open(os.path.join(repo, "bin.dat"), "wb").write(bytes([1, 2, 0, 9, 9]))
     sh("git", "add", "-A", cwd=repo)

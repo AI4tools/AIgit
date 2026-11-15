@@ -1391,7 +1391,15 @@ static int do_diff_batch(SOCKET s, const char *body, size_t body_len) {
     buf_free(&perr2);
     bdiff_block *blocks = NULL;
     size_t nblk = 0;
-    bdiff_split_blocks(patch.p ? patch.p : "", patch.n, &blocks, &nblk);
+    /* 补丁要先过一遍「UTF-8 解码 + universal newlines」，与单文件 diff 走的是
+     * 同一条 append_decoded 通路（Python 侧所有 git 输出都是 text=True，CRLF
+     * 会被吃掉）。不归一化的话，批量 diff 的每个 hunk 行尾都多一个 \r，
+     * 与逐文件 GET 就做不到逐字节相同 —— CI 上抓到的就是这个（batch 比
+     * single 每行多 1 字节，at=106）。 */
+    buf npatch;
+    buf_init(&npatch);
+    append_decoded(&npatch, patch.p ? patch.p : "", patch.n, 1);
+    bdiff_split_blocks(npatch.p ? npatch.p : "", npatch.n, &blocks, &nblk);
 
     int aligned = (prc == 0 && nblk == nname);
     for (size_t i = 0; aligned && i < nblk; i++) {
@@ -1414,7 +1422,7 @@ static int do_diff_batch(SOCKET s, const char *body, size_t body_len) {
                 if (blocks[k].name && !strcmp(blocks[k].name, rels[i])) { hit = &blocks[k]; break; }
         }
         if (hit) {
-            emit_diff_field(&o, patch.p + hit->off, hit->len);
+            emit_diff_field(&o, npatch.p + hit->off, hit->len);
         } else {
             /* 没对齐或该文件没有改动：退回单文件 diff（正确优先） */
             const char *args[9];
@@ -1442,6 +1450,7 @@ static int do_diff_batch(SOCKET s, const char *body, size_t body_len) {
     free(blocks);
     for (size_t i = 0; i < nname; i++) free(nmlist[i]);
     free(nmlist);
+    buf_free(&npatch);
     buf_free(&patch);
     buf_free(&names);
     bdiff_free(rels, nrel);
