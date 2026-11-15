@@ -33,6 +33,14 @@ char *xstrndup(const char *s, size_t n);
 char   *w2u8(const wchar_t *w);     /* 失败返回 NULL */
 wchar_t *u82w(const char *s);       /* 失败返回 NULL */
 
+/* stderr 上输出一行中文（UTF-8 字节）。
+ *
+ * ⚠ 不要用 fwprintf(stderr, L"...")：stderr 被重定向到文件/管道时 CRT 会按
+ * "C" locale 转换，中文全变成 '?'。start.bat 正是把 stdout/stderr 追加进
+ * aigit.log —— 用户报错时只能看到一串问号（实测：被仓锁挡住时日志里就是
+ * "aigit: ????????? aigit ????????? C:\..."）。 */
+void werr(const wchar_t *fmt, ...);
+
 /* 以 sep 切分（就地写 NUL），返回切片数组；*n 为数量。调用方 free 返回的数组。 */
 char **split_inplace(char *s, char sep, size_t *n);
 

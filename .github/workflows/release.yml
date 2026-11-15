@@ -22,11 +22,14 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # 必须在 checkout **之前**：Windows runner 默认 core.autocrlf=true，
+      # 否则工作区全是 CRLF，打进 zip 的 web/* 每个文件多出一截 \r\n、
+      # 体积与本地打包不一致（实测 index.html 104,385 vs 102,034 字节）。
       - name: git environment
         run: |
           git config --global core.autocrlf false
           git config --global core.longpaths true
+      - uses: actions/checkout@v4
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64

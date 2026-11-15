@@ -470,7 +470,7 @@ int git_run(const char *const args[], const char *stdin_data, size_t stdin_len,
 
     wchar_t *env = build_env(1, net);
     wchar_t *cmdline = cmdline_finish(&cmd);
-    if (dbg()) { fwprintf(stderr, L"[c] cmdline: %.240ls\n", cmdline);
+    if (dbg()) { werr(L"[c] cmdline: %.240ls\n", cmdline);
                  fprintf(stderr, "[c] env=%p cwd=%ls hIn=%p hOut=%p hErr=%p\n",
                          (void *)env, g_root, (void *)si.hStdInput,
                          (void *)si.hStdOutput, (void *)si.hStdError); }

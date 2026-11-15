@@ -1877,7 +1877,15 @@ POST /api/diff  {"files": ["a.txt", …], "staged": true|false}
 
 **正确性**：每个文件的 `diff` 与单文件 `GET /api/diff` **逐字节相同**（判据
 `c/tests/batch_diff_c.py`，16 项）：覆盖空格文件名、中文名、子目录、
-二进制（`Binary files … differ`）、改名（旧路径删除块 + 新路径新增块）。
+二进制（`Binary files … differ`）、改名（旧路径删除块 + 新路径新增块）、
+**CRLF 内容**。
+
+⚠ 最后那条是 CI 抓出来的：单文件 GET 走 `append_decoded`（UTF-8 解码 +
+universal newlines，等价于 Python 侧 `text=True`），批量端点第一版直接把
+git 的原始 stdout 拆块返回 —— 工作区是 CRLF 时每个 hunk 行尾多一个 `\r`，
+两边就不是逐字节相同了（CI 诊断行：`batch=121B single=119B at=106`）。
+现在拆块前先过同一条 `append_decoded`，块偏移改用归一化后的缓冲。本地 fixture
+之前全是 LF，所以本地一直绿 —— 判据里补了 `crlf.txt` 之后本地也能抓住。
 
 **护栏**与单文件版一致：目录 → 400「不是文件(是目录)」、`.git` → 400
 「不允许操作 .git」、`../` → 400「路径越界」、从不存在的路径 → 400
@@ -1888,6 +1896,15 @@ POST /api/diff  {"files": ["a.txt", …], "staged": true|false}
 与 `chunked`、`gen count` 上限同类）。
 
 ## 13. 变更记录
+
+- **v34（2026-11-15，首发线收口）**：修掉三个**只在 CI 环境成立**的坑 ——
+  测试脚本写死本机路径（改为相对推导 + `AIGIT_C_EXE` / `AIGIT_PY_ROOT`）；
+  runner 的 TEMP 是 8.3 短名而路径校验比真实长路径（`--root` 改用
+  `GetFinalPathNameByHandleW` 规范，仓内文件不再被误判「路径越界」）；
+  批量 diff 的补丁未做 universal newlines（CRLF 工作区里每行多一个 `\r`）。
+  另把 base64 解码对齐到新版 CPython 的「多余填充」口径（`abcd=` → 400
+  `Excess padding not allowed`，3.11.0/3.12.4 是接受的）。CI 全绿、本地门禁
+  全绿，`v1.0.0-beta.1` 预发布已产出（zip 963,246B）。
 
 - **v33（2026-11-14，上架加固）**：本机同源闸（`Host` 必须是回环、`Origin`
   必须同源、无 `Host` 一律 403）——堵 DNS rebinding 与「网页对本地端口发

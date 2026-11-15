@@ -103,6 +103,20 @@ wchar_t *u82w(const char *s) {
     return out;
 }
 
+void werr(const wchar_t *fmt, ...) {
+    wchar_t wb[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = _vsnwprintf(wb, 4095, fmt, ap);
+    va_end(ap);
+    if (n < 0) wb[4095] = 0; else wb[n] = 0;
+    char *u8 = w2u8(wb);
+    if (u8) {
+        fputs(u8, stderr);
+        free(u8);
+    }
+}
+
 char **split_inplace(char *s, char sep, size_t *n) {
     size_t cap = 8, cnt = 0;
     char **out = xmalloc(cap * sizeof(char *));

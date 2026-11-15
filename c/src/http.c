@@ -154,17 +154,17 @@ void http_set_web(const wchar_t *dir) {
 static void send_file(SOCKET s, const wchar_t *path, const char *ctype) {
     FILE *f = _wfopen(path, L"rb");
     if (!f) {
-        if (getenv("AIGIT_C_DEBUG")) fwprintf(stderr, L"[c] fopen fail: %ls errno=%d\n", path, errno);
+        if (getenv("AIGIT_C_DEBUG")) werr(L"[c] fopen fail: %ls errno=%d\n", path, errno);
         http_send_err(s, 500, "服务端内部错误,详情见服务端日志", "internal_error");
         return;
     }
     if (fseek(f, 0, SEEK_END) != 0) {
-        if (getenv("AIGIT_C_DEBUG")) fwprintf(stderr, L"[c] fseek fail: %ls\n", path);
+        if (getenv("AIGIT_C_DEBUG")) werr(L"[c] fseek fail: %ls\n", path);
         fclose(f); http_send_err(s, 500, "服务端内部错误,详情见服务端日志", "internal_error"); return;
     }
     long sz = ftell(f);
     if (sz < 0 || sz > (long)(64 * 1024 * 1024)) {
-        if (getenv("AIGIT_C_DEBUG")) fwprintf(stderr, L"[c] ftell=%ld: %ls\n", sz, path);
+        if (getenv("AIGIT_C_DEBUG")) werr(L"[c] ftell=%ld: %ls\n", sz, path);
         fclose(f); http_send_err(s, 500, "服务端内部错误,详情见服务端日志", "internal_error"); return;
     }
     rewind(f);

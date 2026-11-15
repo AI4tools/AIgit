@@ -28,12 +28,14 @@ $start = @'
 @echo off
 setlocal
 cd /d "%~dp0"
+rem UTF-8 so the exe's Chinese diagnostics show up in this window (and in aigit.log)
+chcp 65001 >nul
 rem usage: start.bat [repo] [port]
 set "PORT=%~2"
 if "%PORT%"=="" set "PORT=8777"
 set "REPO=%~1"
 if "%REPO%"=="" set "REPO=%~dp0workspace"
-echo aigit 1.0.0
+aigit.exe --version
 echo   repo: %REPO%
 echo   port: %PORT%  (auto-increments if busy)
 echo   log : %~dp0aigit.log

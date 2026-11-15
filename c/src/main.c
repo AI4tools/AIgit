@@ -280,8 +280,7 @@ static int acquire_repo_lock(const wchar_t *root) {
         if (g_repolock != INVALID_HANDLE_VALUE) return 1;
         Sleep(50);
     }
-    fwprintf(stderr,
-             L"aigit: 这个仓已经有另一个 aigit 实例在服务（锁文件 %ls）\n", p);
+    werr(L"aigit: 这个仓已经有另一个 aigit 实例在服务（锁文件 %ls）\n", p);
     return 0;
 }
 
@@ -330,12 +329,12 @@ int wmain(int argc, wchar_t **argv) {
     if (sandbox) {
         if (is_dir_w(full)) {
             if (!delete_tree(full)) {
-                fwprintf(stderr, L"aigit: 无法清空 --root: %ls\n", full);
+                werr(L"aigit: 无法清空 --root: %ls\n", full);
                 return 2;
             }
         }
         if (!CreateDirectoryW(full, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-            fwprintf(stderr, L"aigit: 无法创建 --root: %ls\n", full);
+            werr(L"aigit: 无法创建 --root: %ls\n", full);
             return 2;
         }
         git_init(full);
@@ -345,11 +344,11 @@ int wmain(int argc, wchar_t **argv) {
          * + "init: sandbox" 提交）。只有 --sandbox 才会先清空目录。 */
         if (!is_dir_w(full)) {
             if (GetFileAttributesW(full) != INVALID_FILE_ATTRIBUTES) {
-                fwprintf(stderr, L"aigit: --root 不是目录: %ls\n", full);
+                werr(L"aigit: --root 不是目录: %ls\n", full);
                 return 2;
             }
             if (!CreateDirectoryW(full, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-                fwprintf(stderr, L"aigit: 无法创建 --root: %ls\n", full);
+                werr(L"aigit: 无法创建 --root: %ls\n", full);
                 return 2;
             }
         }
