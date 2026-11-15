@@ -519,7 +519,10 @@ def local_snapshot(repo):
 
 def norm(js, repo, bare):
     s = json.dumps(js, ensure_ascii=False, sort_keys=True)
-    for p, tag in ((repo, "<REPO>"), (bare, "<BARE>")):
+    real = os.path.realpath(repo)
+    real_bare = os.path.realpath(bare) if bare else bare
+    for p, tag in ((repo, "<REPO>"), (real, "<REPO>"),
+                   (bare, "<BARE>"), (real_bare, "<BARE>")):
         if not p:
             continue
         # JSON 串里反斜杠是转义过的，要按转义后的形式替换

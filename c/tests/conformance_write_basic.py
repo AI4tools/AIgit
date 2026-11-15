@@ -350,7 +350,15 @@ def state(repo):
 def norm_json(v, repo):
     """响应里的绝对路径（root）归一，否则两份副本永远不相等。"""
     if isinstance(v, str):
-        return v.replace(repo.replace("\\", "/"), "<ROOT>").replace(repo, "<ROOT>")
+        # CI 的 TEMP 是 8.3 短名，但两端都返回真实长路径（C 的
+        # GetFinalPathNameByHandleW 与 Python 的 Path.resolve() 同义），
+        # 所以短名和长名都要折掉。
+        pats = {repo, repo.replace("\\", "/"), os.path.realpath(repo),
+                os.path.realpath(repo).replace("\\", "/")}
+        for p in sorted(pats, key=len, reverse=True):
+            if p:
+                v = v.replace(p, "<ROOT>")
+        return v
     if isinstance(v, list):
         return [norm_json(x, repo) for x in v]
     if isinstance(v, dict):

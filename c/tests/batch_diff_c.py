@@ -101,7 +101,13 @@ def main():
             single = j1.get("diff") or ""
             if got.get(n) != single:
                 diffs_same = False
-                detail.append(n)
+                a = got.get(n) or ""
+                b = single
+                k = next((i for i in range(min(len(a), len(b))) if a[i] != b[i]),
+                         min(len(a), len(b)))
+                detail.append("%s: batch=%dB single=%dB at=%d batch=%r single=%r"
+                              % (n, len(a), len(b), k,
+                                 a[max(0, k - 30):k + 30], b[max(0, k - 30):k + 30]))
         ok("每个文件的 diff 与逐文件 GET 逐字节相同", diffs_same, str(detail))
         ok("改名一侧（新路径）在批量里有内容",
            "diff --git" in (got.get("renamed.txt") or ""))

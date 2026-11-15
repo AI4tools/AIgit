@@ -397,7 +397,8 @@ def normalize(js, repo):
 
     ⚠ 必须在**解析后的对象**上替换：json.dumps 会把 `\\` 转义成 `\\\\`，
     在序列化后的文本上替换原路径永远匹配不上（第一版就踩了这个坑）。"""
-    pats = (repo, repo.replace("\\", "/"))
+    real = os.path.realpath(repo)
+    pats = (repo, repo.replace("\\", "/"), real, real.replace("\\", "/"))
 
     def walk(o):
         if isinstance(o, str):

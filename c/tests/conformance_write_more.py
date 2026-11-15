@@ -286,7 +286,10 @@ def norm(obj, repo):
     少数错误文案会回显路径）。这不算差异 —— 折掉之后比的是语义。
     """
     if isinstance(obj, str):
-        return obj.replace(repo, "<ROOT>")
+        for p in sorted({repo, os.path.realpath(repo)}, key=len, reverse=True):
+            if p:
+                obj = obj.replace(p, "<ROOT>")
+        return obj
     if isinstance(obj, list):
         return [norm(x, repo) for x in obj]
     if isinstance(obj, dict):
