@@ -22,11 +22,13 @@ build/aigit.exe: $(OBJ)
 build/%.o: src/%.c src/*.h | build
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# mkdir / rm / rmdir 各写一条，前面加 '-' 让另一种 shell 下的失败被忽略：
-# cmd 下用 mkdir + rmdir，MSYS2/bash 下用 mkdir + rm。
+# 同一份 makefile 要同时喂给 cmd（本地 mingw32-make）和 sh（MSYS2 / CI）：
+#   * 建目录只有一句 mkdir（两个 shell 都认）；
+#   * 删目录两种写法都列上，前面加 '-' 让另一种 shell 下的失败被忽略。
+# 注意：build 目标里**不能**有 rm —— 以前误写了一行，cmd 下 rm 不存在所以
+# 本地一直绿，MSYS2 的 sh 下会把刚建好的 build 目录删掉，CI 会全挂在编译前。
 build:
 	-@mkdir build
-	-@rm -rf build
 
 clean:
 	-@rm -rf build
