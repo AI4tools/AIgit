@@ -528,6 +528,25 @@ static int request_is_local(const char *h, size_t n) {
     return 1;
 }
 
+
+/* 早退（403 之类）时也必须把请求体读走：Windows 上带着未读数据 close 会发 RST，
+ * 客户端看到的是 ConnectionResetError，而不是我们刚写出去的响应。
+ * 实测：请求体 >=100KB 时必现。 */
+static void drain_body(SOCKET s, const char *h, size_t n) {
+    long long clen = header_content_length(h, n);
+    if (clen <= 0) return;
+    if (clen > (32ll << 20)) clen = 32ll << 20;
+    DWORD tv = 500;                      /* 读不到就算了，别拖住线程 */
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    char tmp[8192];
+    while (clen > 0) {
+        int want = (int)(clen < (long long)sizeof(tmp) ? clen : (long long)sizeof(tmp));
+        int got = recv(s, tmp, want, 0);
+        if (got <= 0) break;
+        clen -= got;
+    }
+}
+
 static void handle_conn(SOCKET s) {
     /* 半包/慢速连接不能永久占住一个线程：头部 10s 读不到就放弃。 */
     DWORD rcv_to = 10000;
@@ -586,6 +605,7 @@ static void handle_conn(SOCKET s) {
     if (!request_is_local(req.p, header_end)) {
         http_send_err(s, 403, "只接受本机同源请求(Host/Origin 校验失败)",
                       "forbidden");
+        drain_body(s, req.p, header_end);
         buf_free(&req);
         return;
     }
