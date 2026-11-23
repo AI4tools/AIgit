@@ -1,4 +1,5 @@
-aigit 1.0.0 -- 本地 git 前端（单文件 exe，只监听 127.0.0.1）
+aigit -- 本地 git 前端（单文件 exe，只监听 127.0.0.1）
+版本: 运行 aigit.exe --version 查看
 
 怎么用
   1) 解压到任意目录（不要放在 Program Files，避免权限问题）
